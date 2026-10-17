@@ -289,7 +289,7 @@ decoded stream). Then, on the host's own screen, the pointer flickered to the mi
 during moves in the right or bottom half (the compositor drew between the jump and the relative
 move): now only the first move of a stroke, after a second without one, jumps; the rest are
 relative from where the translator put the pointer last (logged live: one jump, then nine relative
-moves summing to exactly 80 % of the width). libei's absolute device, with the compositor's own regions, would avoid the
+moves summing to exactly 80 % of the width; on the iPad, "much better"). libei's absolute device, with the compositor's own regions, would avoid the
 two-step move. On the iPad (2026-10-17) after that fix: "the controls work fine". Not tried here, on purpose (they would act on whatever has focus): clicks,
 scrolls, keys and text; those are for the device test.
 
