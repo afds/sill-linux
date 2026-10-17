@@ -48,7 +48,9 @@ Not supported: audio and a virtual display.
 ## Install
 
 On Ubuntu 24.04 or later, download the `.deb` from the
-[latest release](https://github.com/afds/sill-linux/releases/latest), then:
+[latest release](https://github.com/afds/sill-linux/releases/latest), then the commands below.
+The extension needs GNOME 48 or later (Ubuntu 25.04 on); on 24.04 and 24.10 only the whole desktop
+streams.
 
 ```
 sudo apt install ./sill-linux_*_amd64.deb

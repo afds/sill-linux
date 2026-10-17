@@ -765,3 +765,32 @@ main.js does on a desktop: the host started while locked, a device connecting wh
 the locked goodbye, after unlocking it streamed, and locking while it streamed gave the locked
 goodbye; the host ran throughout. The suspend inhibitor's call answered with a cookie on this
 desktop's session manager (the nested shell has none).
+
+## The review (2026-10-17)
+
+A review of everything since the security review. Fixed:
+- A failed fallback to the Desktop (the screen locking during a pick) no longer exits the host:
+  the devices are told and the host waits, as when nothing streams.
+- When sharing ends here, nothing streams any more, so a device connecting in the 2 s before the
+  others are closed asks for the Desktop instead of waiting on a blank stream.
+- A session GNOME made after `record` gave up (8 s) is stopped, not kept with its indicator up.
+- The once-a-second look at GNOME's session no longer holds up the capture loop while the GNOME
+  task is busy (an Aa fit): asked, then read on a later pass.
+- An Aa fit that reaches an idle host (its start failed) is dropped, not applied to a window that
+  never streams.
+- One failed suspend hold no longer stops the hold for good.
+- A window the app never resized is written back without a "Restored" line, as Sill.
+- A monitor's thumbnail: a whole-monitor screenshot stalls GNOME's main thread (~120 ms at 4K in
+  the nested shell; the screenshot itself, the decode only ~20 ms of it), so every 30 s, the
+  streamed one too (it was every 6 s, and on every list pass for the streamed one). The
+  extension (version 5) decodes it off the main thread, never scales it up or above 1024 px, and
+  cleans up after a failure.
+- The pairing window closes by itself when its code expires (sill-linux may have restarted), and
+  takes only a real QR code's width and short words.
+- The workflows keep the token out of `.git/config`; CI's cache key has the Rust version; the
+  package depends on `gstreamer1.0-plugins-good` (`videocrop`); the README says the extension
+  needs GNOME 48 (Ubuntu 25.04 on).
+
+Checked and not so: closing the streamed window ends GNOME's whole session (read from Mutter's
+source). In the nested shell the session stays, the stream ends and the host goes back to the
+Desktop, the device connected.

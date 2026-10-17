@@ -21,6 +21,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token stays out of .git/config, where any build script could read it.
+          persist-credentials: false
 
       - name: Build dependencies
         run: |
@@ -28,9 +31,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Rust
+        id: rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
+          echo "version=$(rustc -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -39,7 +44,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-deb
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build
         run: cargo build --release --locked
