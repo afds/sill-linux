@@ -614,3 +614,26 @@ behaviour.
 Verified in the nested shell, every earlier check again with the same results: windows, Aa and
 its way back, launching, minimize, every gesture step, the pointer fractions, and the cursor
 shapes in points.
+
+## GNOME's sharing indicator only while a device streams (2026-10-17)
+
+GNOME shows its orange sharing indicator while any screen-cast or remote-desktop session exists.
+sill-linux used to hold one from start to end, so the indicator never went, and its stop button
+ended the stream with an error: sill-linux exited, systemd started it again, and the indicator came
+back.
+
+Now GNOME's session exists only while something streams. At start the session that checks the
+monitor is closed at once. A device picking a source opens a fresh one (as every switch already
+did), and 3 s with nothing streaming close it, so the app's quick reconnects (another network
+path, back from another app) keep it. Pressing the indicator's stop closes GNOME's session.
+sill-linux sees it gone (it asks once a second, and whenever the stream fails: a stopped stream
+can simply go quiet) and tells every device with a goodbye the app shows word for word and does not
+reconnect after: reason "stopped", "Sharing was stopped on ‹name›. Tap it to connect again.",
+`reconnect` false (the App Store 0.5.1 shows any reason it does not know this way). A device still
+connected after 2 s is closed. The host keeps running; a tap on the row starts a new session.
+
+Tested in the nested shell with a test-only extension that calls `stop()` on every remote-access
+handle, as the indicator does. Handles: 0 at idle, 2 while streaming, 0 again 3 s after the device
+left. Stop pressed mid-stream: the goodbye arrived 0.5 s later, the host ran on, and a new
+connection streamed. Windows, launching an app, and Aa resizing and restoring ran as before.
+The portal path (other desktops, `--portal`) is unchanged: its session lives for the whole run.

@@ -52,6 +52,9 @@ The extension is a thin layer that reports GNOME's state and carries out plain a
 decisions live in sill-linux. So after updating sill-linux, `systemctl --user restart sill-linux`
 is enough. Log out again only when sill-linux says the running extension is older.
 
+GNOME's orange sharing indicator shows only while a device streams. Its stop button ends the
+session: the device says sharing was stopped and waits for a tap to connect again.
+
 The service's output: `journalctl --user -u sill-linux -f`. Remove it with
 `--uninstall-service`. To run in a terminal instead: `./target/release/sill-linux`. Ctrl-C tells
 devices the host quit, and they reconnect by themselves when it is back.

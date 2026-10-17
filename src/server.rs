@@ -1002,6 +1002,33 @@ impl Server {
         self.reapply(&st);
     }
 
+    /// Sharing was stopped on this machine (GNOME's indicator): every device is told, in words the
+    /// app shows as they are, and does not reconnect by itself (kind 22 with a reason it does not
+    /// know, `reconnect` false); a tap on its row connects again. One that has not closed in 2 s is
+    /// closed.
+    pub fn stopped_here(&self) {
+        let goodbye = serde_json::json!({
+            "reason": "stopped",
+            "message": format!("Sharing was stopped on {}. Tap it to connect again.", self.host_name),
+            "reconnect": false,
+        });
+        let msg = protocol::message(kind::GOODBYE, protocol::now(), false, goodbye.to_string().as_bytes());
+        let ids: Vec<u64> = {
+            let st = self.state.lock().unwrap();
+            for c in st.clients.values() {
+                let _ = c.tx.send(msg.clone());
+            }
+            st.clients.keys().copied().collect()
+        };
+        let server = self.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            for id in ids {
+                server.remove(id, "sharing stopped here");
+            }
+        });
+    }
+
     /// Called from the capture thread with each encoded access unit.
     pub fn broadcast_access_unit(&self, au: &protocol::AccessUnit) {
         if au.frame.is_empty() {

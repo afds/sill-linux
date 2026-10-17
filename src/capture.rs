@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 
 /// A keyframe asked for less than this after the last one is folded into it.
 const KEYFRAME_SPACING: Duration = Duration::from_millis(250);
+/// Nothing streaming this long closes GNOME's session (its sharing indicator goes), so the app's
+/// quick reconnects (another network path, back from another app) keep it.
+const IDLE_GRACE: Duration = Duration::from_secs(3);
 
 struct PortalCast {
     /// The portal's PipeWire remote; None: this process's own PipeWire connection (Mutter's API).
@@ -103,6 +106,13 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     let mut streaming = false;
     let mut source = Source::Desktop;
     let mut announced = None;
+    // GNOME's session is opened only while a device streams.
+    if let Some(rec) = recorder.as_ref() {
+        match idle(server, &control, rec, &mut apply)? {
+            Some((c, s)) => (cast, source, streaming) = (c, s, true),
+            None => return Ok(()),
+        }
+    }
     loop {
         if announced != Some(dmabuf) {
             println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
@@ -125,6 +135,18 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
                 Source::Desktop
             }
             Outcome::Switch(s) => s,
+            outcome @ (Outcome::Idle | Outcome::StoppedHere) => {
+                if matches!(outcome, Outcome::StoppedHere) {
+                    println!("Sharing was stopped here (GNOME's indicator): devices told; the next connection starts it again.");
+                    server.stopped_here();
+                }
+                let rec = recorder.as_ref().expect("only GNOME's API idles");
+                match idle(server, &control, rec, &mut apply)? {
+                    Some((c, s)) => (cast, source, streaming) = (c, s, true),
+                    None => break,
+                }
+                continue;
+            }
         };
         let Some(rec) = recorder.as_ref() else {
             println!("Windows stream only through GNOME's own screen-cast API (not with --portal); the Desktop keeps streaming.");
@@ -160,6 +182,51 @@ enum Outcome {
     SourceEnded(String),
     /// The pipeline failed before its first frame (with DMA-BUF: try shared memory).
     NoDmaBuf(String),
+    /// Nothing has streamed for `IDLE_GRACE`: GNOME's session closes.
+    Idle,
+    /// GNOME's session was closed here (its sharing indicator's stop): the devices are told.
+    StoppedHere,
+}
+
+/// Nothing streams: GNOME's session is closed (its sharing indicator goes) until a device picks a
+/// source, then a fresh one records it. None: the host is ending.
+fn idle(server: &Server, control: &Receiver<Control>, rec: &Recorder, apply: &mut Apply) -> Result<Option<(PortalCast, Source)>> {
+    let _ = rec.send(RecReq::Close);
+    loop {
+        let req = match control.recv() {
+            Err(_) => return Ok(None),
+            Ok(Control::Start(source)) => {
+                return match record(rec, source) {
+                    Ok(cast) => Ok(Some((cast, source))),
+                    Err(e) if source != Source::Desktop => {
+                        println!("Could not stream that window: {e:#}; the Desktop instead.");
+                        server.showing_desktop();
+                        Ok(Some((record(rec, Source::Desktop)?, Source::Desktop)))
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            Ok(Control::Apply(a)) => {
+                *apply = a;
+                continue;
+            }
+            Ok(Control::Stop | Control::Keyframe) => continue,
+            Ok(Control::WindowCommand(id, action)) => RecReq::Command(id, action),
+            Ok(Control::Launch(app)) => RecReq::Launch(app),
+            Ok(Control::Gesture(name)) => RecReq::Gesture(name),
+            Ok(Control::Fit(id, w, h)) => RecReq::Fit(id, w, h),
+        };
+        let _ = rec.send(req);
+    }
+}
+
+/// Whether GNOME's session still runs: a stream that failed with it gone was stopped here.
+fn session_alive(rec: &Recorder) -> bool {
+    let (tx, rx) = mpsc::channel();
+    if rec.send(RecReq::Alive(tx)).is_err() {
+        return true;
+    }
+    rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true)
 }
 
 fn run_pipeline(
@@ -281,6 +348,8 @@ fn run_pipeline(
     let started = Instant::now();
     let mut seen_crop: (u64, Instant) = (0, Instant::now());
     let mut gate_open = false;
+    let mut stopped_at = (!*streaming).then(Instant::now);
+    let mut last_alive_look = Instant::now();
     let result = loop {
         match control.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Start(s)) if s != source => {
@@ -309,10 +378,12 @@ fn run_pipeline(
             }
             Ok(Control::Start(_)) => {
                 *streaming = true;
+                stopped_at = None;
                 keyframe_pending = true;
             }
             Ok(Control::Stop) => {
                 *streaming = false;
+                stopped_at = Some(Instant::now());
                 if let Some(rec) = recorder {
                     let _ = rec.send(RecReq::Release);
                 }
@@ -408,6 +479,18 @@ fn run_pipeline(
                 MessageView::Eos(_) => failure = Some("the screen cast ended (the portal session was closed)".into()),
                 _ => {}
             }
+        }
+        // Once a second too: a stopped session's stream may just go quiet (pipewiresrc keeps
+        // resending its last frame).
+        let look = failure.is_some() || last_alive_look.elapsed() >= Duration::from_secs(1);
+        if look && let Some(r) = recorder {
+            last_alive_look = Instant::now();
+            if !session_alive(r) {
+                break Ok(Outcome::StoppedHere);
+            }
+        }
+        if recorder.is_some() && !*streaming && stopped_at.is_some_and(|t| t.elapsed() >= IDLE_GRACE) {
+            break Ok(Outcome::Idle);
         }
         if let Some(why) = failure {
             if source != Source::Desktop {
@@ -693,7 +776,8 @@ fn start_capture(server: Server, input: Option<CommandKey>) -> Result<(PortalCas
 }
 
 /// GNOME's own API: a remote-desktop session with the monitor's screen cast linked to it. No
-/// dialog; GNOME's sharing indicator shows while it runs.
+/// dialog. The session made here only checks the monitor and is closed at once: GNOME's sharing
+/// indicator then shows only while a device streams (`idle`).
 async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Recorder, impl Send)> {
     let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
     let wanted = MONITOR.lock().unwrap().clone();
@@ -703,7 +787,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     let stream = session.record(crate::mutter::Source::Monitor(&connector), cursor).await?;
     println!("Capture: GNOME's own screen-cast API, monitor {connector}{}.", if input.is_some() { ", with remote control" } else { "" });
     let cast = PortalCast { fd: None, node: stream.node, size: stream.size };
-    let shown: Shown = Arc::new(std::sync::Mutex::new((Arc::new(session), stream.clone())));
+    let shown: Shown = Arc::new(std::sync::Mutex::new(Some((Arc::new(session), stream.clone()))));
     let input_tx = input.map(|command| {
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
         let (w, h) = stream.size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
@@ -760,6 +844,10 @@ enum RecReq {
     Fit(u64, i32, i32),
     /// Nothing streams: every window Aa sized goes back.
     Release,
+    /// GNOME's session closes (nothing streams for a while).
+    Close,
+    /// Whether the session shown still runs.
+    Alive(mpsc::Sender<bool>),
 }
 
 /// An app launched from a device, and when: its first window listed within `LAUNCH_WAIT` is picked.
@@ -774,7 +862,7 @@ fn record(rec: &Recorder, source: Source) -> Result<PortalCast> {
 }
 
 /// The session and stream shown; input goes to them.
-type Shown = Arc<std::sync::Mutex<(Arc<crate::mutter::Session>, crate::mutter::Stream)>>;
+type Shown = Arc<std::sync::Mutex<Option<(Arc<crate::mutter::Session>, crate::mutter::Stream)>>>;
 
 /// Owns what is shown: a fresh session for every switch, the Desktop's too (Mutter starts no
 /// stream added to a session already running, and a new consumer of a running stream gets no
@@ -859,6 +947,21 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 }
             }
             RecReq::Release => restore(&shell, &mut fitted, None).await,
+            RecReq::Close => {
+                restore(&shell, &mut fitted, None).await;
+                let old = shown.lock().unwrap().take();
+                if let Some((session, _)) = old {
+                    session.stop().await;
+                }
+            }
+            RecReq::Alive(reply) => {
+                let current = shown.lock().unwrap().clone();
+                let alive = match current {
+                    Some((session, _)) => session.alive().await,
+                    None => false,
+                };
+                let _ = reply.send(alive);
+            }
             RecReq::Record(source, reply) => {
                 let keep = match source {
                     Source::Window(id) => Some(id),
@@ -888,8 +991,10 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 match recorded {
                     Ok((session, stream)) => {
                         let _ = reply.send(Ok(cast(&stream)));
-                        let old = std::mem::replace(&mut *shown.lock().unwrap(), (Arc::new(session), stream));
-                        old.0.stop().await;
+                        let old = shown.lock().unwrap().replace((Arc::new(session), stream));
+                        if let Some((session, _)) = old {
+                            session.stop().await;
+                        }
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));
@@ -1391,7 +1496,8 @@ async fn perform(sink: &InputSink, action: &Action) -> Result<()> {
         }
         InputSink::Mutter { shown } => {
             use crate::mutter::{AXIS_FINISH, AXIS_SOURCE_FINGER};
-            let (session, stream) = shown.lock().unwrap().clone();
+            // No session while nothing streams: nowhere for input to go.
+            let Some((session, stream)) = shown.lock().unwrap().clone() else { return Ok(()) };
             match *action {
                 Action::Motion { x, y } => {
                     let (ox, oy) = input_region().map(|r| (r.0, r.1)).unwrap_or((0.0, 0.0));

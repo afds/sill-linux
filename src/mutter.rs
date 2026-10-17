@@ -189,6 +189,14 @@ impl Session {
         self.rd_call("NotifyKeyboardKeysym", &(sym, pressed)).await
     }
 
+    /// Whether GNOME still has this session (closed by its sharing indicator's stop, it is gone).
+    pub async fn alive(&self) -> bool {
+        self.conn
+            .call_method(Some(RD), self.rd.as_ref(), Some("org.freedesktop.DBus.Properties"), "Get", &(RD_SESSION, "SessionId"))
+            .await
+            .is_ok()
+    }
+
     pub async fn stop(&self) {
         let _ = self.rd_call("Stop", &()).await;
     }
