@@ -637,3 +637,21 @@ handle, as the indicator does. Handles: 0 at idle, 2 while streaming, 0 again 3 
 left. Stop pressed mid-stream: the goodbye arrived 0.5 s later, the host ran on, and a new
 connection streamed. Windows, launching an app, and Aa resizing and restoring ran as before.
 The portal path (other desktops, `--portal`) is unchanged: its session lives for the whole run.
+
+## Two Aa fixes (2026-10-17)
+
+- **A window goes back by Sill for Mac's rule** (`restore.rs`, its `WindowRestore`). Unmoved: its
+  whole frame from before. Moved here while it streamed: its own size where it is. Resized here:
+  left as it is. Full screen: left. The frame Sill left a window at is read back once the app and
+  GNOME have taken it (the first change, then 100 ms; 1 s at most). GNOME Calculator takes a size
+  a few hundred milliseconds late, and GNOME moves a window that would run off the screen, so a
+  read after 250 ms took GNOME's own move for the user's.
+- **A launched app's window is picked once it has a size** (its first frame drawn), and Aa waits
+  up to a second for one. Before, Aa could size a window still at 0×0, and its way back had
+  nothing to go to.
+
+Seen in the nested headless shell, with the build from before this change too: recording Calculator
+right after it opened, then sizing it, sometimes crashed GNOME Shell 50 ("Failed to blit window
+content to framebuffer", then `meta_multi_texture_get_n_planes: assertion failed`, then a
+segfault). After these two fixes it did not happen in seven runs, but the cause is GNOME's and
+timing-dependent, so it may not be gone. On a real session a GNOME Shell crash logs the user out.

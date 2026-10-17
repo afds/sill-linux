@@ -869,21 +869,32 @@ type Shown = Arc<std::sync::Mutex<Option<(Arc<crate::mutter::Session>, crate::mu
 /// first frame until something on it changes), the old one stopped once the new one runs.
 async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown, shell: Option<crate::shell::Client>, cursor: u32, mut rx: UnboundedReceiver<RecReq>) {
     let cast = |s: &crate::mutter::Stream| PortalCast { fd: None, node: s.node, size: s.size };
-    // Windows Aa sized, with their frames before: each goes back once it no longer streams, as
-    // Sill for Mac does (issue #57).
-    // shortcut: always the whole old frame, also after the user resized or moved it here; Sill for
-    // Mac leaves a window resized meanwhile (WindowRestore), worth it if that bites.
-    let mut fitted: HashMap<u64, crate::shell::Frame> = HashMap::new();
+    // Windows Aa sized: each goes back once it no longer streams, by Sill for Mac's rule
+    // (`restore.rs`, issue #57).
+    let mut fitted: HashMap<u64, crate::restore::Record> = HashMap::new();
     // The windows a spread minimized, which the next pinch or spread brings back.
     let mut shown_desktop: Option<Vec<u64>> = None;
-    async fn restore(shell: &Option<crate::shell::Client>, fitted: &mut HashMap<u64, crate::shell::Frame>, keep: Option<u64>) {
+    async fn restore(shell: &Option<crate::shell::Client>, fitted: &mut HashMap<u64, crate::restore::Record>, keep: Option<u64>) {
+        use crate::restore::Decision;
         let Some(s) = shell else { return };
         let ids: Vec<u64> = fitted.keys().copied().filter(|id| Some(*id) != keep).collect();
         for id in ids {
-            let f = fitted.remove(&id).unwrap();
+            let r = fitted.remove(&id).unwrap();
+            let (f, whole) = match crate::restore::decide(&r, s.frame_state(id).await) {
+                Decision::Gone | Decision::Home => continue,
+                Decision::Leave(why) => {
+                    println!("Left window {id} as it is: {why}.");
+                    continue;
+                }
+                Decision::Settle(f) => (f, true),
+                Decision::Restore(f, whole) => (f, whole),
+            };
             let restored = s.move_resize(id, f.x, f.y, f.width, f.height).await && (!f.maximized || s.set_maximized(id, true).await);
             if restored {
-                println!("Restored window {id} to {}×{} at {},{}{}.", f.width, f.height, f.x, f.y, if f.maximized { ", maximized" } else { "" });
+                let how = if whole { "" } else { ", its own size where it was moved" };
+                println!("Restored window {id} to {}×{} at {},{}{}{how}.", f.width, f.height, f.x, f.y, if f.maximized { ", maximized" } else { "" });
+            } else {
+                println!("Could not restore window {id}.");
             }
         }
     }
@@ -933,16 +944,42 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 let Some(s) = &shell else { continue };
                 // Never a window in full screen; a maximized one is unmaximized first (and maximized
                 // again when it goes back).
-                match s.frame_state(id).await {
-                    Some((before, false)) => {
+                // A window launched from the device can be picked before GNOME has laid it out
+                // (0×0): it gets a second to show a size.
+                let mut state = s.frame_state(id).await;
+                for _ in 0..10 {
+                    if !matches!(state, Some((f, false)) if f.width <= 0 || f.height <= 0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    state = s.frame_state(id).await;
+                }
+                match state {
+                    Some((before, false)) if before.width > 0 && before.height > 0 => {
                         if before.maximized {
                             s.set_maximized(id, false).await;
                         }
                         if s.move_resize(id, before.x, before.y, w, h).await {
-                            println!("Resized window {id} to {w}×{h} for the device (Aa), from {}×{}.", before.width, before.height);
-                            fitted.entry(id).or_insert(before);
+                            // Read back once the app (it may keep a minimum size) and GNOME (it may
+                            // move the window to keep it on screen) have taken it: the frame's first
+                            // change, then 100 ms; 1 s at most.
+                            let rect = |f: crate::shell::Frame| (f.x, f.y, f.width, f.height);
+                            let start = Instant::now();
+                            let mut after = rect(before);
+                            while start.elapsed() < Duration::from_secs(1) {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                after = s.frame_state(id).await.map(|(f, _)| rect(f)).unwrap_or(after);
+                                if after != rect(before) {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    after = s.frame_state(id).await.map(|(f, _)| rect(f)).unwrap_or(after);
+                                    break;
+                                }
+                            }
+                            println!("Resized window {id} to {}×{} for the device (Aa), from {}×{}.", after.2, after.3, before.width, before.height);
+                            fitted.insert(id, crate::restore::fitted(fitted.get(&id).copied(), before, after, (w, h)));
                         }
                     }
+                    Some((_, false)) => println!("Window {id} has no size yet; not resizing."),
                     _ => println!("Window {id} is full screen or gone; not resizing."),
                 }
             }
@@ -1182,8 +1219,11 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
         if let Some((app, at)) = pending {
             if at.elapsed() > LAUNCH_WAIT {
                 *PENDING_LAUNCH.lock().unwrap() = None;
-            } else if let Some(w) = list.iter().rev().find(|w| w.app_id == app) {
-                // The topmost of the app's windows: a running app's raised one, or its new one.
+            } else if let Some(w) = list.iter().rev().find(|w| w.app_id == app && w.width > 0 && w.height > 0) {
+                // The topmost of the app's windows: a running app's raised one, or its new one once
+                // it has a size (its first frame drawn): recording a window before that crashed
+                // GNOME Shell 50 (a failed blit, then a null texture), and an Aa fit had no frame to
+                // keep.
                 *PENDING_LAUNCH.lock().unwrap() = None;
                 server.pick_window(w.id);
             }
