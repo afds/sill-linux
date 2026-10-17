@@ -860,6 +860,7 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
 /// shortcut: the Desktop's rectangle is read once; a monitor layout change needs a restart.
 async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Option<(f64, f64, f64, f64)>) {
     let mut moving = false;
+    let mut warned = false;
     loop {
         let wait = if moving { Duration::from_micros(1_000_000 / server.current_apply().fps.max(30) as u64) } else { Duration::from_millis(30) };
         tokio::time::sleep(wait).await;
@@ -868,7 +869,13 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
             continue;
         }
         let window = server.active_window();
-        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else { continue };
+        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else {
+            if !warned {
+                warned = true;
+                println!("Pointer: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
+            }
+            continue;
+        };
         let rect = if window.is_some() { frame } else { desktop };
         moving = server.pointer_sample(p, rect);
     }
