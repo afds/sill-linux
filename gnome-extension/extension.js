@@ -15,6 +15,11 @@
 //   ClipboardText() -> s          its text ("" for none)
 //   SetClipboard(s text) -> b     the clipboard's text, from a device
 //   ClipboardChanged              the clipboard has new contents
+//   Gesture(s name) -> s          a trackpad gesture from a device, as GNOME's own: swipeUp
+//                                 Activities then the app grid, swipeDown back, swipeLeft and
+//                                 swipeRight the next and previous workspace, pinch the app grid,
+//                                 spread the desktop shown (pinch or spread again: the windows
+//                                 back); answers what it did, "" for nothing
 //   WindowsChanged                a window came, went, was retitled, resized, minimized or
 //                                 unminimized (coalesced, 250 ms)
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window, at most maxSize on its longer side,
@@ -46,6 +51,7 @@ import Cairo from 'cairo';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const BUS_NAME = 'org.sill_linux.Shell';
 const PATH = '/org/sill_linux/Shell';
@@ -86,6 +92,7 @@ const XML = `
     <method name="ClipboardTypes"><arg type="as" direction="out" name="types"/></method>
     <method name="ClipboardText"><arg type="s" direction="out" name="text"/></method>
     <method name="SetClipboard"><arg type="s" direction="in" name="text"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="Gesture"><arg type="s" direction="in" name="name"/><arg type="s" direction="out" name="did"/></method>
     <signal name="ClipboardChanged"/>
     <signal name="WindowsChanged"/>
   </interface>
@@ -235,6 +242,77 @@ class Service {
             return [x, y, 0, 0, 0, 0, false];
         const f = w.get_frame_rect();
         return [x, y, f.x, f.y, f.width, f.height, true];
+    }
+
+    Gesture(name) {
+        const overview = Main.overview;
+        const apps = overview.visible && overview.dash?.showAppsButton?.checked;
+        const time = global.get_current_time();
+        const workspace = dir => {
+            const ws = global.workspace_manager.get_active_workspace().get_neighbor(dir);
+            if (ws === global.workspace_manager.get_active_workspace())
+                return '';
+            ws.activate(time);
+            return `workspace ${ws.index() + 1}`;
+        };
+        if (this._shownDesktop && (name === 'pinch' || name === 'spread')) {
+            for (const w of this._shownDesktop)
+                w.unminimize();
+            this._shownDesktop = null;
+            return 'the windows back';
+        }
+        switch (name) {
+        case 'swipeUp':
+            if (apps)
+                return '';
+            if (overview.visible) {
+                // showApps() does not leave the window picker once Activities is open (GNOME 50);
+                // the Show Apps button, which the overview follows, does.
+                overview.dash.showAppsButton.checked = true;
+                return 'the app grid';
+            }
+            overview.show();
+            return 'Activities';
+        case 'swipeDown':
+            if (apps) {
+                overview.dash.showAppsButton.checked = false;
+                return 'Activities';
+            }
+            if (overview.visible) {
+                overview.hide();
+                return 'Activities closed';
+            }
+            return '';
+        case 'swipeLeft':
+            return workspace(Meta.MotionDirection.RIGHT);
+        case 'swipeRight':
+            return workspace(Meta.MotionDirection.LEFT);
+        case 'pinch':
+            if (apps) {
+                overview.hide();
+                return 'the app grid closed';
+            }
+            if (overview.visible)
+                overview.dash.showAppsButton.checked = true;
+            else
+                overview.showApps();
+            return 'the app grid';
+        case 'spread': {
+            if (overview.visible) {
+                overview.hide();
+                return 'Activities closed';
+            }
+            const active = global.workspace_manager.get_active_workspace();
+            const shown = windows().filter(w => w.located_on_workspace(active) && w.can_minimize());
+            if (!shown.length)
+                return '';
+            for (const w of shown)
+                w.minimize();
+            this._shownDesktop = shown;
+            return 'the desktop';
+        }
+        }
+        return '';
     }
 
     ClipboardTypes() {

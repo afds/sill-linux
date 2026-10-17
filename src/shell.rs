@@ -203,6 +203,11 @@ impl Client {
         Ok(self.proxy.receive_signal("ClipboardChanged").await?)
     }
 
+    /// A trackpad gesture as GNOME's own; what it did ("" for nothing; None: an older extension).
+    pub async fn gesture(&self, name: &str) -> Option<String> {
+        self.proxy.call_method("Gesture", &(name,)).await.ok()?.body().deserialize().ok()
+    }
+
     pub async fn command(&self, method: &str, id: u64) -> bool {
         match self.proxy.call_method(method, &(id,)).await {
             Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),

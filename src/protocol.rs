@@ -38,6 +38,7 @@ pub mod kind {
     pub const GOODBYE: u8 = 22;
     pub const HELLO: u8 = 23;
     pub const MAC_POINTER: u8 = 26;
+    pub const GESTURE: u8 = 28;
     pub const CLIPBOARD: u8 = 32;
 }
 
@@ -210,6 +211,9 @@ pub struct WindowList {
     pub host_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<i64>,
+    /// Which trackpad gestures this host takes (1: the six); None: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gestures: Option<i64>,
     /// What of the clipboard this host shares (1: text); None: nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<i64>,
@@ -314,6 +318,7 @@ mod tests {
             launch_id: Some("L".into()),
             host_version: None,
             protocol: Some(1),
+            gestures: None,
             clipboard: None,
         };
         let v: serde_json::Value = serde_json::to_value(&l).unwrap();

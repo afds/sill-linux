@@ -70,6 +70,8 @@ pub enum Control {
     WindowCommand(u64, String),
     /// Start an installed app (its .desktop id) from the device's All Apps; its window is picked.
     Launch(String),
+    /// A trackpad gesture (one of Sill's six names) for GNOME to act on.
+    Gesture(String),
     /// Aa: size the streamed window's frame to this many logical pixels (the device's panel over
     /// its text scale).
     Fit(u64, i32, i32),
@@ -141,6 +143,7 @@ struct Client {
     /// Sent kind 32: this machine's copies go to it. With the times of its last second's asks.
     clip_subscribed: bool,
     clip_arrivals: Vec<f64>,
+    gesture_arrivals: Vec<f64>,
 }
 
 struct State {
@@ -180,6 +183,8 @@ pub struct Server {
     input: Arc<Mutex<Option<mpsc::UnboundedSender<InputCmd>>>>,
     /// Where a device's text goes to become this machine's clipboard; None: not shared.
     clipboard: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// Trackpad gestures are taken (GNOME, with the extension).
+    gestures: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Server {
@@ -212,6 +217,7 @@ impl Server {
             door,
             input: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            gestures: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -392,6 +398,7 @@ impl Server {
             launch_id: Some((*self.launch_id).clone()),
             host_version: None,
             protocol: Some(protocol::PROTOCOL),
+            gestures: self.gestures.load(Ordering::Relaxed).then_some(1),
             clipboard: self.clipboard.lock().unwrap().is_some().then_some(crate::clipboard::GENERATION),
         };
         protocol::message(kind::WINDOW_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
@@ -432,6 +439,7 @@ impl Server {
                     last_pointer: None,
                     clip_subscribed: false,
                     clip_arrivals: Vec::new(),
+                    gesture_arrivals: Vec::new(),
                 },
             );
             if st.active != StreamSource::None {
@@ -494,6 +502,7 @@ impl Server {
                 kind::WINDOW_COMMAND => self.window_command(id, &payload),
                 kind::LAUNCH_APP => self.launch(id, &payload),
                 kind::CLIPBOARD => self.clipboard_from(id, &payload),
+                kind::GESTURE => self.gesture(id, &payload),
                 kind::CHANGE_SETTINGS => match serde_json::from_slice::<HostSettingsChange>(&payload) {
                     Ok(change) => self.change_settings(id, change),
                     Err(e) => eprintln!("Bad settings change from client {id}: {e}"),
@@ -821,6 +830,40 @@ impl Server {
             }
             let _ = writer.send(text);
         }
+    }
+
+    /// Takes trackpad gestures from now on (the window list says so).
+    pub fn set_gestures(&self) {
+        self.gestures.store(true, Ordering::Relaxed);
+    }
+
+    /// A device's three- or four-finger gesture (kind 28): one of Sill's six names, at most four a
+    /// second per connection, as Sill for Mac.
+    fn gesture(&self, id: u64, payload: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct TrackpadGesture {
+            gesture: String,
+        }
+        const NAMES: [&str; 6] = ["swipeUp", "swipeDown", "swipeLeft", "swipeRight", "pinch", "spread"];
+        if !self.gestures.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(g) = serde_json::from_slice::<TrackpadGesture>(payload) else { return };
+        if !NAMES.contains(&g.gesture.as_str()) {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        let Some(c) = st.clients.get_mut(&id) else { return };
+        let now = clock();
+        c.gesture_arrivals.retain(|t| now - t < 1.0);
+        if c.gesture_arrivals.len() >= 4 {
+            return;
+        }
+        c.gesture_arrivals.push(now);
+        let label = c.label.clone();
+        drop(st);
+        println!("Gesture from {label}: {}", g.gesture);
+        let _ = self.control.send(Control::Gesture(g.gesture));
     }
 
     /// Whether a source streams (the pointer is watched only then).

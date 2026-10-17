@@ -298,6 +298,11 @@ fn run_pipeline(
                     let _ = rec.send(RecReq::Launch(app));
                 }
             }
+            Ok(Control::Gesture(name)) => {
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Gesture(name));
+                }
+            }
             Ok(Control::Fit(id, w, h)) => {
                 if let Some(rec) = recorder {
                     let _ = rec.send(RecReq::Fit(id, w, h));
@@ -717,6 +722,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     match &shell {
         Some(s) => {
             println!("Windows: from the Sill for Linux GNOME Shell extension.");
+            server.set_gestures();
             // This machine's pointer on the devices (kind 26), unless it is in the picture already.
             if cursor == 0 {
                 let origin = crate::mutter::monitor_origin(&conn, &connector).await.unwrap_or((0, 0));
@@ -744,6 +750,7 @@ enum RecReq {
     Record(Source, mpsc::Sender<Result<PortalCast>>),
     Command(u64, String),
     Launch(String),
+    Gesture(String),
     /// Aa: a window's frame to this size (logical pixels).
     Fit(u64, i32, i32),
     /// Nothing streams: every window Aa sized goes back.
@@ -789,6 +796,14 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
             RecReq::Launch(app) => match &shell {
                 Some(s) if s.launch(&app).await => *PENDING_LAUNCH.lock().unwrap() = Some((app, Instant::now())),
                 _ => println!("Could not launch {app}."),
+            },
+            RecReq::Gesture(name) => match &shell {
+                Some(s) => match s.gesture(&name).await {
+                    Some(did) if !did.is_empty() => println!("Gesture {name}: {did}."),
+                    Some(_) => println!("Gesture {name}: nothing to do."),
+                    None => println!("Gesture {name}: the GNOME Shell extension running is older than this host; --install-extension, then log out and in."),
+                },
+                None => {}
             },
             RecReq::Fit(id, w, h) => {
                 let Some(s) = &shell else { continue };

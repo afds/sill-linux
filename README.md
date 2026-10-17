@@ -49,7 +49,9 @@ here, so typing goes to it), cropped to its frame. Holding a thumbnail gives its
 minimize, full screen. All Apps lists the installed apps with their icons and starts one (its
 window then streams), and Aa sizes the streamed window to the iPad's panel (it goes back when it
 stops streaming). After updating sill-linux, run `--install-extension` again and log out and in.
-Without the extension, or with `--portal`, only the Desktop streams. The clipboard is shared both ways too
+Without the extension, or with `--portal`, only the Desktop streams. Three-finger gestures on the app's trackpad work as GNOME's own:
+swipe up for Activities and the app grid, left and right for workspaces, pinch for the app grid,
+spread for the desktop. The clipboard is shared both ways too
 (text; never a password manager's copies; `--no-clipboard` turns it off), with a Sill app version
 that has it (after 0.5.1). Elsewhere, or with `--portal`, the
 desktop portal asks once which monitor to share and to allow remote control; the answer is kept

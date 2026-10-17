@@ -555,3 +555,22 @@ Verified in the nested shell (its own clipboard, never this machine's) with Sill
 - the window lists said `clipboard=1`.
 
 The marker rule has unit tests only (St.Clipboard writes one type).
+
+## Trackpad gestures (2026-10-17)
+
+Kind 28 (`TrackpadGesture`, Sill's six names), taken only once the window list says `gestures` 1
+(GNOME, with the extension), at most four a second per connection, as Sill for Mac. Sill for Mac
+turns each gesture into the Mac's own shortcut and guesses what is open; GNOME's state can be read,
+so the extension's `Gesture(name)` acts on it the way GNOME's own touchpad gestures do:
+- swipe up: Activities, then the app grid;
+- swipe down: back the same way;
+- swipe left and right: the next and previous workspace (natural direction, as on the Mac);
+- pinch: the app grid, or closes it;
+- spread: closes Activities, else shows the desktop (the active workspace's windows minimized);
+- a pinch or a spread after that brings those windows back.
+
+Found in the nested shell: once Activities is open, `Main.overview.showApps()` leaves it in the
+window picker (GNOME 50), while setting the Show Apps button's `checked` switches to the app grid.
+
+Verified there with a test client sending each gesture: every step answered as listed (Activities,
+the app grid, nothing at the top; back down; workspace 2 and 1; the desktop and the windows back).
