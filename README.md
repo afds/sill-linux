@@ -107,7 +107,8 @@ notification, and in a terminal it is printed too (with a QR code if `qrencode` 
 ```
 sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
            [--show-cursor] [--keep-all-taps] [--choose-screen] [--portal] [--monitor CONNECTOR]
-           [--no-notifications] [--no-clipboard] [--no-remote] [--command-key ctrl|super]
+           [--no-notifications] [--no-clipboard] [--no-remote] [--unlock-from-device]
+           [--command-key ctrl|super]
            [--forget-devices]
 ```
 
@@ -118,6 +119,10 @@ sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-
   since the app's trackpad can report it as a tap.
 - `--view-only` takes no input.
 - `--no-remote` keeps this machine's addresses from paired devices, so there is no Remote row.
+- `--unlock-from-device` lets paired devices see the lock screen and unlock it. GNOME normally stops
+  all screen sharing while the screen is locked (the device then says so); with this flag the
+  extension sets that rule aside while sill-linux runs, and windows stay hidden from devices until
+  the screen is unlocked. Off by default.
 
 With a device streaming, the host prints a `[1s]` line: frames captured, encoded, sent and
 dropped, and the device's own frame age and round trip.

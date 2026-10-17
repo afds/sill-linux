@@ -10,7 +10,7 @@ use std::sync::mpsc;
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
                   [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
                   [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR] [--no-clipboard]
-                  [--no-remote]
+                  [--no-remote] [--unlock-from-device]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
        sill-linux --install-extension                 GNOME: list single windows in the app's bar
@@ -60,12 +60,13 @@ struct Args {
     service: Option<bool>,
     extension: bool,
     clipboard: bool,
+    unlock: bool,
     /// The arguments to keep in the service's command line.
     pass: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, pass: Vec::new() };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, unlock: false, pass: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut taken = None;
@@ -97,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-notifications" => a.notifications = false,
             "--no-clipboard" => a.clipboard = false,
             "--no-remote" => sill_linux::remote::set_enabled(false),
+            "--unlock-from-device" => a.unlock = true,
             "--install-service" => {
                 a.service = Some(true);
                 continue;
@@ -234,6 +236,7 @@ fn main() {
         sill_linux::capture::set_force_portal(args.portal);
         sill_linux::capture::set_monitor(args.monitor.clone());
         sill_linux::capture::set_share_clipboard(args.clipboard);
+        sill_linux::capture::set_unlock_from_device(args.unlock);
     }
     run_capture(&server, control_rx, args.input, args.show_cursor, args.keep_all_taps);
 }

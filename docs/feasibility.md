@@ -765,3 +765,23 @@ main.js does on a desktop: the host started while locked, a device connecting wh
 the locked goodbye, after unlocking it streamed, and locking while it streamed gave the locked
 goodbye; the host ran throughout. The suspend inhibitor's call answered with a cookie on this
 desktop's session manager (the nested shell has none).
+
+### `--unlock-from-device` (opt-in)
+
+With the flag, sill-linux asks the extension (version 5, which stays enabled on the lock screen:
+`session-modes` user and unlock-dialog) to set GNOME's rule aside: its `SetUnlockFromDevice(true)`
+puts own methods on the remote-access controller's JS wrapper, the one main.js calls, that skip
+the inhibit made while the session mode is `unlock-dialog` and the uninhibit that matches it.
+Only while the caller is on the bus: when sill-linux goes (exit, crash), the extension removes them
+and makes any inhibit it skipped, so a lock screen up then is protected again. Rust keeps
+windows from the devices while `org.gnome.ScreenSaver` says locked: none listed (a streamed one
+stops as a closed window does), no thumbnails of them, no launch picks; displays stay (they show
+the lock screen).
+
+Checked in the nested shell, the test extension locking and inhibiting as main.js does on a
+desktop: with a window streaming, the lock kept the session; 1.2 s later the list was empty and
+the window's stream stopped; the Desktop then streamed the lock screen, and typed text reached the
+password field. Unlocked: windows back, a new session streamed. Locked again and sill-linux
+stopped: a host without the flag was refused with the locked goodbye (GNOME's inhibit back).
+Not checked: a real unlock with the password, and a GNOME Shell crash path (the wrappers die with
+it; a fresh shell has GNOME's own behaviour).

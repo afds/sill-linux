@@ -833,6 +833,13 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
                 );
             }
             server.set_gestures();
+            if UNLOCK_FROM_DEVICE.load(Ordering::Relaxed) {
+                if running >= 5 && s.set_unlock_from_device(true).await {
+                    println!("Lock screen: devices see it and can unlock it (--unlock-from-device); windows stay hidden while it is locked.");
+                } else {
+                    println!("Lock screen: --unlock-from-device needs the newer extension (--install-extension, then log out and in).");
+                }
+            }
             if running >= 3 && let Some(door) = server.pairing_door() {
                 tokio::spawn(pairing_window(door, s.clone()));
             }
@@ -1192,6 +1199,14 @@ async fn pairing_window(door: Arc<crate::door::PairingDoor>, shell: crate::shell
     }
 }
 
+static UNLOCK_FROM_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--unlock-from-device`: devices see the lock screen and can unlock it (GNOME's rule against
+/// screen casting there is set aside while this host runs; the extension, version 5, does it).
+pub fn set_unlock_from_device(on: bool) {
+    UNLOCK_FROM_DEVICE.store(on, Ordering::Relaxed);
+}
+
 static SHARE_CLIPBOARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// `--no-clipboard`: nothing of the clipboard is shared with devices.
@@ -1325,6 +1340,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
     let mut apps_sent = false;
     let mut displays: Vec<(u64, crate::mutter::Monitor)> = Vec::new();
     let mut display_stamps: HashMap<u64, Instant> = HashMap::new();
+    let mut locked = false;
     loop {
         let changed = tokio::select! {
             c = async { match changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => c.is_some(),
@@ -1363,6 +1379,14 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
             displays = now_displays;
             *DISPLAYS.lock().unwrap() = displays.clone();
         }
+        // Nothing behind the lock screen goes to the devices: no windows (a streamed one stops, as a
+        // closed one does) and no thumbnails of them while it is locked.
+        let now_locked = crate::mutter::screen_locked(&conn).await;
+        if now_locked != locked {
+            locked = now_locked;
+            println!("Windows: {}", if locked { "hidden from devices while the screen is locked." } else { "shown again (unlocked)." });
+            stamps.clear();
+        }
         // The server sends the list only when it changed.
         // The app shows a window's app name and icon, not its title: each display is an app of
         // its own, named after the monitor.
@@ -1374,7 +1398,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
             width: m.rect.2 as i64,
             height: m.rect.3 as i64,
         });
-        let windows = list.iter().map(|w| HostWindow {
+        let windows = list.iter().filter(|_| !locked).map(|w| HostWindow {
             mutter_id: w.id,
             title: w.title.clone(),
             app_name: w.app_name.clone(),
@@ -1383,7 +1407,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
             height: w.height as i64,
         });
         server.set_windows(hosts.chain(windows).collect());
-        let pending = PENDING_LAUNCH.lock().unwrap().clone();
+        let pending = PENDING_LAUNCH.lock().unwrap().clone().filter(|_| !locked);
         if let Some((app, at)) = pending {
             if at.elapsed() > LAUNCH_WAIT {
                 *PENDING_LAUNCH.lock().unwrap() = None;
@@ -1433,7 +1457,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
         stamps.retain(|id, _| list.iter().any(|w| w.id == *id));
         let active = server.active_window();
         let now = Instant::now();
-        for w in &list {
+        for w in list.iter().filter(|_| !locked) {
             let due = match stamps.get(&w.id) {
                 None => true,
                 Some((info, at)) => info != w || active == Some(w.id) || now.duration_since(*at) >= Duration::from_secs(6),
