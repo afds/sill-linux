@@ -99,7 +99,7 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
 
     gst::init().context("GStreamer init")?;
     let mut apply = server.current_apply();
-    let (formats, encoder_desc, name) = encoder(apply.kbps())?;
+    let (formats, encoder_desc, name) = encoder()?;
     server.set_software_encoder(name.contains("software"));
     let gl = name.starts_with("NVENC");
     // NVENC takes the compositor's DMA-BUF straight into GL (zero copy; also the only way frames
@@ -439,7 +439,7 @@ fn run_pipeline(
                         Err(e) => break Err(e.context("changing the resolution")),
                     }
                 } else {
-                    tail.enc.set_property("bitrate", apply.kbps());
+                    set_bitrate(&tail.enc, apply.kbps());
                 }
                 describe(shape, apply);
                 keyframe_pending = true;
@@ -570,8 +570,12 @@ struct TailShape {
 }
 
 /// The crop of a GL texture: the output's texture coordinates mapped into the region.
+// highp: mediump (16-bit floats on GLES, what NVIDIA's EGL gives GStreamer) cannot address a
+// 1,000+ px texture's pixels, so every sample fell between them and window streams came out soft
+// (32.8 dB against a plain crop; highp: identical). Not behind GL_FRAGMENT_PRECISION_HIGH, which
+// NVIDIA's GLES leaves undefined.
 const CROP_SHADER: &str = "#ifdef GL_ES
-precision mediump float;
+precision highp float;
 #endif
 varying vec2 v_texcoord;
 uniform sampler2D tex;
@@ -605,6 +609,16 @@ fn describe(shape: &TailShape, a: &Apply) {
     println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
 }
 
+/// The bitrate asked for, at most what the encoder takes (x265enc stops at 102,400 kbit/s, under
+/// Extreme's 150 Mbit/s).
+fn set_bitrate(enc: &gst::Element, kbps: u32) {
+    let max = enc
+        .find_property("bitrate")
+        .and_then(|p| p.downcast::<gst::glib::ParamSpecUInt>().ok())
+        .map_or(u32::MAX, |p| p.maximum());
+    enc.set_property("bitrate", kbps.min(max));
+}
+
 fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<AtomicU64>, Arc<AtomicU64>)) -> Result<Tail> {
     let size = match (a.retina, shape.logical) {
         (false, Some((w, h))) => format!(",width={w},height={h}"),
@@ -627,7 +641,6 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
             format!("{cut}videoscale ! video/x-raw,format={first}{size}")
         }
     };
-    // The encoder's bitrate is the one asked for now (the template carries the first one).
     let encoder = shape.encoder.clone();
     let description = format!(
         "{scale} ! {encoder} ! video/x-h265,profile=main ! h265parse config-interval=-1 \
@@ -635,7 +648,7 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
     );
     let bin = gst::parse::bin_from_description(&description, true).context("building the encoder")?;
     let enc = bin.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
-    enc.set_property("bitrate", a.kbps());
+    set_bitrate(&enc, a.kbps());
     if let (Some(shader), Some(((x, y, w, h), (bw, bh)))) = (bin.by_name("crop"), shape.crop) {
         let f = |v: u32, of: u32| v as f32 / of.max(1) as f32;
         shader.set_property("fragment", CROP_SHADER);
@@ -716,7 +729,7 @@ fn replace_tail(
 
 /// The first HEVC encoder this machine has: the input formats it takes, the element with its
 /// settings, and a name for the log.
-fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
+fn encoder() -> Result<(&'static str, String, &'static str)> {
     // SILL_LINUX_ENCODER=nv|va|x265 picks one (testing); otherwise the first this machine has.
     let only = std::env::var("SILL_LINUX_ENCODER").ok();
     let have = |name: &str| {
@@ -734,7 +747,7 @@ fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
             "BGRx,BGRA,RGBx,RGBA,NV12",
             format!(
                 "nvh265enc name=enc preset=p1 tune=ultra-low-latency zerolatency=true bframes=0 gop-size={gop} \
-                 rc-mode=cbr bitrate={kbps} repeat-sequence-header=true"
+                 rc-mode=cbr repeat-sequence-header=true"
             ),
             "NVENC (nvh265enc)",
         ));
@@ -742,14 +755,14 @@ fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
     if have("vah265enc") {
         return Ok((
             "NV12",
-            format!("vah265enc name=enc b-frames=0 key-int-max={gop} rate-control=cbr bitrate={kbps} target-usage=7"),
+            format!("vah265enc name=enc b-frames=0 key-int-max={gop} rate-control=cbr target-usage=7"),
             "VA-API (vah265enc)",
         ));
     }
     if have("x265enc") {
         return Ok((
             "I420",
-            format!("x265enc name=enc speed-preset=ultrafast tune=zerolatency key-int-max={gop} bitrate={kbps}"),
+            format!("x265enc name=enc speed-preset=ultrafast tune=zerolatency key-int-max={gop}"),
             "software x265 (x265enc)",
         ));
     }

@@ -794,3 +794,23 @@ A review of everything since the security review. Fixed:
 Checked and not so: closing the streamed window ends GNOME's whole session (read from Mutter's
 source). In the nested shell the session stays, the stream ends and the host goes back to the
 Desktop, the device connected.
+
+## Window streams were soft (2026-10-17)
+
+Text in a streamed window was a little soft, with faint specks on white, at any quality. Measured
+in the nested shell (a test page in a window, the stream against a screenshot of the window):
+40.6 dB of luma, where the Desktop and the encoder alone gave 50–53. The cause was the crop
+shader that cuts a window out of its buffer on the GL path (every NVENC machine): `precision
+mediump float`, on GLES (what NVIDIA's EGL gives GStreamer), is 16-bit, too coarse to address a
+texture 1,000+ pixels wide, so every sample fell between pixels. With `highp` the shader's output
+is identical to a plain crop, and the window stream measures 53.3 dB. Not behind
+`GL_FRAGMENT_PRECISION_HIGH`: NVIDIA's GLES leaves it undefined, and the shader stayed mediump.
+
+Checked on the way and not the cause: the encoder (NVENC at 150 Mbit/s is within a few dB of
+lossless on text, still or scrolling, at presets p1, p4 and p7 alike), the stream's variable frame
+rate, NVENC's own RGB to YUV conversion, Mutter's window capture (x265 through the plain crop gave
+the window as captured). Prioritize Encoding Speed still changes nothing here: the presets made no
+difference to quality at these bitrates.
+
+Found too: x265enc takes at most 102,400 kbit/s, and Extreme (150 Mbit/s) panicked the host on a
+machine with neither NVENC nor VA-API. The bitrate is now at most what the encoder takes.
