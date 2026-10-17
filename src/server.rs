@@ -14,6 +14,7 @@
 //! - a client that drains no frame for 4 s is closed (not in its first 8 s).
 
 use crate::door::{PairingDoor, Admission};
+use crate::input::InputEvent;
 use crate::protocol::{self, kind, ClientStats, Hello, StreamSource, Viewport, WindowList};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -41,6 +42,14 @@ pub enum Control {
     Stop,
     /// A client needs a keyframe (it joined, or it lost a delta).
     Keyframe,
+}
+
+/// What the server hands the input side: one device's event, or that it left (its keys and
+/// buttons go up).
+#[derive(Debug)]
+pub enum InputCmd {
+    Event(u64, InputEvent),
+    Left(u64),
 }
 
 /// How the door speaks.
@@ -78,6 +87,8 @@ pub struct Server {
     host_name: Arc<String>,
     launch_id: Arc<String>,
     door: Door,
+    /// The input side once the portal allows it; None: input is ignored (view only).
+    input: Arc<Mutex<Option<mpsc::UnboundedSender<InputCmd>>>>,
 }
 
 impl Server {
@@ -88,7 +99,13 @@ impl Server {
             host_name: Arc::new(host_name),
             launch_id: Arc::new(uuid::Uuid::new_v4().to_string()),
             door,
+            input: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Where devices' input goes from now on.
+    pub fn set_input(&self, tx: mpsc::UnboundedSender<InputCmd>) {
+        *self.input.lock().unwrap() = Some(tx);
     }
 
     /// Binds and serves on threads of its own; returns the bound address.
@@ -273,9 +290,16 @@ impl Server {
                     }
                 }
                 kind::INPUT => {
-                    if !input_noted {
-                        input_noted = true;
-                        println!("Input from client {id} is ignored for now (phase 2).");
+                    let input = self.input.lock().unwrap().clone();
+                    match (input, InputEvent::parse(&payload)) {
+                        (Some(tx), Some(event)) => {
+                            let _ = tx.send(InputCmd::Event(id, event));
+                        }
+                        (None, _) if !input_noted => {
+                            input_noted = true;
+                            println!("Input from client {id} is ignored (view only).");
+                        }
+                        _ => {}
                     }
                 }
                 _ => {} // kinds this host does not serve yet are skipped, as Sill's readers skip unknown kinds
@@ -319,6 +343,9 @@ impl Server {
         let mut st = self.state.lock().unwrap();
         let Some(c) = st.clients.remove(&id) else { return };
         let _ = c.close.send(true);
+        if let Some(tx) = self.input.lock().unwrap().as_ref() {
+            let _ = tx.send(InputCmd::Left(id));
+        }
         println!("Client left: {} ({reason})", c.label);
         if st.clients.is_empty() && st.active != StreamSource::None {
             st.active = StreamSource::None;

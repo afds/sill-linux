@@ -4,9 +4,9 @@ An experimental Linux (Wayland) host for the [Sill](https://getsill.app) iPhone 
 stream a Linux desktop, and later single windows, to the existing Sill app over your network.
 
 **Status: phases 1 and 3 of [docs/feasibility.md](docs/feasibility.md).** It streams the whole
-desktop to the **App Store build** of the Sill app over your network: TLS 1.3 with pinned keys,
-and a one-time pairing with a code this terminal shows, as Sill for Mac does. No input yet (taps
-and keys are ignored), no single windows.
+desktop to the **App Store build** of the Sill app over your network (TLS 1.3 with pinned keys,
+and a one-time pairing with a code this terminal shows, as Sill for Mac does), and takes the
+app's input: taps and clicks, scrolling, hardware keys and typed text. No single windows yet.
 
 This is a separate project. It is not part of Sill and isn't supported by Sill's author. Sill's
 own host is the free Mac app; this one speaks the same wire protocol (pinned in
@@ -31,10 +31,14 @@ door, for a Debug build of the app.
 The host's key, recognition key and paired devices live in `~/.local/state/sill-linux/` (0600).
 Deleting `host-key.pk8` makes a new host as far as devices are concerned: each pairs again.
 
-The first run asks which monitor to share; the answer is kept
-(`~/.local/state/sill-linux/restore-token`, delete it to be asked again). With a device
+The first run asks which monitor to share and to allow remote control (the RemoteDesktop portal);
+the answer is kept
+(`~/.local/state/sill-linux/remote-desktop-token`, delete it to be asked again; with
+`--view-only`, no remote control, `restore-token`). The device's Command key is Ctrl here
+(`--command-key super` to change it), so ⌘C copies; the app's Spotlight key (⌘Space) taps Super,
+which opens GNOME's Activities. With a device
 streaming, it prints a `[1s]` line: frames captured, encoded, sent and dropped, then the device's
-own `client …` line every two seconds (frame age and round trip, median/worst).
+own `client …` line every two seconds; `in N` is the device's input events (frame age and round trip, median/worst).
 
 A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.

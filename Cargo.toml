@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"], optional = true }
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"], optional = true }
 gstreamer = { version = "0.25.4", optional = true }
 gstreamer-app = { version = "0.25.2", optional = true }
 gstreamer-video = { version = "0.25.4", optional = true }

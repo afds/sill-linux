@@ -10,7 +10,12 @@
 //! `$XDG_STATE_HOME/sill-linux/restore-token`, so later runs start without the dialog.
 
 use crate::protocol;
-use crate::server::{Control, Server};
+use crate::input::{Action, CommandKey, Translator};
+use crate::server::{Control, InputCmd, Server};
+use ashpd::desktop::remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions, StartOptions};
+use ashpd::desktop::Session;
+use std::collections::HashMap;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions};
 use ashpd::desktop::{CreateSessionOptions, PersistMode};
@@ -35,8 +40,12 @@ struct PortalCast {
     size: Option<(i32, i32)>,
 }
 
-pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Result<()> {
-    let cast = start_portal()?;
+/// `input`: the Command key's meaning, or None for view only (no remote control asked for).
+pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input: Option<CommandKey>) -> Result<()> {
+    let (cast, input_tx) = start_portal(input)?;
+    if let Some(tx) = input_tx {
+        server.set_input(tx);
+    }
     match cast.size {
         Some((w, h)) => println!("Screen cast: PipeWire node {}, {w}×{h}.", cast.node),
         None => println!("Screen cast: PipeWire node {}.", cast.node),
@@ -76,6 +85,11 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(s) = sample.caps().and_then(|c| c.structure(0)) {
+                    if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+                        FRAME_SIZE.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+                    }
+                }
                 if let Some(buffer) = sample.buffer() {
                     if let Ok(map) = buffer.map_readable() {
                         frames_server.broadcast_access_unit(&protocol::convert_annex_b(map.as_slice()));
@@ -132,7 +146,8 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
             last_stats = Instant::now();
             let (cap, enc) = (captured.swap(0, Ordering::Relaxed), encoded.swap(0, Ordering::Relaxed));
             if streaming {
-                println!("[1s] cap {cap} enc {enc} {}", server.take_stats());
+                let inputs = INPUT_EVENTS.swap(0, Ordering::Relaxed);
+                println!("[1s] cap {cap} enc {enc} {} in {inputs}", server.take_stats());
             }
         }
         if keyframe_pending && last_keyframe.elapsed() >= KEYFRAME_SPACING {
@@ -225,18 +240,28 @@ fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
     bail!("no HEVC encoder in GStreamer (nvh265enc, vah265enc or x265enc)")
 }
 
-fn token_path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("sill-linux").join("restore-token")
+fn state_file(name: &str) -> PathBuf {
+    crate::identity::state_dir().join(name)
+}
+
+fn read_token(path: &PathBuf) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+fn save_token(path: &PathBuf, token: Option<&str>) {
+    if let Some(t) = token {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, t);
+    }
 }
 
 /// Runs the portal on a thread of its own, which then keeps the session (and its D-Bus
-/// connection) alive for as long as this process runs.
-fn start_portal() -> Result<PortalCast> {
-    let (tx, rx) = mpsc::channel::<Result<PortalCast>>();
+/// connection) alive for as long as this process runs. With `input`, the session is a
+/// RemoteDesktop one with the screen cast in it, and input runs on that thread too.
+fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>)> {
+    let (tx, rx) = mpsc::channel::<Result<(PortalCast, Option<UnboundedSender<InputCmd>>)>>();
     std::thread::Builder::new().name("portal".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -246,30 +271,47 @@ fn start_portal() -> Result<PortalCast> {
             }
         };
         rt.block_on(async move {
-            match portal_session().await {
-                Ok((cast, keep)) => {
-                    let _ = tx.send(Ok(cast));
-                    let _keep = keep;
-                    std::future::pending::<()>().await;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
+            match input {
+                Some(command) => match remote_session(command).await {
+                    Ok((cast, input_tx, keep)) => {
+                        let _ = tx.send(Ok((cast, Some(input_tx))));
+                        let _keep = keep;
+                        std::future::pending::<()>().await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                },
+                None => match screencast_session().await {
+                    Ok((cast, keep)) => {
+                        let _ = tx.send(Ok((cast, None)));
+                        let _keep = keep;
+                        std::future::pending::<()>().await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                },
             }
         });
     })?;
     rx.recv().context("the portal thread ended")?
 }
 
-async fn portal_session() -> Result<(PortalCast, impl Send)> {
-    let proxy = Screencast::new().await.context("the screen-cast portal is not available")?;
-    let session = proxy.create_session(CreateSessionOptions::default()).await.context("CreateSession")?;
-    let cursor = match proxy.available_cursor_modes().await {
+async fn cursor_mode(proxy: &Screencast) -> CursorMode {
+    match proxy.available_cursor_modes().await {
         Ok(modes) if modes.contains(CursorMode::Embedded) => CursorMode::Embedded,
         _ => CursorMode::Hidden,
-    };
-    let token_file = token_path();
-    let token = std::fs::read_to_string(&token_file).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    }
+}
+
+/// View only: the screen-cast portal alone (`--view-only`).
+async fn screencast_session() -> Result<(PortalCast, impl Send)> {
+    let proxy = Screencast::new().await.context("the screen-cast portal is not available")?;
+    let session = proxy.create_session(CreateSessionOptions::default()).await.context("CreateSession")?;
+    let cursor = cursor_mode(&proxy).await;
+    let token_file = state_file("restore-token");
+    let token = read_token(&token_file);
     if token.is_none() {
         println!("Asking to share a screen: pick the monitor in the dialog on this screen.");
     }
@@ -293,17 +335,135 @@ async fn portal_session() -> Result<(PortalCast, impl Send)> {
         .context("Start")?
         .response()
         .context("screen sharing was not allowed")?;
-    if let Some(t) = streams.restore_token() {
-        if let Some(dir) = token_file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&token_file, t);
-    }
+    save_token(&token_file, streams.restore_token());
     let stream = streams.streams().first().ok_or_else(|| anyhow!("the portal returned no stream"))?;
     let (node, size) = (stream.pipe_wire_node_id(), stream.size());
-    let fd = proxy
-        .open_pipe_wire_remote(&session, Default::default())
-        .await
-        .context("OpenPipeWireRemote")?;
+    let fd = proxy.open_pipe_wire_remote(&session, Default::default()).await.context("OpenPipeWireRemote")?;
     Ok((PortalCast { fd, node, size }, (proxy, session)))
+}
+
+/// The screen and remote control in one RemoteDesktop session: one dialog, kept with its own
+/// restore token (a screen-cast token does not restore a RemoteDesktop session).
+async fn remote_session(command: CommandKey) -> Result<(PortalCast, UnboundedSender<InputCmd>, impl Send)> {
+    let rd = RemoteDesktop::new().await.context("the remote-desktop portal is not available (use --view-only)")?;
+    let sc = Screencast::new().await.context("the screen-cast portal is not available")?;
+    let session = rd.create_session(CreateSessionOptions::default()).await.context("CreateSession")?;
+    let cursor = cursor_mode(&sc).await;
+    let token_file = state_file("remote-desktop-token");
+    let token = read_token(&token_file);
+    if token.is_none() {
+        println!("Asking to share a screen and allow remote control: pick the monitor and allow it in the dialog on this screen.");
+    }
+    rd.select_devices(
+        &session,
+        SelectDevicesOptions::default()
+            .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+            .set_restore_token(token.as_deref()),
+    )
+    .await
+    .context("SelectDevices")?
+    .response()
+    .context("SelectDevices was refused")?;
+    sc.select_sources(
+        &session,
+        SelectSourcesOptions::default()
+            .set_cursor_mode(cursor)
+            .set_sources(BitFlags::from(SourceType::Monitor))
+            .set_multiple(false),
+    )
+    .await
+    .context("SelectSources")?
+    .response()
+    .context("SelectSources was refused")?;
+    let selected = rd
+        .start(&session, None, StartOptions::default())
+        .await
+        .context("Start")?
+        .response()
+        .context("screen sharing and remote control were not allowed")?;
+    save_token(&token_file, selected.restore_token());
+    let devices = selected.devices();
+    println!(
+        "Remote control: {}.",
+        match (devices.contains(DeviceType::Pointer), devices.contains(DeviceType::Keyboard)) {
+            (true, true) => "pointer and keyboard",
+            (true, false) => "pointer only",
+            (false, true) => "keyboard only",
+            (false, false) => "not allowed",
+        }
+    );
+    let stream = selected.streams().first().ok_or_else(|| anyhow!("the portal returned no stream"))?;
+    let (node, size) = (stream.pipe_wire_node_id(), stream.size());
+    let fd = sc.open_pipe_wire_remote(&session, Default::default()).await.context("OpenPipeWireRemote")?;
+    let (w, h) = size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_input(rd, session, node, w, h, command, input_rx));
+    Ok((PortalCast { fd, node, size }, input_tx, sc))
+}
+
+/// Input events counted for the stats line.
+static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// The encoded picture's size, width << 32 | height (0 before the first frame): the space the
+/// portal takes absolute motion in.
+static FRAME_SIZE: AtomicU64 = AtomicU64::new(0);
+
+fn frame_size() -> Option<(f64, f64)> {
+    let v = FRAME_SIZE.load(Ordering::Relaxed);
+    (v != 0).then(|| ((v >> 32) as f64, (v & 0xffff_ffff) as f64))
+}
+
+/// Each device's events through its own `Translator`, executed in order on the portal.
+async fn run_input(
+    rd: RemoteDesktop,
+    session: Session<RemoteDesktop>,
+    stream: u32,
+    width: f64,
+    height: f64,
+    command: CommandKey,
+    mut rx: UnboundedReceiver<InputCmd>,
+) {
+    let mut translators: HashMap<u64, Translator> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut failed = false;
+    loop {
+        let actions: Vec<Action> = tokio::select! {
+            cmd = rx.recv() => match cmd {
+                None => break,
+                Some(InputCmd::Event(id, event)) => {
+                    INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+                    let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command));
+                    if let Some((w, h)) = frame_size() {
+                        t.set_size(w, h);
+                    }
+                    t.handle(event, Instant::now())
+                }
+                Some(InputCmd::Left(id)) => translators.remove(&id).map(|mut t| t.release_all()).unwrap_or_default(),
+            },
+            _ = tick.tick() => {
+                let now = Instant::now();
+                translators.values_mut().flat_map(|t| t.tick(now)).collect()
+            }
+        };
+        for action in actions {
+            if let Err(e) = perform(&rd, &session, stream, &action).await {
+                if !failed {
+                    failed = true;
+                    eprintln!("Input: the portal refused {action:?}: {e} (further failures not shown)");
+                }
+            }
+        }
+    }
+}
+
+async fn perform(rd: &RemoteDesktop, session: &Session<RemoteDesktop>, stream: u32, action: &Action) -> ashpd::Result<()> {
+    let state = |pressed: bool| if pressed { KeyState::Pressed } else { KeyState::Released };
+    match *action {
+        Action::Motion { x, y } => rd.notify_pointer_motion_absolute(session, stream, x, y, Default::default()).await,
+        Action::Button { button, pressed } => rd.notify_pointer_button(session, button, state(pressed), Default::default()).await,
+        Action::Axis { dx, dy } => rd.notify_pointer_axis(session, dx, dy, NotifyPointerAxisOptions::default()).await,
+        Action::AxisStop => rd.notify_pointer_axis(session, 0.0, 0.0, NotifyPointerAxisOptions::default().set_finish(true)).await,
+        Action::Key { code, pressed } => rd.notify_keyboard_keycode(session, code, state(pressed), Default::default()).await,
+        Action::Keysym { sym, pressed } => rd.notify_keyboard_keysym(session, sym, state(pressed), Default::default()).await,
+    }
 }

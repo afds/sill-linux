@@ -2,11 +2,13 @@
 
 use sill_linux::door::PairingDoor;
 use sill_linux::identity::{self, Identity};
+use sill_linux::input::CommandKey;
 use sill_linux::server::{Control, Door, Server};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::mpsc;
 
 const USAGE: &str = "usage: sill-linux [--port N] [--bitrate MBPS] [--name NAME] [--open | --plain] [--no-advertise]
+                  [--view-only | --command-key ctrl|super]
        sill-linux --forget-devices
 
   --port N          TCP port of the door (default 47460)
@@ -15,6 +17,8 @@ const USAGE: &str = "usage: sill-linux [--port N] [--bitrate MBPS] [--name NAME]
   --open            TLS, but any device connects without pairing (TXT p=0)
   --plain           plain TCP, no pairing: only a Debug build of the app connects
   --no-advertise    do not register _sill._tcp with Avahi (connect by address instead)
+  --view-only       stream only; ask for no remote control (taps and keys from devices are ignored)
+  --command-key K   what the device's Command key is here: ctrl (default: ⌘C copies) or super
   --forget-devices  remove every paired device, then exit
 
 By default the door speaks TLS and a device pairs once with a code this terminal shows (TXT p=1),
@@ -34,10 +38,11 @@ struct Args {
     advertise: bool,
     mode: Mode,
     forget: bool,
+    input: Option<CommandKey>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, bitrate_mbps: 15, name: hostname(), advertise: true, mode: Mode::Paired, forget: false };
+    let mut a = Args { port: 47460, bitrate_mbps: 15, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl) };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -59,6 +64,14 @@ fn parse_args() -> Result<Args, String> {
             "--plain" => a.mode = Mode::Plain,
             "--no-advertise" => a.advertise = false,
             "--forget-devices" => a.forget = true,
+            "--view-only" => a.input = None,
+            "--command-key" => {
+                a.input = Some(match value("--command-key")?.as_str() {
+                    "ctrl" => CommandKey::Ctrl,
+                    "super" => CommandKey::Super,
+                    _ => return Err("--command-key is ctrl or super".into()),
+                })
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -135,19 +148,19 @@ fn main() {
     }
     let _advert = if args.advertise { sill_linux::advertise::publish(&args.name, addr.port(), &txt) } else { None };
 
-    run_capture(&server, control_rx, args.bitrate_mbps);
+    run_capture(&server, control_rx, args.bitrate_mbps, args.input);
 }
 
 #[cfg(feature = "capture")]
-fn run_capture(server: &Server, control: mpsc::Receiver<Control>, bitrate_mbps: u32) {
-    if let Err(e) = sill_linux::capture::run(server, control, bitrate_mbps) {
+fn run_capture(server: &Server, control: mpsc::Receiver<Control>, bitrate_mbps: u32, input: Option<CommandKey>) {
+    if let Err(e) = sill_linux::capture::run(server, control, bitrate_mbps, input) {
         eprintln!("Capture failed: {e:#}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(feature = "capture"))]
-fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _bitrate_mbps: u32) {
+fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _bitrate_mbps: u32, _input: Option<CommandKey>) {
     eprintln!("Built without the capture feature: serving the door with no picture.");
     for c in control {
         println!("Control: {c:?}");

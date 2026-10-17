@@ -7,5 +7,6 @@ pub mod pairing;
 pub mod identity;
 pub mod tls;
 pub mod door;
+pub mod input;
 #[cfg(feature = "capture")]
 pub mod capture;

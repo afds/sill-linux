@@ -161,7 +161,8 @@ Each phase is usable on its own.
    app by address (`-SillConnect host:port`, `-SillHUD 1`). That build needs a Mac with Xcode;
    without one, phase 3 comes before phase 2 so the App Store build can connect.
    Success: frame age and fps in the app's stats comparable to the Mac host's.
-2. **Input.** RemoteDesktop and libei: tap and click, scroll with phases, HID keys, text.
+2. **Input.** RemoteDesktop and libei: tap and click, scroll with phases, HID keys, text. Built
+   with the portal's D-Bus calls, not libei (results below).
 3. **TLS door, pairing and Avahi**, so an App Store build finds, pairs with and reconnects to the
    host. Built, ahead of phase 2 (results below). Golden tests reproduce Sill's fingerprints, tags, PBKDF2 proofs and signed info.
 4. **Windows.** A backend trait (`list`, `thumbnail`, `capture`, `raise`): the wlroots family and
@@ -262,3 +263,22 @@ The app's panel is 728×535 pt, so a 3840×2160 stream is far more than it shows
 
 Not yet tried in this phase: Not built: the QR path is printed only with `qrencode`
 installed and is untested; kind 18 (no "away from home" for this host); Remote Access.
+
+## Phase 2 results (2026-10-17)
+
+Input through the RemoteDesktop portal's D-Bus calls (`NotifyPointerMotionAbsolute`, buttons,
+`NotifyPointerAxis` with `finish`, keycodes, keysyms); libei is not needed for this. The screen
+cast is now part of the RemoteDesktop session (one dialog, its own restore token);
+`--view-only` keeps the screen-cast-only session. `input.rs` translates Sill's events, pure and
+tested (10 tests): positions in the stream's pixels, natural scrolling negated for Wayland with
+the axis stop after the device's own coast (or 0.12 s after a lift with none), HID usages through
+Linux's `usb_kbd_keycode` table, Command as Ctrl (or Super) and ⌘Space as a Super tap, modifier
+bits pressed around a key whose modifier key is not down, text as keysyms with held keys released
+first, and every key and button released when a device leaves.
+
+Verified here: the portal grants "pointer and keyboard"; ten pointer moves from a plain-door
+client, no portal error; the decoded stream shows the pointer at exactly the asked place (20 %,
+30 %). Found on the way: GNOME takes absolute motion in the stream's own pixels (3840×2160 at
+scale 2), not the logical size the portal reports (1920×1080); the first try put the pointer at
+half the distance. Not tried here, on purpose (they would act on whatever has focus): clicks,
+scrolls, keys and text; those are for the device test.
