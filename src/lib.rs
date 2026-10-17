@@ -15,3 +15,5 @@ pub mod service;
 pub mod capture;
 #[cfg(feature = "capture")]
 pub mod mutter;
+#[cfg(feature = "capture")]
+pub mod shell;

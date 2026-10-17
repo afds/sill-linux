@@ -11,7 +11,7 @@
 
 use crate::protocol;
 use crate::input::{Action, CommandKey, Translator};
-use crate::server::{Apply, Control, InputCmd, Server};
+use crate::server::{Apply, Control, HostWindow, InputCmd, Server, Source};
 use ashpd::desktop::remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions, StartOptions};
 use ashpd::desktop::Session;
 use std::collections::HashMap;
@@ -45,6 +45,36 @@ struct PortalCast {
 /// portal's absolute motion is given in. 0 before the first frame.
 static CAPTURED_SIZE: AtomicU64 = AtomicU64::new(0);
 
+/// The region a window stream's buffers show (Mutter draws a window into a buffer the size of the
+/// stream and says where, as each buffer's crop): x, y, width, height, 16 bits each; 0 for none.
+static CROP: AtomicU64 = AtomicU64::new(0);
+
+fn pack_crop((x, y, w, h): (u32, u32, u32, u32)) -> u64 {
+    ((x as u64 & 0xffff) << 48) | ((y as u64 & 0xffff) << 32) | ((w as u64 & 0xffff) << 16) | (h as u64 & 0xffff)
+}
+
+fn unpack_crop(v: u64) -> Option<(u32, u32, u32, u32)> {
+    (v != 0).then(|| ((v >> 48) as u32 & 0xffff, (v >> 32) as u32 & 0xffff, (v >> 16) as u32 & 0xffff, v as u32 & 0xffff))
+}
+
+/// The part of the buffers the devices see (a window's crop): positions from a device are
+/// fractions of it. None: the whole buffer.
+static INPUT_REGION: std::sync::Mutex<Option<(f64, f64, f64, f64)>> = std::sync::Mutex::new(None);
+
+fn input_region() -> Option<(f64, f64, f64, f64)> {
+    *INPUT_REGION.lock().unwrap()
+}
+
+/// The streamed window's frame inside its buffer (from the extension, kept current by
+/// `watch_windows`), so the picture leaves out the window's shadow.
+static FRAME_INSETS: std::sync::Mutex<Option<(u64, crate::shell::Insets)>> = std::sync::Mutex::new(None);
+
+/// A window's crop waits this long without changing before the encoder follows it (a resize
+/// changes it with every frame).
+const CROP_SETTLE: Duration = Duration::from_millis(200);
+/// A window stream whose buffers carry no crop streams whole after this.
+const CROP_WAIT: Duration = Duration::from_millis(500);
+
 fn captured_size() -> Option<(f64, f64)> {
     let v = CAPTURED_SIZE.load(Ordering::Relaxed);
     (v != 0).then(|| ((v >> 32) as f64, (v & 0xffff_ffff) as f64))
@@ -52,7 +82,7 @@ fn captured_size() -> Option<(f64, f64)> {
 
 /// `input`: the Command key's meaning, or None for view only (no remote control asked for).
 pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey>) -> Result<()> {
-    let (cast, input_tx) = start_capture(input)?;
+    let (mut cast, input_tx, recorder) = start_capture(server.clone(), input)?;
     if let Some(tx) = input_tx {
         server.set_input(tx);
     }
@@ -71,16 +101,51 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     // to shared memory if that does not negotiate. SILL_LINUX_SHM=1 forces shared memory.
     let mut dmabuf = gl && std::env::var_os("SILL_LINUX_SHM").is_none();
     let mut streaming = false;
+    let mut source = Source::Desktop;
+    let mut announced = None;
     loop {
-        println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
-        let shape = TailShape { gl, dmabuf, formats, encoder: encoder_desc.clone(), logical: cast.size };
-        match run_pipeline(server, &control, &cast, &shape, &mut apply, &mut streaming)? {
+        if announced != Some(dmabuf) {
+            println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
+            announced = Some(dmabuf);
+        }
+        // Standard is the monitor's logical size; a window streams at its own size.
+        let logical = if source == Source::Desktop { cast.size } else { None };
+        let shape = TailShape { gl, dmabuf, formats, encoder: encoder_desc.clone(), logical, crop: None };
+        let switch_to = match run_pipeline(server, &control, &cast, &shape, &mut apply, &mut streaming, source, recorder.as_ref())? {
             Outcome::Ended => break,
-            Outcome::NoDmaBuf(why) if dmabuf => {
+            Outcome::NoDmaBuf(why) if dmabuf && source == Source::Desktop => {
                 println!("DMA-BUF did not work here ({why}); using shared memory.");
                 dmabuf = false;
+                continue;
             }
-            Outcome::NoDmaBuf(why) => bail!(why),
+            Outcome::NoDmaBuf(why) if source == Source::Desktop => bail!(why),
+            Outcome::NoDmaBuf(why) | Outcome::SourceEnded(why) => {
+                println!("The window's stream ended ({why}); back to the Desktop.");
+                server.showing_desktop();
+                Source::Desktop
+            }
+            Outcome::Switch(s) => s,
+        };
+        let Some(rec) = recorder.as_ref() else {
+            println!("Windows stream only through GNOME's own screen-cast API (not with --portal); the Desktop keeps streaming.");
+            continue;
+        };
+        match record(rec, switch_to) {
+            Ok(c) => {
+                match c.size {
+                    Some((w, h)) => println!("Screen cast: PipeWire node {}, {w}×{h}.", c.node),
+                    None => println!("Screen cast: PipeWire node {}.", c.node),
+                }
+                cast = c;
+                source = switch_to;
+            }
+            Err(e) => {
+                println!("Could not stream that window: {e:#}; back to the Desktop.");
+                // The old stream still runs when the new one failed; a fresh one either way.
+                cast = record(rec, Source::Desktop)?;
+                source = Source::Desktop;
+                server.showing_desktop();
+            }
         }
     }
     drop(cast);
@@ -89,6 +154,10 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
 
 enum Outcome {
     Ended,
+    /// A device picked another source.
+    Switch(Source),
+    /// A window's stream ended (the window closed).
+    SourceEnded(String),
     /// The pipeline failed before its first frame (with DMA-BUF: try shared memory).
     NoDmaBuf(String),
 }
@@ -100,7 +169,15 @@ fn run_pipeline(
     shape: &TailShape,
     apply: &mut Apply,
     streaming: &mut bool,
+    source: Source,
+    recorder: Option<&Recorder>,
 ) -> Result<Outcome> {
+    let mut shape = shape.clone();
+    let shape = &mut shape;
+    let window = source != Source::Desktop;
+    CROP.store(0, Ordering::Relaxed);
+    CAPTURED_SIZE.store(0, Ordering::Relaxed);
+    *INPUT_REGION.lock().unwrap() = None;
     // The source half stays for the whole run: the PipeWire stream and the valve (closed while
     // nobody watches; it passes caps on, so opening it renegotiates nothing). The fd stays open in
     // `cast` for as long as the pipeline runs (pipewiresrc dups it).
@@ -121,7 +198,7 @@ fn run_pipeline(
         "pipewiresrc {fd} path={node} {memory} ! valve name=gate drop={drop} drop-mode=forward-sticky-events ! {head}",
         fd = cast.fd.as_ref().map(|f| format!("fd={}", f.as_raw_fd())).unwrap_or_default(),
         node = cast.node,
-        drop = !*streaming,
+        drop = true,
     );
     let pipeline = gst::parse::launch(&description)
         .context("building the pipeline")?
@@ -147,8 +224,12 @@ fn run_pipeline(
     let min_interval_us = Arc::new(AtomicU64::new(0));
     if let Some(pad) = gate.static_pad("sink") {
         let c = captured.clone();
-        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _| {
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
             c.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = info.buffer().and_then(|b| b.meta::<gst_video::VideoCropMeta>()) {
+                let (x, y, w, h) = m.rect();
+                CROP.store(pack_crop((x, y, w & !1, h & !1)), Ordering::Relaxed);
+            }
             if let Some(s) = pad.current_caps().and_then(|c| c.structure(0).map(|s| s.to_owned())) {
                 if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
                     CAPTURED_SIZE.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
@@ -196,16 +277,28 @@ fn run_pipeline(
     let bus = pipeline.bus().ok_or_else(|| anyhow!("no bus"))?;
     let mut last_keyframe = Instant::now() - KEYFRAME_SPACING;
     let mut keyframe_pending = *streaming;
+    // A window streams once its region is known (its first frame would be the whole buffer).
+    let mut waiting_crop = window;
+    let started = Instant::now();
+    let mut seen_crop: (u64, Instant) = (0, Instant::now());
+    let mut gate_open = false;
     let result = loop {
         match control.recv_timeout(Duration::from_millis(50)) {
-            Ok(Control::Start) => {
+            Ok(Control::Start(s)) if s != source => {
                 *streaming = true;
-                gate.set_property("drop", false);
+                break Ok(Outcome::Switch(s));
+            }
+            Ok(Control::WindowCommand(id, action)) => {
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Command(id, action));
+                }
+            }
+            Ok(Control::Start(_)) => {
+                *streaming = true;
                 keyframe_pending = true;
             }
             Ok(Control::Stop) => {
                 *streaming = false;
-                gate.set_property("drop", true);
             }
             Ok(Control::Keyframe) => keyframe_pending = true,
             Ok(Control::Apply(a)) if a != *apply => {
@@ -216,7 +309,8 @@ fn run_pipeline(
                     // A resolution change replaces the tail: changing the size live failed in
                     // GStreamer (the scaler would not renegotiate mid-stream, then pipewiresrc
                     // renegotiated and the capture ended, Retina → Standard, 2026-10-17).
-                    match replace_tail(&pipeline, &gate, &head, tail, shape, apply, server, &counters, *streaming) {
+                    gate_open = false;
+                    match replace_tail(&pipeline, &gate, &head, tail, shape, apply, server, &counters) {
                         Ok(t) => tail = t,
                         Err(e) => break Err(e.context("changing the resolution")),
                     }
@@ -229,6 +323,49 @@ fn run_pipeline(
             Ok(Control::Apply(_)) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(Outcome::Ended),
+        }
+        if window {
+            let now = Instant::now();
+            let observed = CROP.load(Ordering::Relaxed);
+            if observed != seen_crop.0 {
+                seen_crop = (observed, now);
+            }
+            let insets = match source {
+                Source::Window(id) => FRAME_INSETS.lock().unwrap().filter(|(w, _)| *w == id).map(|(_, i)| i),
+                Source::Desktop => None,
+            };
+            let wanted = unpack_crop(observed)
+                .filter(|c| c.2 >= 2 && c.3 >= 2)
+                .map(|c| insets.map(|i| i.frame_in(c)).unwrap_or(c));
+            let have = shape.crop.map(|c| c.0);
+            if wanted.is_some() && wanted != have && now.duration_since(seen_crop.1) >= CROP_SETTLE {
+                let (x, y, w, h) = wanted.unwrap();
+                let buffers = captured_size().map(|(bw, bh)| (bw as u32, bh as u32)).unwrap_or((x + w, y + h));
+                // Standard: the window's logical size (the buffers' pixels over the monitor's scale).
+                let ratio = match cast.size {
+                    Some((lw, _)) if lw > 0 => (buffers.0 as f64 / lw as f64).max(1.0),
+                    _ => 1.0,
+                };
+                let even = |v: f64| ((v.round() as i32) & !1).max(2);
+                shape.crop = Some(((x, y, w, h), buffers));
+                *INPUT_REGION.lock().unwrap() = Some((x as f64, y as f64, w as f64, h as f64));
+                shape.logical = Some((even(w as f64 / ratio), even(h as f64 / ratio)));
+                gate_open = false;
+                match replace_tail(&pipeline, &gate, &head, tail, shape, apply, server, &counters) {
+                    Ok(t) => tail = t,
+                    Err(e) => break Err(e.context("cropping to the window")),
+                }
+                describe(shape, apply);
+                waiting_crop = false;
+                keyframe_pending = true;
+            } else if waiting_crop && wanted.is_none() && captured_size().is_some() && started.elapsed() >= CROP_WAIT {
+                waiting_crop = false; // no crop: the buffers are the window
+            }
+        }
+        let open = *streaming && !waiting_crop;
+        if open != gate_open {
+            gate.set_property("drop", !open);
+            gate_open = open;
         }
         if last_stats.elapsed() >= Duration::from_secs(1) {
             last_stats = Instant::now();
@@ -254,6 +391,9 @@ fn run_pipeline(
             }
         }
         if let Some(why) = failure {
+            if source != Source::Desktop {
+                break Ok(Outcome::SourceEnded(why));
+            }
             if encoded_total.load(Ordering::Relaxed) == 0 {
                 break Ok(Outcome::NoDmaBuf(why));
             }
@@ -265,13 +405,32 @@ fn run_pipeline(
 }
 
 /// What every tail is made of.
+#[derive(Clone)]
 struct TailShape {
     gl: bool,
     dmabuf: bool,
     formats: &'static str,
     encoder: String,
+    /// Standard's size; None: the stream's own.
     logical: Option<(i32, i32)>,
+    /// A window's region in the buffers (even sizes) and the buffers' size.
+    crop: Option<((u32, u32, u32, u32), (u32, u32))>,
 }
+
+/// The crop of a GL texture: the output's texture coordinates mapped into the region.
+const CROP_SHADER: &str = "#ifdef GL_ES
+precision mediump float;
+#endif
+varying vec2 v_texcoord;
+uniform sampler2D tex;
+uniform float cx;
+uniform float cy;
+uniform float cw;
+uniform float ch;
+void main () {
+  gl_FragColor = texture2D (tex, vec2 (cx + v_texcoord.x * cw, cy + v_texcoord.y * ch));
+}
+";
 
 /// The half after the valve: scaler, size, encoder, parser, appsink. Rebuilt for a resolution
 /// change.
@@ -287,6 +446,10 @@ fn describe(shape: &TailShape, a: &Apply) {
         (false, None) => "Standard".to_string(),
         (true, _) => "Retina (the stream's own size)".to_string(),
     };
+    let res = match shape.crop {
+        Some(((_, _, w, h), _)) => format!("{res}, the window's {w}×{h}"),
+        None => res,
+    };
     println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
 }
 
@@ -295,11 +458,22 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
         (false, Some((w, h))) => format!(",width={w},height={h}"),
         _ => String::new(),
     };
-    let scale = if shape.gl {
-        format!("glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}")
-    } else {
-        let first = shape.formats.split(',').next().unwrap_or("I420");
-        format!("videoscale ! video/x-raw,format={first}{size}")
+    let scale = match (shape.gl, shape.crop) {
+        (true, None) => format!("glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}"),
+        (true, Some(((_, _, w, h), _))) => format!(
+            "glshader name=crop ! video/x-raw(memory:GLMemory),format=RGBA,width={w},height={h} \
+             ! glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}"
+        ),
+        (false, crop) => {
+            let first = shape.formats.split(',').next().unwrap_or("I420");
+            let cut = match crop {
+                Some(((x, y, w, h), (bw, bh))) => {
+                    format!("videocrop left={x} top={y} right={} bottom={} ! ", bw.saturating_sub(x + w), bh.saturating_sub(y + h))
+                }
+                None => String::new(),
+            };
+            format!("{cut}videoscale ! video/x-raw,format={first}{size}")
+        }
     };
     // The encoder's bitrate is the one asked for now (the template carries the first one).
     let encoder = shape.encoder.clone();
@@ -310,6 +484,17 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
     let bin = gst::parse::bin_from_description(&description, true).context("building the encoder")?;
     let enc = bin.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
     enc.set_property("bitrate", a.kbps());
+    if let (Some(shader), Some(((x, y, w, h), (bw, bh)))) = (bin.by_name("crop"), shape.crop) {
+        let f = |v: u32, of: u32| v as f32 / of.max(1) as f32;
+        shader.set_property("fragment", CROP_SHADER);
+        let uniforms = gst::Structure::builder("uniforms")
+            .field("cx", f(x, bw))
+            .field("cy", f(y, bh))
+            .field("cw", f(w, bw))
+            .field("ch", f(h, bh))
+            .build();
+        shader.set_property("uniforms", uniforms);
+    }
     let sink = bin
         .by_name("sink")
         .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
@@ -345,7 +530,7 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
 }
 
 /// Swaps the tail while the source runs: the valve closed, the old tail stopped and removed, the
-/// new one linked and started, the valve opened again if devices watch. The valve's sticky
+/// new one linked and started; the caller opens the valve again if devices watch. The valve's sticky
 /// events (caps included) go to the new tail with its first buffer.
 #[allow(clippy::too_many_arguments)]
 fn replace_tail(
@@ -357,7 +542,6 @@ fn replace_tail(
     a: &Apply,
     server: &Server,
     counters: &(Arc<AtomicU64>, Arc<AtomicU64>),
-    streaming: bool,
 ) -> Result<Tail> {
     gate.set_property("drop", true);
     // A buffer already past the valve finishes its trip through the old tail first.
@@ -377,9 +561,6 @@ fn replace_tail(
         _ => bail!("linking the new encoder: no pads"),
     }
     tail.bin.sync_state_with_parent().context("starting the new encoder")?;
-    if streaming {
-        gate.set_property("drop", false);
-    }
     Ok(tail)
 }
 
@@ -461,8 +642,8 @@ pub fn set_monitor(connector: Option<String>) {
 /// Starts the capture on a thread of its own, which then keeps the session (and its D-Bus
 /// connection) alive for as long as this process runs; input runs on that thread too. GNOME's own
 /// API where it is here (`mutter`), else the portal.
-fn start_capture(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>)> {
-    let (tx, rx) = mpsc::channel::<Result<(PortalCast, Option<UnboundedSender<InputCmd>>)>>();
+fn start_capture(server: Server, input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Option<Recorder>)> {
+    let (tx, rx) = mpsc::channel::<Started>();
     std::thread::Builder::new().name("capture".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -478,9 +659,9 @@ fn start_capture(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unboun
                     Err(_) => false,
                 };
             if use_mutter {
-                match mutter_session(input).await {
-                    Ok((cast, input_tx, keep)) => {
-                        let _ = tx.send(Ok((cast, input_tx)));
+                match mutter_session(server, input).await {
+                    Ok((cast, input_tx, recorder, keep)) => {
+                        let _ = tx.send(Ok((cast, input_tx, Some(recorder))));
                         let _keep = keep;
                         std::future::pending::<()>().await;
                     }
@@ -498,33 +679,211 @@ fn start_capture(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unboun
 
 /// GNOME's own API: a remote-desktop session with the monitor's screen cast linked to it. No
 /// dialog; GNOME's sharing indicator shows while it runs.
-async fn mutter_session(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, impl Send)> {
+async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Recorder, impl Send)> {
     let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
     let wanted = MONITOR.lock().unwrap().clone();
     let connector = crate::mutter::monitor_connector(&conn, wanted.as_deref()).await?;
-    let mut session = crate::mutter::Session::new(conn).await?;
+    let session = crate::mutter::Session::new(conn.clone()).await?;
     let cursor = if SHOW_CURSOR.load(Ordering::Relaxed) { 1 } else { 0 };
     let stream = session.record(crate::mutter::Source::Monitor(&connector), cursor).await?;
     println!("Capture: GNOME's own screen-cast API, monitor {connector}{}.", if input.is_some() { ", with remote control" } else { "" });
     let cast = PortalCast { fd: None, node: stream.node, size: stream.size };
-    let session = Arc::new(session);
+    let shown: Shown = Arc::new(std::sync::Mutex::new((Arc::new(session), stream.clone())));
     let input_tx = input.map(|command| {
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
         let (w, h) = stream.size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
-        let sink = InputSink::Mutter { session: session.clone(), stream: stream.clone() };
+        let sink = InputSink::Mutter { shown: shown.clone() };
         tokio::spawn(run_input(sink, w, h, command, true, input_rx));
         input_tx
     });
-    Ok((cast, input_tx, session))
+    let (rec_tx, rec_rx) = tokio::sync::mpsc::unbounded_channel();
+    let shell = crate::shell::Client::connect(&conn).await;
+    match &shell {
+        Some(s) => {
+            println!("Windows: from the Sill for Linux GNOME Shell extension.");
+            tokio::spawn(watch_windows(server, s.clone()));
+        }
+        None => println!(
+            "Windows: the Sill for Linux GNOME Shell extension is not running, so only the Desktop streams \
+             (sill-linux --install-extension, then log out and in)."
+        ),
+    }
+    tokio::spawn(recorder(conn, connector, shown.clone(), shell, cursor, rec_rx));
+    Ok((cast, input_tx, rec_tx, shown))
 }
 
-async fn portal_thread(input: Option<CommandKey>, tx: mpsc::Sender<Result<(PortalCast, Option<UnboundedSender<InputCmd>>)>>) {
+/// Requests to the GNOME session's task: record a source, or a window's light from a device.
+type Recorder = UnboundedSender<RecReq>;
+
+enum RecReq {
+    Record(Source, mpsc::Sender<Result<PortalCast>>),
+    Command(u64, String),
+}
+
+/// Asks the GNOME session for a source's PipeWire stream (from the pipeline's thread).
+fn record(rec: &Recorder, source: Source) -> Result<PortalCast> {
+    let (tx, rx) = mpsc::channel();
+    rec.send(RecReq::Record(source, tx)).map_err(|_| anyhow!("the GNOME session ended"))?;
+    rx.recv_timeout(Duration::from_secs(8)).map_err(|_| anyhow!("no answer from the GNOME session"))?
+}
+
+/// The session and stream shown; input goes to them.
+type Shown = Arc<std::sync::Mutex<(Arc<crate::mutter::Session>, crate::mutter::Stream)>>;
+
+/// Owns what is shown: a fresh session for every switch, the Desktop's too (Mutter starts no
+/// stream added to a session already running, and a new consumer of a running stream gets no
+/// first frame until something on it changes), the old one stopped once the new one runs.
+async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown, shell: Option<crate::shell::Client>, cursor: u32, mut rx: UnboundedReceiver<RecReq>) {
+    let cast = |s: &crate::mutter::Stream| PortalCast { fd: None, node: s.node, size: s.size };
+    while let Some(req) = rx.recv().await {
+        match req {
+            RecReq::Record(source, reply) => {
+                if let (Source::Window(id), Some(s)) = (source, &shell) {
+                    // Raised and focused, as Sill for Mac raises a picked window: keys go to it.
+                    s.command("Activate", id).await;
+                    *FRAME_INSETS.lock().unwrap() = s.geometry(id).await.map(|i| (id, i));
+                }
+                let recorded = async {
+                    let session = crate::mutter::Session::new(conn.clone()).await?;
+                    let stream = match source {
+                        Source::Desktop => session.record(crate::mutter::Source::Monitor(&connector), cursor).await,
+                        Source::Window(id) => session.record(crate::mutter::Source::Window(id), cursor).await,
+                    };
+                    match stream {
+                        Ok(s) => Ok((session, s)),
+                        Err(e) => {
+                            session.stop().await;
+                            Err(e)
+                        }
+                    }
+                }
+                .await;
+                match recorded {
+                    Ok((session, stream)) => {
+                        let _ = reply.send(Ok(cast(&stream)));
+                        let old = std::mem::replace(&mut *shown.lock().unwrap(), (Arc::new(session), stream));
+                        old.0.stop().await;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            RecReq::Command(id, action) => {
+                let method = match action.as_str() {
+                    "close" => "Close",
+                    "minimize" => "Minimize",
+                    "fullScreen" => "ToggleFullscreen",
+                    other => {
+                        println!("Window command {other:?} is not one this host knows.");
+                        continue;
+                    }
+                };
+                match &shell {
+                    Some(s) if s.command(method, id).await => {}
+                    _ => println!("Window command {action} did not reach the window."),
+                }
+            }
+        }
+    }
+}
+
+/// The window list into the server, again on every change, and thumbnails while devices watch:
+/// as Sill for Mac, each at most 208×132, every 2 s for a window that changed or streams, else
+/// every 6 s, and all again when a device joins.
+async fn watch_windows(server: Server, shell: crate::shell::Client) {
+    use futures_util::StreamExt;
+    const BOX: u32 = 208;
+    let mut changes = match shell.changes().await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            println!("Windows: no change signal from the extension ({e:#}); the list refreshes every 2 s.");
+            None
+        }
+    };
+    let mut list: Vec<crate::shell::ShellWindow> = Vec::new();
+    let mut stamps: HashMap<u64, (crate::shell::ShellWindow, Instant)> = HashMap::new();
+    let mut last_clients = 0;
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut failed = false;
+    loop {
+        let changed = tokio::select! {
+            c = async { match changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => c.is_some(),
+            _ = tick.tick() => changes.is_none(),
+        };
+        if changed || list.is_empty() {
+            match shell.list().await {
+                Ok(l) => {
+                    failed = false;
+                    list = l;
+                    server.set_windows(
+                        list.iter()
+                            .map(|w| HostWindow {
+                                mutter_id: w.id,
+                                title: w.title.clone(),
+                                app_name: w.app_name.clone(),
+                                app_id: w.app_id.clone(),
+                                width: w.width as i64,
+                                height: w.height as i64,
+                            })
+                            .collect(),
+                    );
+                }
+                Err(e) if !failed => {
+                    failed = true;
+                    println!("Windows: the extension did not answer ({e:#}).");
+                }
+                Err(_) => {}
+            }
+            if let Some(id) = server.active_window() {
+                if let Some(i) = shell.geometry(id).await {
+                    *FRAME_INSETS.lock().unwrap() = Some((id, i));
+                }
+            }
+            if changed {
+                continue;
+            }
+        }
+        let clients = server.client_count();
+        if clients == 0 {
+            stamps.clear();
+            last_clients = 0;
+            continue;
+        }
+        if clients > last_clients {
+            stamps.clear();
+        }
+        last_clients = clients;
+        stamps.retain(|id, _| list.iter().any(|w| w.id == *id));
+        let active = server.active_window();
+        let now = Instant::now();
+        for w in &list {
+            let due = match stamps.get(&w.id) {
+                None => true,
+                Some((info, at)) => info != w || active == Some(w.id) || now.duration_since(*at) >= Duration::from_secs(6),
+            };
+            if !due {
+                continue;
+            }
+            stamps.insert(w.id, (w.clone(), now));
+            if let Some(png) = shell.thumbnail(w.id, BOX).await {
+                server.broadcast_thumbnail(w.id, &png);
+            }
+        }
+    }
+}
+
+/// What the capture thread hands back: the first stream, input's channel, the GNOME session's
+/// recorder (None on the portal).
+type Started = Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Option<Recorder>)>;
+
+async fn portal_thread(input: Option<CommandKey>, tx: mpsc::Sender<Started>) {
     {
         {
             match input {
                 Some(command) => match remote_session(command).await {
                     Ok((cast, input_tx, keep)) => {
-                        let _ = tx.send(Ok((cast, Some(input_tx))));
+                        let _ = tx.send(Ok((cast, Some(input_tx), None)));
                         let _keep = keep;
                         std::future::pending::<()>().await;
                     }
@@ -534,7 +893,7 @@ async fn portal_thread(input: Option<CommandKey>, tx: mpsc::Sender<Result<(Porta
                 },
                 None => match screencast_session().await {
                     Ok((cast, keep)) => {
-                        let _ = tx.send(Ok((cast, None)));
+                        let _ = tx.send(Ok((cast, None, None)));
                         let _keep = keep;
                         std::future::pending::<()>().await;
                     }
@@ -689,7 +1048,9 @@ static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Where input goes: the portal's RemoteDesktop session, or GNOME's own.
 enum InputSink {
     Portal { rd: RemoteDesktop, session: Session<RemoteDesktop>, node: u32 },
-    Mutter { session: Arc<crate::mutter::Session>, stream: crate::mutter::Stream },
+    /// The session and stream shown (absolute positions are in its coordinates); they follow a
+    /// switch.
+    Mutter { shown: Shown },
 }
 
 /// Each device's events through its own `Translator`, executed in order. `everywhere`: absolute
@@ -719,7 +1080,9 @@ async fn run_input(
                         println!("{:>8} ms  device {id}: {event:?}", t0.elapsed().as_millis());
                     }
                     let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command).keep_all_taps(keep_all_taps()).absolute_everywhere(everywhere));
-                    if let Some((w, h)) = captured_size() {
+                    if let Some((_, _, w, h)) = input_region() {
+                        t.set_size(w, h);
+                    } else if let Some((w, h)) = captured_size() {
                         t.set_size(w, h);
                     }
                     let dropped = t.dropped_taps;
@@ -766,10 +1129,14 @@ async fn perform(sink: &InputSink, action: &Action) -> Result<()> {
             }
             .map_err(Into::into)
         }
-        InputSink::Mutter { session, stream } => {
+        InputSink::Mutter { shown } => {
             use crate::mutter::{AXIS_FINISH, AXIS_SOURCE_FINGER};
+            let (session, stream) = shown.lock().unwrap().clone();
             match *action {
-                Action::Motion { x, y } => session.motion_absolute(stream, x, y).await,
+                Action::Motion { x, y } => {
+                    let (ox, oy) = input_region().map(|r| (r.0, r.1)).unwrap_or((0.0, 0.0));
+                    session.motion_absolute(&stream, x + ox, y + oy).await
+                }
                 Action::RelMotion { dx, dy } => session.motion_relative(dx, dy).await,
                 Action::Button { button, pressed } => session.button(button, pressed).await,
                 Action::Axis { dx, dy } => session.axis(dx, dy, AXIS_SOURCE_FINGER).await,

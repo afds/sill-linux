@@ -65,7 +65,7 @@ pub struct Session {
     pub conn: zbus::Connection,
     pub rd: OwnedObjectPath,
     pub sc: OwnedObjectPath,
-    started: bool,
+    started: std::sync::atomic::AtomicBool,
 }
 
 /// A recorded source: its stream object (absolute motion names it), PipeWire node and size in
@@ -95,12 +95,20 @@ impl Session {
             .context("ScreenCast.CreateSession")?
             .body()
             .deserialize()?;
-        Ok(Session { conn, rd, sc, started: false })
+        Ok(Session { conn, rd, sc, started: std::sync::atomic::AtomicBool::new(false) })
     }
 
     /// Records the monitor or a window and waits for its PipeWire node. The first one starts the
     /// session.
-    pub async fn record(&mut self, source: Source<'_>, cursor: u32) -> Result<Stream> {
+    pub async fn record(&self, source: Source<'_>, cursor: u32) -> Result<Stream> {
+        // Listened for before the call: on a session already started, Mutter announces the new
+        // stream's node while it answers the call, before its object could be named.
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(SC_STREAM)?
+            .member("PipeWireStreamAdded")?
+            .build();
+        let mut added = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(16)).await?;
         let mut props: HashMap<&str, Value> = HashMap::new();
         props.insert("cursor-mode", Value::from(cursor));
         let reply = match source {
@@ -114,20 +122,25 @@ impl Session {
         }
         .context("ScreenCast record")?;
         let path: OwnedObjectPath = reply.body().deserialize()?;
-        let stream = zbus::Proxy::new(&self.conn, SC, path.clone(), SC_STREAM).await?;
-        let mut added = stream.receive_signal("PipeWireStreamAdded").await?;
-        if !self.started {
+        if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             self.conn
                 .call_method(Some(RD), self.rd.as_ref(), Some(RD_SESSION), "Start", &())
                 .await
                 .context("RemoteDesktop.Start")?;
-            self.started = true;
         }
-        let msg = tokio::time::timeout(Duration::from_secs(5), added.next())
-            .await
-            .map_err(|_| anyhow!("no PipeWire stream within 5 s"))?
-            .ok_or_else(|| anyhow!("the stream ended"))?;
-        let (node,): (u32,) = msg.body().deserialize()?;
+        let node = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = added.next().await {
+                let msg = msg?;
+                if msg.header().path().map(|p| p.as_str() == path.as_str()).unwrap_or(false) {
+                    let (node,): (u32,) = msg.body().deserialize()?;
+                    return Ok::<u32, anyhow::Error>(node);
+                }
+            }
+            bail!("the stream ended")
+        })
+        .await
+        .map_err(|_| anyhow!("no PipeWire stream within 5 s"))??;
+        let stream = zbus::Proxy::new(&self.conn, SC, path.clone(), SC_STREAM).await?;
         let params: HashMap<String, OwnedValue> = stream.get_property("Parameters").await.unwrap_or_default();
         let size = params.get("size").and_then(|v| <(i32, i32)>::try_from(v.clone()).ok());
         Ok(Stream { path, node, size })

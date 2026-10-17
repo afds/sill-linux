@@ -12,6 +12,7 @@ const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plai
                   [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
+       sill-linux --install-extension                 GNOME: list single windows in the app's bar
        sill-linux --forget-devices
 
   --port N          TCP port of the door (default 47460)
@@ -55,12 +56,13 @@ struct Args {
     portal: bool,
     monitor: Option<String>,
     service: Option<bool>,
+    extension: bool,
     /// The arguments to keep in the service's command line.
     pass: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, pass: Vec::new() };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, pass: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut taken = None;
@@ -96,6 +98,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--uninstall-service" => {
                 a.service = Some(false);
+                continue;
+            }
+            "--install-extension" => {
+                a.extension = true;
                 continue;
             }
             "--command-key" => {
@@ -137,6 +143,13 @@ fn main() {
         }
     };
 
+    if args.extension {
+        if let Err(e) = sill_linux::service::install_extension() {
+            eprintln!("Could not install the extension: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match args.service {
         Some(true) => {
             if let Err(e) = sill_linux::service::install(&args.pass) {

@@ -19,6 +19,7 @@ pub mod kind {
     pub const PARAMETER_SETS: u8 = 0;
     pub const FRAME: u8 = 1;
     pub const WINDOW_LIST: u8 = 2;
+    pub const THUMBNAIL: u8 = 3;
     pub const SELECT_SOURCE: u8 = 6;
     pub const INPUT: u8 = 8;
     pub const VIEWPORT: u8 = 9;
@@ -26,6 +27,7 @@ pub mod kind {
     pub const PONG: u8 = 11;
     pub const CLIENT_STATS: u8 = 12;
     pub const TICK: u8 = 13;
+    pub const WINDOW_COMMAND: u8 = 15;
     pub const HOST_SETTINGS: u8 = 16;
     pub const CHANGE_SETTINGS: u8 = 17;
     pub const PAIR_REQUEST: u8 = 19;

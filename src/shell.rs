@@ -1,0 +1,127 @@
+//! The window list from the Sill for Linux GNOME Shell extension (`gnome-extension/`), on the
+//! session bus as `org.sill_linux.Shell`: windows with Mutter's window ids (what `RecordWindow`
+//! takes), thumbnails, and raise, close, minimize or fullscreen on a device's request.
+
+use anyhow::{Context, Result};
+use ashpd::zbus;
+
+const NAME: &str = "org.sill_linux.Shell";
+const PATH: &str = "/org/sill_linux/Shell";
+
+/// One window, as the extension lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShellWindow {
+    pub id: u64,
+    pub title: String,
+    pub app_name: String,
+    pub app_id: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A window's frame inside its buffer (`Geometry`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Insets {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Insets {
+    /// The frame's part of a crop of the buffer (`crop` in stream pixels), sizes even.
+    pub fn frame_in(&self, (x, y, w, h): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+        let kx = w as f64 / self.width as f64;
+        let ky = h as f64 / self.height as f64;
+        let l = (self.left.max(0) as f64 * kx).round() as u32;
+        let t = (self.top.max(0) as f64 * ky).round() as u32;
+        let r = (self.right.max(0) as f64 * kx).round() as u32;
+        let b = (self.bottom.max(0) as f64 * ky).round() as u32;
+        if l + r + 2 > w || t + b + 2 > h {
+            return (x, y, w & !1, h & !1);
+        }
+        (x + l, y + t, (w - l - r) & !1, (h - t - b) & !1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_inside_the_crop() {
+        // Calculator in the nested test: 360×616 frame, 25 px of shadow, buffer 410×666.
+        let i = Insets { left: 25, top: 25, right: 25, bottom: 25, width: 410, height: 666 };
+        assert_eq!(i.frame_in((0, 0, 410, 666)), (25, 25, 360, 616));
+        // At scale 2 the crop is twice the logical buffer.
+        assert_eq!(i.frame_in((0, 0, 820, 1332)), (50, 50, 720, 1232));
+        // No shadow (maximized).
+        let m = Insets { left: 0, top: 0, right: 0, bottom: 0, width: 1600, height: 1000 };
+        assert_eq!(m.frame_in((0, 0, 1600, 1000)), (0, 0, 1600, 1000));
+        // Insets bigger than the crop: the crop as it is.
+        let odd = Insets { left: 300, top: 0, right: 300, bottom: 0, width: 410, height: 666 };
+        assert_eq!(odd.frame_in((0, 0, 411, 666)), (0, 0, 410, 666));
+    }
+}
+
+#[derive(Clone)]
+pub struct Client {
+    proxy: zbus::Proxy<'static>,
+}
+
+impl Client {
+    /// The extension's service, if it runs (installed, enabled, and the session logged into
+    /// again since it was installed).
+    pub async fn connect(conn: &zbus::Connection) -> Option<Client> {
+        let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+        let name = zbus::names::BusName::try_from(NAME).ok()?;
+        if !dbus.name_has_owner(name.try_into().ok()?).await.unwrap_or(false) {
+            return None;
+        }
+        let proxy = zbus::Proxy::new(conn, NAME, PATH, NAME).await.ok()?;
+        Some(Client { proxy })
+    }
+
+    pub async fn list(&self) -> Result<Vec<ShellWindow>> {
+        let reply = self.proxy.call_method("ListWindows", &()).await.context("ListWindows")?;
+        let rows: Vec<(u64, String, String, String, i32, i32)> = reply.body().deserialize()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, title, app_name, app_id, width, height)| ShellWindow { id, title, app_name, app_id, width, height })
+            .collect())
+    }
+
+    /// A PNG of the window, at most `max` on its longer side.
+    pub async fn thumbnail(&self, id: u64, max: u32) -> Option<Vec<u8>> {
+        let reply = self.proxy.call_method("Thumbnail", &(id, max)).await.ok()?;
+        let path: String = reply.body().deserialize().ok()?;
+        if path.is_empty() {
+            return None;
+        }
+        let png = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        png
+    }
+
+    /// Where the frame sits in the window's buffer: left, top, right, bottom insets and the
+    /// buffer's width and height, logical pixels (None: no such window, or an older extension).
+    pub async fn geometry(&self, id: u64) -> Option<Insets> {
+        let reply = self.proxy.call_method("Geometry", &(id,)).await.ok()?;
+        let ((left, top, right, bottom, width, height),): ((i32, i32, i32, i32, i32, i32),) = reply.body().deserialize().ok()?;
+        (width > 0 && height > 0).then_some(Insets { left, top, right, bottom, width, height })
+    }
+
+    pub async fn command(&self, method: &str, id: u64) -> bool {
+        match self.proxy.call_method(method, &(id,)).await {
+            Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Fires on every `WindowsChanged` (coalesced by the extension to one per 250 ms).
+    pub async fn changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
+        Ok(self.proxy.receive_signal("WindowsChanged").await?)
+    }
+}

@@ -40,7 +40,13 @@ The host's key, recognition key and paired devices live in `~/.local/state/sill-
 Deleting `host-key.pk8` makes a new host as far as devices are concerned: each pairs again.
 
 On GNOME it uses GNOME's own screen-cast API: no dialog (GNOME's sharing indicator shows while it
-runs), the primary monitor (`--monitor DP-3` for another). Elsewhere, or with `--portal`, the
+runs), the primary monitor (`--monitor DP-3` for another).
+
+**Single windows (GNOME):** `./target/release/sill-linux --install-extension` installs a small GNOME
+Shell extension that lists this machine's windows; log out and in once to load it. The app's bar
+then shows each window with a thumbnail, and a tap streams that window alone (raised and focused
+here, so typing goes to it), cropped to its frame. Holding a thumbnail gives its lights: close,
+minimize, full screen. Without the extension, or with `--portal`, only the Desktop streams. Elsewhere, or with `--portal`, the
 desktop portal asks once which monitor to share and to allow remote control; the answer is kept
 (`~/.local/state/sill-linux/remote-desktop-token`, delete it to be asked again; with
 `--view-only`, no remote control, `restore-token`). The device's Command key is Ctrl here
@@ -74,7 +80,8 @@ connects, by its row or with the launch argument `-SillConnect <IP>:47460`.
 **Without a device:** Sill's own `Scripts/sillclient.py` pairs and opens a session like the app
 (`--pair-ask --then-code=FILE --identity=DIR`, then `--tls --identity=DIR`; the host writes each
 code to `SILL_LINUX_TEST_CODE_FILE`). `tools/receive.py HOST PORT [SECONDS] [--join-late]`, on a
-`--plain` door, checks every message's layout and decodes the stream with ffmpeg.
+`--plain` door, checks every message's layout and decodes the stream with ffmpeg;
+`tools/windows.py HOST PORT` picks every listed window in turn and checks and decodes each.
 
 With NVENC the screen comes over DMA-BUF straight into the GPU (no copy, and a fullscreen video
 keeps updating, which shared memory does not on NVIDIA); shared memory is the fallback.

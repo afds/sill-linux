@@ -83,6 +83,50 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+pub const EXTENSION_UUID: &str = "sill-linux@sill-linux";
+const EXTENSION_FILES: [(&str, &str); 2] = [
+    ("metadata.json", include_str!("../gnome-extension/metadata.json")),
+    ("extension.js", include_str!("../gnome-extension/extension.js")),
+];
+
+/// The GNOME Shell extension that lists windows (built into this program): written to
+/// ~/.local/share/gnome-shell/extensions and enabled. GNOME on Wayland loads a new extension only
+/// at the next login.
+pub fn install_extension() -> Result<()> {
+    let home = std::env::var_os("HOME").context("no HOME")?;
+    let dir = std::path::PathBuf::from(home).join(".local/share/gnome-shell/extensions").join(EXTENSION_UUID);
+    std::fs::create_dir_all(&dir)?;
+    for (name, text) in EXTENSION_FILES {
+        std::fs::write(dir.join(name), text)?;
+    }
+    println!("Wrote the GNOME Shell extension to {}.", dir.display());
+    let enabled = Command::new("gnome-extensions").args(["enable", EXTENSION_UUID]).status();
+    match enabled {
+        Ok(s) if s.success() => println!("Enabled it."),
+        _ => {
+            // Not loaded yet: put it in the list the shell reads at login.
+            let list = Command::new("gsettings").args(["get", "org.gnome.shell", "enabled-extensions"]).output().context("running gsettings")?;
+            let current = String::from_utf8_lossy(&list.stdout).trim().to_string();
+            if !current.contains(EXTENSION_UUID) {
+                let new = match current.trim_start_matches("@as ").trim() {
+                    "[]" | "" => format!("['{EXTENSION_UUID}']"),
+                    l => format!("{}, '{EXTENSION_UUID}']", l.trim_end_matches(']')),
+                };
+                let ok = Command::new("gsettings").args(["set", "org.gnome.shell", "enabled-extensions", &new]).status()?.success();
+                if !ok {
+                    bail!("gsettings could not enable the extension");
+                }
+            }
+            println!("Enabled it for the next login.");
+        }
+    }
+    println!(
+        "Log out and in again to load it (GNOME on Wayland loads new extensions only at login); then the\n\
+         Sill app's bar lists this machine's windows. Updating it later works the same way."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

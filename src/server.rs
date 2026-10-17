@@ -36,16 +36,37 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the server asks of the capture side.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Control {
-    /// Start encoding the Desktop (a device picked it).
-    Start,
+    /// Start encoding this source (a device picked it): the Desktop, or a window by Mutter's id.
+    Start(Source),
     /// Nobody watches any more: stop encoding.
     Stop,
     /// A client needs a keyframe (it joined, or it lost a delta).
     Keyframe,
     /// What the encoder should run at now.
     Apply(Apply),
+    /// A window's light from the device's bar: "close", "minimize" or "fullScreen".
+    WindowCommand(u64, String),
+}
+
+/// What is streamed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Source {
+    Desktop,
+    /// Mutter's window id.
+    Window(u64),
+}
+
+/// A window this host can stream, from the window list (the GNOME Shell extension).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostWindow {
+    pub mutter_id: u64,
+    pub title: String,
+    pub app_name: String,
+    pub app_id: String,
+    pub width: i64,
+    pub height: i64,
 }
 
 /// The encoder's settings, from the saved settings and the devices' rates.
@@ -103,6 +124,11 @@ struct State {
     software_encoder: bool,
     /// The encoded picture's size, for the panel's readout.
     encoded: Option<(i64, i64)>,
+    /// The windows the device's bar lists, with the 32-bit ids the app uses for them.
+    windows: Vec<protocol::WindowInfo>,
+    wire_ids: HashMap<u64, u32>,
+    mutter_ids: HashMap<u32, u64>,
+    next_wire_id: u32,
 }
 
 #[derive(Clone)]
@@ -131,6 +157,10 @@ impl Server {
                 settings_path,
                 software_encoder: false,
                 encoded: None,
+                windows: Vec::new(),
+                wire_ids: HashMap::new(),
+                mutter_ids: HashMap::new(),
+                next_wire_id: 1,
             })),
             control,
             host_name: Arc::new(host_name),
@@ -306,10 +336,11 @@ impl Server {
         }
     }
 
-    fn window_list(&self, active: StreamSource) -> Vec<u8> {
+    fn window_list(&self, st: &State) -> Vec<u8> {
+        let active = st.active;
         let list = WindowList {
             mac_name: (*self.host_name).clone(),
-            windows: vec![],
+            windows: st.windows.clone(),
             active,
             launch_id: Some((*self.launch_id).clone()),
             host_version: None,
@@ -332,7 +363,7 @@ impl Server {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
             st.next_id += 1;
-            let _ = tx.send(self.window_list(st.active));
+            let _ = tx.send(self.window_list(&st));
             let _ = tx.send(self.settings_message(&st, None));
             st.clients.insert(
                 id,
@@ -404,6 +435,7 @@ impl Server {
                         );
                     }
                 }
+                kind::WINDOW_COMMAND => self.window_command(id, &payload),
                 kind::CHANGE_SETTINGS => match serde_json::from_slice::<HostSettingsChange>(&payload) {
                     Ok(change) => self.change_settings(id, change),
                     Err(e) => eprintln!("Bad settings change from client {id}: {e}"),
@@ -471,26 +503,141 @@ impl Server {
     fn select(&self, id: u64, source: StreamSource) {
         let mut st = self.state.lock().unwrap();
         let chosen = match source {
-            StreamSource::Window(w) => {
-                println!("Client {id} picked window {w}; this host lists no windows yet, so it keeps the Desktop.");
-                StreamSource::Desktop
+            StreamSource::Window(w) if !st.mutter_ids.contains_key(&w) => {
+                println!("Client {id} picked window {w}, which this host does not list; it keeps what it streams.");
+                if let Some(c) = st.clients.get(&id) {
+                    let _ = c.tx.send(self.window_list(&st));
+                }
+                return;
             }
             other => other,
         };
         if chosen == st.active {
             if let Some(c) = st.clients.get(&id) {
-                let _ = c.tx.send(self.window_list(st.active));
+                let _ = c.tx.send(self.window_list(&st));
             }
             return;
         }
         st.active = chosen;
-        println!("Streaming: {}", if chosen == StreamSource::Desktop { "the Desktop" } else { "nothing" });
-        let list = self.window_list(chosen);
+        let control = match chosen {
+            StreamSource::None => {
+                println!("Streaming: nothing");
+                Control::Stop
+            }
+            StreamSource::Desktop => {
+                println!("Streaming: the Desktop");
+                Control::Start(Source::Desktop)
+            }
+            StreamSource::Window(w) => {
+                let m = st.mutter_ids[&w];
+                let title = st.windows.iter().find(|x| x.id == w).map(|x| format!("{} — {}", x.app_name, x.title)).unwrap_or_default();
+                println!("Streaming: window {title}");
+                Control::Start(Source::Window(m))
+            }
+        };
+        let list = self.window_list(&st);
         for c in st.clients.values_mut() {
             c.needs_keyframe = true;
             let _ = c.tx.send(list.clone());
         }
-        let _ = self.control.send(if chosen == StreamSource::None { Control::Stop } else { Control::Start });
+        let _ = self.control.send(control);
+    }
+
+    /// The window list (from the GNOME Shell extension): sent to the devices when it changed. A
+    /// streamed window that is gone stops the stream (the app asks for the Desktop then).
+    pub fn set_windows(&self, list: Vec<HostWindow>) {
+        let mut st = self.state.lock().unwrap();
+        let mut windows = Vec::with_capacity(list.len());
+        for w in &list {
+            let wire = match st.wire_ids.get(&w.mutter_id) {
+                Some(&id) => id,
+                None => {
+                    let id = st.next_wire_id;
+                    st.next_wire_id += 1;
+                    st.wire_ids.insert(w.mutter_id, id);
+                    st.mutter_ids.insert(id, w.mutter_id);
+                    id
+                }
+            };
+            windows.push(protocol::WindowInfo {
+                id: wire,
+                title: w.title.clone(),
+                app_name: w.app_name.clone(),
+                bundle_id: w.app_id.clone(),
+                width: w.width,
+                height: w.height,
+            });
+        }
+        if windows == st.windows {
+            return;
+        }
+        st.windows = windows;
+        if let StreamSource::Window(w) = st.active {
+            if !st.windows.iter().any(|x| x.id == w) {
+                println!("Streaming: nothing (the window closed)");
+                st.active = StreamSource::None;
+                let _ = self.control.send(Control::Stop);
+            }
+        }
+        let msg = self.window_list(&st);
+        for c in st.clients.values() {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
+    /// A window's thumbnail (any image the app's UIImage reads; PNG here) to every device.
+    pub fn broadcast_thumbnail(&self, mutter_id: u64, image: &[u8]) {
+        let st = self.state.lock().unwrap();
+        let Some(&wire) = st.wire_ids.get(&mutter_id) else { return };
+        let mut payload = wire.to_be_bytes().to_vec();
+        payload.extend_from_slice(image);
+        let msg = protocol::message(kind::THUMBNAIL, protocol::now(), false, &payload);
+        for c in st.clients.values() {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
+    /// The capture side went back to the Desktop by itself (a window could not be streamed, or its
+    /// stream ended): the devices are told.
+    pub fn showing_desktop(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.active == StreamSource::Desktop || st.active == StreamSource::None {
+            return;
+        }
+        st.active = StreamSource::Desktop;
+        println!("Streaming: the Desktop");
+        let list = self.window_list(&st);
+        for c in st.clients.values_mut() {
+            c.needs_keyframe = true;
+            let _ = c.tx.send(list.clone());
+        }
+    }
+
+    /// The streamed window's Mutter id, if a window streams.
+    pub fn active_window(&self) -> Option<u64> {
+        let st = self.state.lock().unwrap();
+        match st.active {
+            StreamSource::Window(w) => st.mutter_ids.get(&w).copied(),
+            _ => None,
+        }
+    }
+
+    /// How many devices are connected (thumbnails are made only then, and all again for a new one).
+    pub fn client_count(&self) -> usize {
+        self.state.lock().unwrap().clients.len()
+    }
+
+    fn window_command(&self, id: u64, payload: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct WindowCommand {
+            id: u32,
+            action: String,
+        }
+        let Ok(cmd) = serde_json::from_slice::<WindowCommand>(payload) else { return };
+        let st = self.state.lock().unwrap();
+        let Some(&m) = st.mutter_ids.get(&cmd.id) else { return };
+        println!("Window command from client {id}: {} window {}", cmd.action, cmd.id);
+        let _ = self.control.send(Control::WindowCommand(m, cmd.action));
     }
 
     fn remove(&self, id: u64, reason: &str) {
@@ -689,7 +836,7 @@ mod tests {
 
         // The device asks for the Desktop: the capture side is told to start, the list says so.
         select_desktop(&mut s);
-        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop));
         let (_, p) = read_until(&mut s, kind::WINDOW_LIST);
         assert_eq!(serde_json::from_slice::<WindowList>(&p).unwrap().active, StreamSource::Desktop);
 
@@ -728,7 +875,7 @@ mod tests {
         a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         read_message(&mut a);
         select_desktop(&mut a);
-        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop));
         let mut b = StdStream::connect(addr).unwrap();
         b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (_, p) = read_message(&mut b);

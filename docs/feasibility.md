@@ -424,3 +424,59 @@ Verified: the capture over DMA-BUF with no dialog; absolute positions in the str
 the whole screen in one step: a move to 80 %, 75 % (3072, 1620 of 3840×2160) put the pointer exactly
 there, nothing refused. So on GNOME's API the translator has no box (`absolute_everywhere`): no
 relative moves and no flash at a stroke's start.
+
+## Phase 4b: single windows on GNOME (2026-10-17)
+
+The app's bar lists this machine's windows and a pick streams that window alone, as with Sill for
+Mac. Three parts:
+
+- **The window list** comes from a GNOME Shell extension (`gnome-extension/`, uuid
+  `sill-linux@sill-linux`, GNOME 48–51), since GNOME keeps the list from ordinary processes
+  (`Introspect.GetWindows`: AccessDenied). It owns `org.sill_linux.Shell` on the session bus:
+  `ListWindows` (Mutter's window id, title, app name, `.desktop` id, frame size; normal windows,
+  not minimized, as Sill for Mac lists only windows on screen), `Geometry` (the frame's insets in
+  the window's buffer: the shadow), `Thumbnail` (a PNG at most 208 px on its longer side, the
+  frame alone), `Activate`, `Close`, `Minimize`, `ToggleFullscreen`, and `WindowsChanged`
+  (created, closed, retitled, resized, minimized; at most every 250 ms). `sill-linux
+  --install-extension` writes it (built into the binary) and enables it; GNOME on Wayland loads a
+  new extension only at the next login. Without it the host says so and streams the Desktop alone.
+- **The catalog** (`server.rs`): kind 2 lists the windows under 32-bit ids of the host's own
+  (Mutter's are 64-bit), kept for the run; kind 3 thumbnails, as Sill for Mac paces them (every
+  2 s for a window that changed or streams, else every 6 s, all again for a device that joins,
+  none while no device is connected); kind 15 (a window's lights) closes, minimizes or toggles
+  full screen through the extension. A streamed window that closes stops the stream, and the app
+  asks for the Desktop.
+- **The capture** (`capture.rs`): a pick records the window with `RecordWindow(window-id)` after
+  `Activate` (raised and focused, so keys go to it). Found while building, in a headless nested
+  GNOME Shell (its own D-Bus session, settings in a keyfile):
+  - Mutter starts no stream added to a session already running (`RecordWindow` answers, no
+    `PipeWireStreamAdded` follows), so every switch makes a new linked remote-desktop and
+    screen-cast pair (no dialog either way) and stops the old one once the new one runs; input
+    follows. The Desktop is recorded anew too: a second consumer of a running monitor stream got
+    no first frame while the screen stood still.
+  - On a session already started, `PipeWireStreamAdded` can come while Mutter answers the call,
+    so the signal is listened for (a match rule) before the call.
+  - A window's buffers are the stream's whole size (the monitor's here) with the window in one
+    corner and a crop rectangle in each buffer's metadata (`GstVideoCropMeta` from pipewiresrc),
+    which glupload ignores. The valve's probe reads the crop; the tail crops on the GPU with a
+    small `glshader` (or `videocrop` on shared memory) to the frame inside it (the extension's
+    `Geometry` takes the shadow off), then scales for Standard (the window's logical size). A
+    window streams only once its crop is known (500 ms at most); a crop that changes (a resize,
+    maximize) rebuilds the tail once it has held for 200 ms.
+  - Input in a window: a device's position is a fraction of the cropped picture, mapped into the
+    window's region of the buffer, then given to `NotifyPointerMotionAbsolute` on the window's
+    stream (Mutter maps it onto the window).
+
+Verified in the nested shell (Text Editor and Calculator), `tools/windows.py` on a `--plain`
+door: the list with both windows; Desktop → each window → Desktop, a keyframe each time; pictures
+at each window's frame size (700×520, 360×616), decoded by ffmpeg with no error; thumbnails
+208×155 and 122×208; minimize from the device takes the window off the list; typing into the
+streamed Text Editor shows in the stream at once ("ello sill": the first letter of a fresh
+headless session's first text was lost; not seen on the real desktop before). Not settled there:
+clicks (in that headless shell a click activated no GTK button even on the Desktop, where hover
+worked), so taps inside a window wait for the iPad. The user's real settings were compared before
+and after every run.
+
+Not yet: Standard for a window on a scale-2 monitor (the ratio is read from the buffers against the
+stream's size; untested at scale 2), Aa (resizing the window to the device's panel), app icons and
+All Apps (kinds 4, 5, 7), the portal (no window streams there: the Desktop alone).
