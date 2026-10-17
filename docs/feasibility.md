@@ -280,5 +280,11 @@ Verified here: the portal grants "pointer and keyboard"; ten pointer moves from 
 client, no portal error; the decoded stream shows the pointer at exactly the asked place (20 %,
 30 %). Found on the way: GNOME takes absolute motion in the stream's own pixels (3840×2160 at
 scale 2), not the logical size the portal reports (1920×1080); the first try put the pointer at
-half the distance. Not tried here, on purpose (they would act on whatever has focus): clicks,
+half the distance. Then, on the iPad, the trackpad stopped at the screen's middle: GNOME's portal
+refuses absolute positions outside the size it reports ("Invalid position" past 1920×1080) while
+the compositor divides them by the scale, so absolute motion reaches only the top-left quarter at
+scale 2. A place outside that box is now reached by its nearest point inside it and then relative
+motion in logical pixels (unaccelerated: the pointer landed within 2 px of 80 %, 75 % in the
+decoded stream). libei's absolute device, with the compositor's own regions, would avoid the
+two-step move. Not tried here, on purpose (they would act on whatever has focus): clicks,
 scrolls, keys and text; those are for the device test.

@@ -460,6 +460,7 @@ async fn perform(rd: &RemoteDesktop, session: &Session<RemoteDesktop>, stream: u
     let state = |pressed: bool| if pressed { KeyState::Pressed } else { KeyState::Released };
     match *action {
         Action::Motion { x, y } => rd.notify_pointer_motion_absolute(session, stream, x, y, Default::default()).await,
+        Action::RelMotion { dx, dy } => rd.notify_pointer_motion(session, dx, dy, Default::default()).await,
         Action::Button { button, pressed } => rd.notify_pointer_button(session, button, state(pressed), Default::default()).await,
         Action::Axis { dx, dy } => rd.notify_pointer_axis(session, dx, dy, NotifyPointerAxisOptions::default()).await,
         Action::AxisStop => rd.notify_pointer_axis(session, 0.0, 0.0, NotifyPointerAxisOptions::default().set_finish(true)).await,
