@@ -653,5 +653,5 @@ The portal path (other desktops, `--portal`) is unchanged: its session lives for
 Seen in the nested headless shell, with the build from before this change too: recording Calculator
 right after it opened, then sizing it, sometimes crashed GNOME Shell 50 ("Failed to blit window
 content to framebuffer", then `meta_multi_texture_get_n_planes: assertion failed`, then a
-segfault). After these two fixes it did not happen in seven runs, but the cause is GNOME's and
+segfault). After these two fixes it did not happen in six runs, but the cause is GNOME's and
 timing-dependent, so it may not be gone. On a real session a GNOME Shell crash logs the user out.
