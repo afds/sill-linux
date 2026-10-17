@@ -26,7 +26,6 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -63,59 +62,30 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
 
     gst::init().context("GStreamer init")?;
     let mut apply = server.current_apply();
-    let (formats, encoder, name) = encoder(apply.kbps())?;
-    let software = name.contains("software");
-    server.set_software_encoder(software);
-    let gl = name.starts_with("NVENC");
+    let (formats, encoder_desc, name) = encoder(apply.kbps())?;
+    server.set_software_encoder(name.contains("software"));
     // Shared memory by default. SILL_LINUX_DMABUF=1 tries zero copy for NVENC (the compositor's
     // DMA-BUF imported into GL, which nvh265enc reads), but on GNOME 50 with an RTX 3060 glupload
     // read the buffer with the wrong layout (NVIDIA's tiled modifiers) and the picture was garbage.
+    let gl = name.starts_with("NVENC");
     let dmabuf = gl && std::env::var_os("SILL_LINUX_DMABUF").is_some();
     println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
-    let logical = cast.size.map(|(w, h)| (w, h));
-    // The fd stays open in `cast` for as long as the pipeline runs (pipewiresrc does not own it).
+    let shape = TailShape { gl, formats, encoder: encoder_desc, logical: cast.size };
+
+    // The source half stays for the whole run: the PipeWire stream and the valve (closed while
+    // nobody watches; it passes caps on, so opening it renegotiates nothing). The fd stays open in
+    // `cast` for as long as the pipeline runs (pipewiresrc does not own it).
+    let memory = if dmabuf { "keepalive-time=500 ! video/x-raw(memory:DMABuf)" } else { "always-copy=true keepalive-time=500 ! video/x-raw" };
     let description = format!(
-        "pipewiresrc fd={fd} path={node} {input} \
-         ! {encoder} \
-         ! video/x-h265,profile=main \
-         ! h265parse config-interval=-1 \
-         ! video/x-h265,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false max-buffers=4 drop=false",
+        "pipewiresrc fd={fd} path={node} {memory} ! valve name=gate drop=true drop-mode=forward-sticky-events",
         fd = cast.fd.as_raw_fd(),
         node = cast.node,
-        input = input_chain(dmabuf, gl, formats),
     );
     let pipeline = gst::parse::launch(&description)
         .context("building the pipeline")?
         .dynamic_cast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
     let gate = pipeline.by_name("gate").ok_or_else(|| anyhow!("no valve"))?;
-    let size = pipeline.by_name("size").ok_or_else(|| anyhow!("no size filter"))?;
-    let enc = pipeline.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
-    let sink = pipeline
-        .by_name("sink")
-        .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
-        .ok_or_else(|| anyhow!("no appsink"))?;
-
-    let frames_server = server.clone();
-    sink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if let Some(s) = sample.caps().and_then(|c| c.structure(0)) {
-                    if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
-                        frames_server.set_encoded_size(w as i64, h as i64);
-                    }
-                }
-                if let Some(buffer) = sample.buffer() {
-                    if let Ok(map) = buffer.map_readable() {
-                        frames_server.broadcast_access_unit(&protocol::convert_annex_b(map.as_slice()));
-                    }
-                }
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
 
     // Counters for the once-a-second line (buffers out of pipewiresrc, encoded units), the
     // captured size for input, and the frame-rate limit (frames sooner than it are dropped before
@@ -136,6 +106,12 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
         });
     }
     if let Some(pad) = gate.static_pad("src") {
+        // A new tail asks upstream to renegotiate as it links; pipewiresrc would then renegotiate
+        // its PipeWire stream (and fail, or reconnect): the tail takes the caps as they are.
+        pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| match info.event() {
+            Some(e) if e.type_() == gst::EventType::Reconfigure => gst::PadProbeReturn::Drop,
+            _ => gst::PadProbeReturn::Ok,
+        });
         let interval = min_interval_us.clone();
         let last = Arc::new(std::sync::Mutex::new(None::<Instant>));
         pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
@@ -149,39 +125,15 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             gst::PadProbeReturn::Ok
         });
     }
-    if let Some(pad) = sink.static_pad("sink") {
-        let c = encoded.clone();
-        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            c.fetch_add(1, Ordering::Relaxed);
-            gst::PadProbeReturn::Ok
-        });
-    }
-    let configure = |a: &Apply| {
-        enc.set_property("bitrate", a.kbps());
+    let set_rate = |a: &Apply| {
         // 90 % of the frame interval: a frame a little early is not dropped.
         min_interval_us.store(900_000 / a.fps.max(1) as u64, Ordering::Relaxed);
-        let mut caps = if gl {
-            "video/x-raw(memory:GLMemory),format=RGBA".to_string()
-        } else {
-            format!("video/x-raw,format={}", formats.split(',').next().unwrap_or("I420"))
-        };
-        if !a.retina {
-            if let Some((w, h)) = logical {
-                caps += &format!(",width={w},height={h}");
-            }
-        }
-        match gst::Caps::from_str(&caps) {
-            Ok(c) => size.set_property("caps", c),
-            Err(e) => eprintln!("Stream settings: bad caps {caps}: {e}"),
-        }
-        let res = match (a.retina, logical) {
-            (false, Some((w, h))) => format!("Standard ({w}×{h})"),
-            (false, None) => "Standard".to_string(),
-            (true, _) => "Retina (the stream's own size)".to_string(),
-        };
-        println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
     };
-    configure(&apply);
+    set_rate(&apply);
+    let mut tail = build_tail(&shape, &apply, server, &encoded)?;
+    pipeline.add(&tail.bin)?;
+    gate.link(&tail.bin).context("linking the encoder")?;
+    describe(&shape, &apply);
     let mut streaming = false;
     let mut last_stats = Instant::now();
 
@@ -204,13 +156,25 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
                 gate.set_property("drop", true);
             }
             Ok(Control::Keyframe) => keyframe_pending = true,
-            Ok(Control::Apply(a)) => {
-                if a != apply {
-                    apply = a;
-                    configure(&apply);
-                    keyframe_pending = true;
+            Ok(Control::Apply(a)) if a != apply => {
+                let new_size = a.retina != apply.retina;
+                apply = a;
+                set_rate(&apply);
+                if new_size {
+                    // A resolution change replaces the tail: changing the size live failed in
+                    // GStreamer (the scaler would not renegotiate mid-stream, then pipewiresrc
+                    // renegotiated and the capture ended, Retina → Standard, 2026-10-17).
+                    match replace_tail(&pipeline, &gate, tail, &shape, &apply, server, &encoded, streaming) {
+                        Ok(t) => tail = t,
+                        Err(e) => break Err(e.context("changing the resolution")),
+                    }
+                } else {
+                    tail.enc.set_property("bitrate", apply.kbps());
                 }
+                describe(&shape, &apply);
+                keyframe_pending = true;
             }
+            Ok(Control::Apply(_)) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
@@ -226,7 +190,7 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             keyframe_pending = false;
             last_keyframe = Instant::now();
             let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-            sink.send_event(event);
+            tail.sink.send_event(event);
         }
         while let Some(msg) = bus.pop() {
             use gst::MessageView;
@@ -248,19 +212,112 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     result
 }
 
-/// What goes between pipewiresrc's own settings and the encoder: the memory it hands over, the
-/// valve (closed while nobody watches; it passes caps on, so opening it renegotiates nothing), the
-/// scaler and the `size` filter (Retina or Standard, set live), on the GPU for NVENC.
-fn input_chain(dmabuf: bool, gl: bool, formats: &str) -> String {
-    let valve = "valve name=gate drop=true drop-mode=forward-sticky-events";
-    let memory = if dmabuf { "keepalive-time=500 ! video/x-raw(memory:DMABuf)" } else { "always-copy=true keepalive-time=500 ! video/x-raw" };
-    let scale = if gl {
-        "glupload ! glcolorconvert ! glcolorscale ! capsfilter name=size caps=video/x-raw(memory:GLMemory),format=RGBA".to_string()
-    } else {
-        let first = formats.split(',').next().unwrap_or("I420");
-        format!("videoconvertscale ! capsfilter name=size caps=video/x-raw,format={first}")
+/// What every tail is made of.
+struct TailShape {
+    gl: bool,
+    formats: &'static str,
+    encoder: String,
+    logical: Option<(i32, i32)>,
+}
+
+/// The half after the valve: scaler, size, encoder, parser, appsink. Rebuilt for a resolution
+/// change.
+struct Tail {
+    bin: gst::Bin,
+    enc: gst::Element,
+    sink: gst_app::AppSink,
+}
+
+fn describe(shape: &TailShape, a: &Apply) {
+    let res = match (a.retina, shape.logical) {
+        (false, Some((w, h))) => format!("Standard ({w}×{h})"),
+        (false, None) => "Standard".to_string(),
+        (true, _) => "Retina (the stream's own size)".to_string(),
     };
-    format!("{memory} ! {valve} ! {scale}")
+    println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
+}
+
+fn build_tail(shape: &TailShape, a: &Apply, server: &Server, encoded: &Arc<AtomicU64>) -> Result<Tail> {
+    let size = match (a.retina, shape.logical) {
+        (false, Some((w, h))) => format!(",width={w},height={h}"),
+        _ => String::new(),
+    };
+    let scale = if shape.gl {
+        format!("glupload ! glcolorconvert ! glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}")
+    } else {
+        let first = shape.formats.split(',').next().unwrap_or("I420");
+        format!("videoconvertscale ! video/x-raw,format={first}{size}")
+    };
+    // The encoder's bitrate is the one asked for now (the template carries the first one).
+    let encoder = shape.encoder.clone();
+    let description = format!(
+        "{scale} ! {encoder} ! video/x-h265,profile=main ! h265parse config-interval=-1 \
+         ! video/x-h265,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false max-buffers=4 drop=false"
+    );
+    let bin = gst::parse::bin_from_description(&description, true).context("building the encoder")?;
+    let enc = bin.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
+    enc.set_property("bitrate", a.kbps());
+    let sink = bin
+        .by_name("sink")
+        .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
+        .ok_or_else(|| anyhow!("no appsink"))?;
+    let frames_server = server.clone();
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if let Some(s) = sample.caps().and_then(|c| c.structure(0)) {
+                    if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+                        frames_server.set_encoded_size(w as i64, h as i64);
+                    }
+                }
+                if let Some(buffer) = sample.buffer() {
+                    if let Ok(map) = buffer.map_readable() {
+                        frames_server.broadcast_access_unit(&protocol::convert_annex_b(map.as_slice()));
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    if let Some(pad) = sink.static_pad("sink") {
+        let c = encoded.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    Ok(Tail { bin, enc, sink })
+}
+
+/// Swaps the tail while the source runs: the valve closed, the old tail stopped and removed, the
+/// new one linked and started, the valve opened again if devices watch. The valve's sticky
+/// events (caps included) go to the new tail with its first buffer.
+#[allow(clippy::too_many_arguments)]
+fn replace_tail(
+    pipeline: &gst::Pipeline,
+    gate: &gst::Element,
+    old: Tail,
+    shape: &TailShape,
+    a: &Apply,
+    server: &Server,
+    encoded: &Arc<AtomicU64>,
+    streaming: bool,
+) -> Result<Tail> {
+    gate.set_property("drop", true);
+    // A buffer already past the valve finishes its trip through the old tail first.
+    std::thread::sleep(Duration::from_millis(40));
+    gate.unlink(&old.bin);
+    old.bin.set_state(gst::State::Null).context("stopping the old encoder")?;
+    pipeline.remove(&old.bin)?;
+    let tail = build_tail(shape, a, server, encoded)?;
+    pipeline.add(&tail.bin)?;
+    gate.link(&tail.bin).context("linking the new encoder")?;
+    tail.bin.sync_state_with_parent().context("starting the new encoder")?;
+    if streaming {
+        gate.set_property("drop", false);
+    }
+    Ok(tail)
 }
 
 fn break_err(pipeline: &gst::Pipeline) {
@@ -367,7 +424,19 @@ fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unbound
     rx.recv().context("the portal thread ended")?
 }
 
+/// The pointer in the picture only with `--show-cursor`: like Sill for Mac, the app draws its own
+/// where it needs one (the trackpad held upright, Pencil hover), and a cursor in the picture makes
+/// the compositor send a frame for every move.
+static SHOW_CURSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_show_cursor(show: bool) {
+    SHOW_CURSOR.store(show, Ordering::Relaxed);
+}
+
 async fn cursor_mode(proxy: &Screencast) -> CursorMode {
+    if !SHOW_CURSOR.load(Ordering::Relaxed) {
+        return CursorMode::Hidden;
+    }
     match proxy.available_cursor_modes().await {
         Ok(modes) if modes.contains(CursorMode::Embedded) => CursorMode::Embedded,
         _ => CursorMode::Hidden,

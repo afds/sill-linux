@@ -308,6 +308,20 @@ list; Retina and Pro answered with its token, saved, and the live stream went fr
 kept. Input still lands in the captured stream's pixels whatever the encoded size (the motion
 actions logged in Standard mode: 80 % of the width exactly).
 
+Found on the iPad: Retina → Standard ended the capture ("no more input formats", then, with the
+reconfigure stopped at the valve, "not-negotiated": glcolorscale would not renegotiate from
+3840×2160 to 1920×1080 mid-stream). Changing the size live is gone: a resolution change now replaces
+the half after the valve (scaler, encoder, parser, appsink) while pipewiresrc runs on, the valve's
+sticky caps going to the new half with its first buffer, and upstream reconfigure events stopped at
+the valve so pipewiresrc never renegotiates. Five switches back and forth through Sill's test
+client: each a keyframe 0.5–0.9 s later, the capture never ended. Bitrate and frame rate still
+change live.
+
+The pointer is no longer in the picture by default (`--show-cursor` puts it back): as Sill for
+Mac, the app draws its own where it needs one, and the compositor no longer sends a frame per
+pointer move. Moves of this machine's own mouse are then not seen on the device (Sill for Mac's
+kind 26 shows them; not built here).
+
 Not done: the pointer drawn on the device (kinds 14 and 26: needs PipeWire's cursor metadata,
 which pipewiresrc does not pass on, so pipewire-rs directly); a busy screen's frame rate on the
 iPad is still to be measured.

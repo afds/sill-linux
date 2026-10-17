@@ -20,7 +20,7 @@ with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and 
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
+cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor]
 ```
 
 Run it in a terminal you can see: when a device asks to pair, the code is printed there (and a
@@ -45,6 +45,10 @@ for Mac, and apply at once without restarting the stream; they are kept in
 `~/.local/state/sill-linux/settings.json`. Resolution: Standard is the monitor's logical size
 (1920×1080 for a 4K monitor at 200 %), this host's default; Retina is every pixel. Prioritize Speed
 stays on (NVENC's lowest-latency preset); there is no virtual display on Linux.
+
+This machine's pointer is left out of the picture, as Sill for Mac does: the app draws its own
+where it needs one (the trackpad held upright, Pencil hover). `--show-cursor` draws it into the
+picture instead (then moves of the local mouse show too, at the cost of a frame per move).
 
 A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.
