@@ -640,10 +640,9 @@ fn read_token(path: &PathBuf) -> Option<String> {
 
 fn save_token(path: &PathBuf, token: Option<&str>) {
     if let Some(t) = token {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = crate::identity::write_private(path, t.as_bytes()) {
+            eprintln!("Could not save {}: {e}", path.display());
         }
-        let _ = std::fs::write(path, t);
     }
 }
 

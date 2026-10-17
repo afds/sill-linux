@@ -34,6 +34,28 @@ const EVICT_AFTER: Duration = Duration::from_secs(4);
 const EVICT_GRACE: Duration = Duration::from_secs(8);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Sill's `Door`: connections not yet admitted, in all and from one address.
+const MAX_PENDING: usize = 8;
+const MAX_PENDING_PER_SOURCE: usize = 2;
+
+/// A connection not yet admitted, counted against the caps until dropped.
+struct Pending {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    ip: std::net::IpAddr,
+    sources: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut m = self.sources.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Seconds on a monotonic clock, for the pointer's rules.
 fn clock() -> f64 {
@@ -345,13 +367,38 @@ impl Server {
                     Ok(l) => l,
                     Err(e) => return eprintln!("Listener failed: {e}"),
                 };
+                let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING));
+                let sources = Arc::new(Mutex::new(HashMap::new()));
+                let mut last_refusal: Option<Instant> = None;
                 loop {
                     match listener.accept().await {
                         Ok((stream, peer)) => {
+                            let ip = peer.ip().to_canonical();
+                            if !crate::door::origin_allowed(ip, &crate::door::local_subnets()) {
+                                if last_refusal.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+                                    println!("Refused a connection from {ip}: not this machine's networks (at most one such line a minute).");
+                                    last_refusal = Some(Instant::now());
+                                }
+                                continue;
+                            }
+                            let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+                            {
+                                let mut m = sources.lock().unwrap();
+                                let n = m.entry(ip).or_insert(0);
+                                if *n >= MAX_PENDING_PER_SOURCE {
+                                    continue;
+                                }
+                                *n += 1;
+                            }
+                            let pending = Pending { _permit: permit, ip, sources: sources.clone() };
                             let s = server.clone();
-                            tokio::spawn(async move { s.handle(stream, peer).await });
+                            tokio::spawn(async move { s.handle(stream, peer, pending).await });
                         }
-                        Err(e) => eprintln!("Accept failed: {e}"),
+                        Err(e) => {
+                            // Out of file descriptors, say: never spin.
+                            eprintln!("Accept failed: {e}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
             })
@@ -361,11 +408,14 @@ impl Server {
         Ok(local)
     }
 
-    async fn handle(self, stream: TcpStream, peer: SocketAddr) {
+    async fn handle(self, stream: TcpStream, peer: SocketAddr, pending: Pending) {
         let _ = stream.set_nodelay(true);
         let peer_text = peer.to_string();
         let door = match &self.door {
-            Door::Plain => return self.session(stream, peer_text).await,
+            Door::Plain => {
+                drop(pending);
+                return self.session(stream, peer_text).await;
+            }
             Door::Tls(d) => d.clone(),
         };
         let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, door.acceptor().accept(stream)).await {
@@ -381,7 +431,10 @@ impl Server {
         let Some(fingerprint) = fingerprint else { return println!("TLS from {peer_text} without a P-256 key: closed") };
         match door.admit(alpn.as_deref(), &fingerprint) {
             Admission::Pairing => door.serve_pairing(tls, fingerprint, peer_text).await,
-            Admission::Session(label) => self.session(tls, format!("{label} at {peer_text}")).await,
+            Admission::Session(label) => {
+                drop(pending);
+                self.session(tls, format!("{label} at {peer_text}")).await
+            }
             Admission::Refuse(goodbye) => {
                 let mut tls = tls;
                 if let Some(g) = goodbye {
@@ -416,6 +469,10 @@ impl Server {
         let mut close_rx_writer = close_tx.subscribe();
         let frames_in_flight = Arc::new(AtomicUsize::new(0));
         let last_drain = Arc::new(Mutex::new(Instant::now()));
+        // shortcut: only pongs are bounded for a device that stops reading; window lists and cursor
+        // shapes it never takes still queue (at the host's own pace) until it leaves or is evicted.
+        let pongs_queued = Arc::new(AtomicUsize::new(0));
+        let pongs_written = pongs_queued.clone();
 
         let id = {
             let mut st = self.state.lock().unwrap();
@@ -462,6 +519,9 @@ impl Server {
                     m = rx.recv() => {
                         let Some(data) = m else { break };
                         let is_frame = data[0] == kind::FRAME;
+                        if data[0] == kind::PONG {
+                            pongs_written.fetch_sub(1, Ordering::SeqCst);
+                        }
                         if wr.write_all(&data).await.is_err() {
                             break;
                         }
@@ -489,18 +549,23 @@ impl Server {
                 Err(e) => break if e.kind() == std::io::ErrorKind::InvalidData { "message too large" } else { "closed" },
             };
             match h.kind {
-                kind::PING => self.send_to(id, protocol::message(kind::PONG, protocol::now(), false, &payload)),
+                // The app's ping carries 8 or 16 bytes; at most 32 pongs wait for a device that stops reading.
+                kind::PING if payload.len() <= 64 && pongs_queued.load(Ordering::SeqCst) < 32 => {
+                    pongs_queued.fetch_add(1, Ordering::SeqCst);
+                    self.send_to(id, protocol::message(kind::PONG, protocol::now(), false, &payload))
+                }
+                kind::PING => {}
                 kind::SELECT_SOURCE => match serde_json::from_slice::<StreamSource>(&payload) {
                     Ok(source) => self.select(id, source),
                     Err(e) => eprintln!("Bad source from client {id}: {e}"),
                 },
                 kind::HELLO => {
                     if let Ok(hello) = serde_json::from_slice::<Hello>(&payload) {
-                        let label = hello.device.clone().unwrap_or_else(|| "a device".into());
+                        let label = crate::door::clean(hello.device.as_deref().unwrap_or(""), "a device");
                         println!(
                             "Client hello: {label}, Sill {} ({}), protocol {}",
-                            hello.app_version.as_deref().unwrap_or("?"),
-                            hello.build.as_deref().unwrap_or("?"),
+                            crate::door::clean(hello.app_version.as_deref().unwrap_or(""), "?"),
+                            crate::door::clean(hello.build.as_deref().unwrap_or(""), "?"),
                             hello.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
                         );
                     }
@@ -544,7 +609,7 @@ impl Server {
                         if let Ok(s) = serde_json::from_slice::<ClientStats>(&payload) {
                             println!(
                                 "client {}: {} fps, frame age {}, rtt {}",
-                                s.device,
+                                crate::door::clean(&s.device, "a device"),
                                 s.fps,
                                 median_and_worst(s.frame_age_ms, s.frame_age_max_ms),
                                 median_and_worst(s.rtt_ms, s.rtt_max_ms)
@@ -919,7 +984,7 @@ impl Server {
         let Ok(cmd) = serde_json::from_slice::<WindowCommand>(payload) else { return };
         let st = self.state.lock().unwrap();
         let Some(&m) = st.mutter_ids.get(&cmd.id) else { return };
-        println!("Window command from client {id}: {} window {}", cmd.action, cmd.id);
+        println!("Window command from client {id}: {:?} window {}", cmd.action, cmd.id);
         let _ = self.control.send(Control::WindowCommand(m, cmd.action));
     }
 

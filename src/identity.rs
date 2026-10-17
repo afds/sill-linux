@@ -10,7 +10,7 @@ use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,19 +43,31 @@ pub fn state_dir() -> PathBuf {
         .join("sill-linux")
 }
 
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+/// Written 0600 through a fresh temporary file (a stale one, of any mode, is removed first), in a
+/// directory made 0700.
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        private_dir(dir)?;
+    }
     let tmp = path.with_extension("tmp");
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let _ = fs::remove_file(&tmp);
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
 
+/// The state directory, made if needed and kept 0700 even when something made it wider.
+fn private_dir(dir: &Path) -> Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| format!("securing {}", dir.display()))
+}
+
 impl Identity {
     /// Loads the identity from `dir`, making the key and recognition key on first use.
     pub fn load_or_create(dir: &Path) -> Result<Identity> {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
+        private_dir(dir)?;
         let rng = SystemRandom::new();
         let key_path = dir.join("host-key.pk8");
         let key_pkcs8 = match fs::read(&key_path) {
