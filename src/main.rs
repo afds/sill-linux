@@ -8,7 +8,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::mpsc;
 
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
-                  [--view-only | --command-key ctrl|super] [--show-cursor]
+                  [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
        sill-linux --forget-devices
 
   --port N          TCP port of the door (default 47460)
@@ -19,6 +19,7 @@ const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plai
   --view-only       stream only; ask for no remote control (taps and keys from devices are ignored)
   --command-key K   what the device's Command key is here: ctrl (default: ⌘C copies) or super
   --show-cursor     draw this machine's pointer into the picture (off: the app draws its own)
+  --keep-all-taps   click on every tap the app sends, also one that ends a slow pointer move
   --forget-devices  remove every paired device, then exit
 
 By default the door speaks TLS and a device pairs once with a code this terminal shows (TXT p=1),
@@ -40,10 +41,11 @@ struct Args {
     forget: bool,
     input: Option<CommandKey>,
     show_cursor: bool,
+    keep_all_taps: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -61,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
             "--forget-devices" => a.forget = true,
             "--view-only" => a.input = None,
             "--show-cursor" => a.show_cursor = true,
+            "--keep-all-taps" => a.keep_all_taps = true,
             "--command-key" => {
                 a.input = Some(match value("--command-key")?.as_str() {
                     "ctrl" => CommandKey::Ctrl,
@@ -144,12 +147,13 @@ fn main() {
     }
     let _advert = if args.advertise { sill_linux::advertise::publish(&args.name, addr.port(), &txt) } else { None };
 
-    run_capture(&server, control_rx, args.input, args.show_cursor);
+    run_capture(&server, control_rx, args.input, args.show_cursor, args.keep_all_taps);
 }
 
 #[cfg(feature = "capture")]
-fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<CommandKey>, show_cursor: bool) {
+fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<CommandKey>, show_cursor: bool, keep_all_taps: bool) {
     sill_linux::capture::set_show_cursor(show_cursor);
+    sill_linux::capture::set_keep_all_taps(keep_all_taps);
     if let Err(e) = sill_linux::capture::run(server, control, input) {
         eprintln!("Capture failed: {e:#}");
         std::process::exit(1);
@@ -157,7 +161,7 @@ fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<
 }
 
 #[cfg(not(feature = "capture"))]
-fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _input: Option<CommandKey>, _show_cursor: bool) {
+fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _input: Option<CommandKey>, _show_cursor: bool, _keep_all_taps: bool) {
     eprintln!("Built without the capture feature: serving the door with no picture.");
     for c in control {
         println!("Control: {c:?}");

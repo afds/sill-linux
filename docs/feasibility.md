@@ -325,3 +325,21 @@ kind 26 shows them; not built here).
 Not done: the pointer drawn on the device (kinds 14 and 26: needs PipeWire's cursor metadata,
 which pipewiresrc does not pass on, so pipewire-rs directly); a busy screen's frame rate on the
 iPad is still to be measured.
+
+## Stray clicks from the trackpad (2026-10-17)
+
+Reported on the iPad: "sometimes when I use the trackpad and lift my finger after moving the
+cursor, it clicks". The timed input log (`SILL_LINUX_INPUT_LOG=1`) showed the clicks are the app's
+own: a press and its release 1 ms apart, from iOS's tap recognizer on the trackpad, which allows a
+little movement and a long touch, so a slow, small nudge followed by a lift is a tap (650 ms of
+moves, the click 69 ms after the last). It would do the same against Sill for Mac.
+
+Worked around here (`input::Translator`, on by default, `--keep-all-taps` off): a tap within
+120 ms of a run of moves at least 150 ms long is dropped; a real tap (a twitch of tens of
+milliseconds, or a pause first) and a drag (0.45 s of stillness first) are kept, and a press whose
+release does not come within 40 ms (the Pencil after hovering) goes through that much later.
+`examples/replay-input.rs` replays a log: on the reported session it kept the two real taps and
+dropped only the stray one.
+
+For Sill's app (Noah): the trackpad's tap recognizer could require that the touch moved the
+pointer less than a few points, or fail it once the finger tracker has moved the cursor.

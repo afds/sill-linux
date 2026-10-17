@@ -429,6 +429,17 @@ fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unbound
 /// the compositor send a frame for every move.
 static SHOW_CURSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+static KEEP_ALL_TAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--keep-all-taps`: no tap is dropped (see `input::Translator`'s tap filter).
+pub fn set_keep_all_taps(keep: bool) {
+    KEEP_ALL_TAPS.store(keep, Ordering::Relaxed);
+}
+
+fn keep_all_taps() -> bool {
+    KEEP_ALL_TAPS.load(Ordering::Relaxed)
+}
+
 pub fn set_show_cursor(show: bool) {
     SHOW_CURSOR.store(show, Ordering::Relaxed);
 }
@@ -570,11 +581,16 @@ async fn run_input(
                     if log {
                         println!("{:>8} ms  device {id}: {event:?}", t0.elapsed().as_millis());
                     }
-                    let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command));
+                    let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command).keep_all_taps(keep_all_taps()));
                     if let Some((w, h)) = captured_size() {
                         t.set_size(w, h);
                     }
-                    t.handle(event, Instant::now())
+                    let dropped = t.dropped_taps;
+                    let actions = t.handle(event, Instant::now());
+                    if t.dropped_taps > dropped {
+                        println!("Input: a tap at the end of a pointer move was not clicked (--keep-all-taps keeps them).");
+                    }
+                    actions
                 }
                 Some(InputCmd::Left(id)) => translators.remove(&id).map(|mut t| t.release_all()).unwrap_or_default(),
             },

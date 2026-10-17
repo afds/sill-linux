@@ -142,7 +142,30 @@ pub struct Translator {
     synthetic: BTreeMap<u16, Vec<i32>>,
     in_gesture: bool,
     stop_at: Option<Instant>,
+    /// Drop a tap that ends a pointer move (`keep_all_taps` off).
+    filter_taps: bool,
+    /// The pointer's last move, and when the moves it ends began (a gap over `STROKE_GAP` starts
+    /// a new run).
+    last_move: Option<Instant>,
+    moves_since: Option<Instant>,
+    /// A left press held back to see whether its release comes at once (a tap).
+    pending_left: Option<Instant>,
+    /// Taps dropped so far, for the log.
+    pub dropped_taps: u64,
 }
+
+/// The Sill app's trackpad counts a slow, small nudge of the pointer followed by a lift as a tap
+/// (iOS's tap recognizer allows a little movement and a long touch), so the lift clicks what the
+/// pointer was just moved onto (the iPad, 2026-10-17: 650 ms of moves, the click 69 ms after the
+/// last). A tap the app sends is a press and its release within a millisecond or two; one that
+/// comes within `TAP_AFTER_MOVE` of moves that ran at least `MOVE_RUN` is dropped. A real tap
+/// (a twitch of tens of milliseconds, or a pause first) and a drag (the app's press and hold needs
+/// 0.45 s of stillness) are kept; a press with no release within `TAP_WINDOW` (the Pencil after
+/// hovering) goes through that much later.
+const TAP_AFTER_MOVE: Duration = Duration::from_millis(120);
+const MOVE_RUN: Duration = Duration::from_millis(150);
+const STROKE_GAP: Duration = Duration::from_millis(150);
+const TAP_WINDOW: Duration = Duration::from_millis(40);
 
 impl Translator {
     /// `width`×`height`: the size the portal reports for the stream; the picture's own size
@@ -163,11 +186,30 @@ impl Translator {
             synthetic: BTreeMap::new(),
             in_gesture: false,
             stop_at: None,
+            filter_taps: true,
+            last_move: None,
+            moves_since: None,
+            pending_left: None,
+            dropped_taps: 0,
         }
     }
 
     /// The stream's size in its own pixels, the space absolute motion is given in (GNOME at scale
     /// 2: 3840×2160 for a monitor the portal calls 1920×1080).
+    /// `--keep-all-taps`: every tap the device sends clicks.
+    pub fn keep_all_taps(mut self, keep: bool) -> Translator {
+        self.filter_taps = !keep;
+        self
+    }
+
+    /// The held-back left press goes out after all (its release did not come at once).
+    fn flush_pending(&mut self, out: &mut Vec<Action>) {
+        if self.pending_left.take().is_some() && !self.buttons.contains(&BTN_LEFT) {
+            self.buttons.push(BTN_LEFT);
+            out.push(Action::Button { button: BTN_LEFT, pressed: true });
+        }
+    }
+
     pub fn set_size(&mut self, width: f64, height: f64) {
         if (width, height) != (self.width, self.height) {
             self.width = width;
@@ -234,9 +276,35 @@ impl Translator {
 
     pub fn handle(&mut self, event: InputEvent, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
+        // A held-back press: its release now drops both; anything else lets the press go first.
+        if let Some(at) = self.pending_left {
+            let is_release = matches!(event, InputEvent::Pointer { action: PointerAction::LeftUp, .. });
+            if is_release && now.duration_since(at) <= TAP_WINDOW {
+                self.pending_left = None;
+                self.dropped_taps += 1;
+                return out;
+            }
+            self.flush_pending(&mut out);
+        }
         match event {
             InputEvent::Pointer { action, x, y } => {
                 self.motion(x, y, &mut out);
+                if action == PointerAction::Move {
+                    if self.last_move.is_none_or(|l| now.duration_since(l) > STROKE_GAP) {
+                        self.moves_since = Some(now);
+                    }
+                    self.last_move = Some(now);
+                }
+                if action == PointerAction::LeftDown && self.filter_taps && !self.buttons.contains(&BTN_LEFT) {
+                    let ends_a_move = match (self.last_move, self.moves_since) {
+                        (Some(l), Some(s)) => now.duration_since(l) <= TAP_AFTER_MOVE && l.duration_since(s) >= MOVE_RUN,
+                        _ => false,
+                    };
+                    if ends_a_move {
+                        self.pending_left = Some(now);
+                        return out;
+                    }
+                }
                 let (button, pressed) = match action {
                     PointerAction::Move => return out,
                     PointerAction::LeftDown => (BTN_LEFT, true),
@@ -375,20 +443,26 @@ impl Translator {
         self.held.contains_key(&code) || self.held.contains_key(&right)
     }
 
-    /// The axis stop owed after a lift with no momentum.
+    /// The axis stop owed after a lift with no momentum, and a held-back press whose release did
+    /// not come.
     pub fn tick(&mut self, now: Instant) -> Vec<Action> {
-        match self.stop_at {
-            Some(t) if now >= t && self.in_gesture => {
+        let mut out = Vec::new();
+        if self.pending_left.is_some_and(|at| now.duration_since(at) > TAP_WINDOW) {
+            self.flush_pending(&mut out);
+        }
+        if let Some(t) = self.stop_at {
+            if now >= t && self.in_gesture {
                 self.stop_at = None;
                 self.in_gesture = false;
-                vec![Action::AxisStop]
+                out.push(Action::AxisStop);
             }
-            _ => vec![],
         }
+        out
     }
 
     /// The device left: every key and button it holds goes up.
     pub fn release_all(&mut self) -> Vec<Action> {
+        self.pending_left = None;
         let mut out = Vec::new();
         for button in std::mem::take(&mut self.buttons) {
             out.push(Action::Button { button, pressed: false });
@@ -521,6 +595,73 @@ mod tests {
         let mut one = t();
         let a = one.handle(InputEvent::Pointer { action: PointerAction::Move, x: 1.0, y: 1.0 }, now);
         assert_eq!(a, vec![Action::Motion { x: 1919.0, y: 1079.0 }]);
+    }
+
+    fn mv(tr: &mut Translator, at: Instant, x: f64) -> Vec<Action> {
+        tr.handle(InputEvent::Pointer { action: PointerAction::Move, x, y: 0.5 }, at)
+    }
+    fn press(tr: &mut Translator, at: Instant, down: bool) -> Vec<Action> {
+        let action = if down { PointerAction::LeftDown } else { PointerAction::LeftUp };
+        tr.handle(InputEvent::Pointer { action, x: 0.5, y: 0.5 }, at)
+    }
+    fn buttons(a: &[Action]) -> Vec<Action> {
+        a.iter().filter(|x| matches!(x, Action::Button { .. })).cloned().collect()
+    }
+
+    #[test]
+    fn a_tap_that_ends_a_move_is_dropped() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // The iPad's case: 650 ms of moves, the tap 69 ms after the last.
+        let mut tr = t();
+        for i in 0..30 {
+            mv(&mut tr, ms(i * 22), 0.3 + i as f64 * 0.001);
+        }
+        assert!(buttons(&press(&mut tr, ms(29 * 22 + 69), true)).is_empty());
+        assert!(buttons(&press(&mut tr, ms(29 * 22 + 70), false)).is_empty());
+        assert_eq!(tr.dropped_taps, 1);
+        assert!(tr.tick(ms(2000)).is_empty());
+
+        // A real tap: a 66 ms twitch, then the tap.
+        let mut tr = t();
+        for i in 0..4 {
+            mv(&mut tr, ms(i * 22), 0.5);
+        }
+        assert_eq!(buttons(&press(&mut tr, ms(85), true)), vec![Action::Button { button: BTN_LEFT, pressed: true }]);
+        assert_eq!(buttons(&press(&mut tr, ms(86), false)), vec![Action::Button { button: BTN_LEFT, pressed: false }]);
+
+        // A tap after a pause.
+        let mut tr = t();
+        for i in 0..30 {
+            mv(&mut tr, ms(i * 22), 0.3);
+        }
+        assert_eq!(buttons(&press(&mut tr, ms(29 * 22 + 568), true)).len(), 1);
+
+        // The Pencil after hovering: a press whose release does not come at once goes through,
+        // 40 ms late, and its drag and release as usual.
+        let mut tr = t();
+        for i in 0..30 {
+            mv(&mut tr, ms(i * 22), 0.3);
+        }
+        let at = 29 * 22 + 10;
+        assert!(buttons(&press(&mut tr, ms(at), true)).is_empty());
+        assert_eq!(buttons(&tr.tick(ms(at + 50))), vec![Action::Button { button: BTN_LEFT, pressed: true }]);
+        assert_eq!(buttons(&press(&mut tr, ms(at + 400), false)), vec![Action::Button { button: BTN_LEFT, pressed: false }]);
+        // Or a move first: the press goes out before it.
+        let mut tr = t();
+        for i in 0..30 {
+            mv(&mut tr, ms(i * 22), 0.3);
+        }
+        press(&mut tr, ms(at), true);
+        let a = mv(&mut tr, ms(at + 15), 0.31);
+        assert_eq!(buttons(&a), vec![Action::Button { button: BTN_LEFT, pressed: true }]);
+
+        // --keep-all-taps.
+        let mut tr = t().keep_all_taps(true);
+        for i in 0..30 {
+            mv(&mut tr, ms(i * 22), 0.3);
+        }
+        assert_eq!(buttons(&press(&mut tr, ms(29 * 22 + 69), true)).len(), 1);
     }
 
     #[test]

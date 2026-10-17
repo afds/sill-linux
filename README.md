@@ -20,7 +20,7 @@ with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and 
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor]
+cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor] [--keep-all-taps]
 ```
 
 Run it in a terminal you can see: when a device asks to pair, the code is printed there (and a
@@ -49,6 +49,10 @@ stays on (NVENC's lowest-latency preset); there is no virtual display on Linux.
 This machine's pointer is left out of the picture, as Sill for Mac does: the app draws its own
 where it needs one (the trackpad held upright, Pencil hover). `--show-cursor` draws it into the
 picture instead (then moves of the local mouse show too, at the cost of a frame per move).
+
+The app's trackpad can count a slow, small pointer nudge followed by a lift as a tap; such a tap
+is not clicked here (`--keep-all-taps` clicks every tap). `cargo run --example replay-input -- LOG`
+replays an input log (`SILL_LINUX_INPUT_LOG=1`) and shows which clicks would go out.
 
 A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.
