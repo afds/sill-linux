@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.104"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"], optional = true }
+futures-util = { version = "0.3.34", optional = true }
 gstreamer = { version = "0.25.4", optional = true }
 gstreamer-app = { version = "0.25.2", optional = true }
 gstreamer-video = { version = "0.25.4", optional = true }
@@ -26,4 +27,5 @@ uuid = { version = "1.28.0", features = ["v4"] }
 default = ["capture"]
 # The portal and GStreamer pipeline. Needs libgstreamer1.0-dev and libgstreamer-plugins-base1.0-dev;
 # without it (--no-default-features) the protocol and server still build and test.
-capture = ["dep:ashpd", "dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+capture = ["dep:ashpd", "dep:futures-util", "dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+futures-util = ["dep:futures-util"]

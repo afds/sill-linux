@@ -405,3 +405,22 @@ test against a Debug build of its branch.
 - `--choose-screen`: the saved portal choice is ignored once; the new one is saved.
 - Seen once on the DMA-BUF path, mid-stream, nothing broken: GStreamer-Video-CRITICAL
   `gst_video_frame_map_id: assertion 'info->finfo->format == meta->format' failed`. To watch.
+
+## Phase 4a: GNOME's own API (2026-10-17)
+
+Decided with the user: on GNOME, capture and input through Mutter's D-Bus API
+(`org.gnome.Mutter.ScreenCast`, `org.gnome.Mutter.RemoteDesktop`), as gnome-remote-desktop does,
+and a GNOME Shell extension for the window list (phase 4b). An ordinary process may create these
+sessions (verified); they live as long as its D-Bus connection.
+
+`mutter.rs`: a remote-desktop session, a screen-cast session linked to it
+(`remote-desktop-session-id`), `RecordMonitor(connector)` (the primary monitor from
+`DisplayConfig.GetCurrentState`, or `--monitor`), `PipeWireStreamAdded` for the node, and input
+through `NotifyPointerMotionAbsolute(stream, x, y)` and the rest. pipewiresrc connects by node to
+this process's own PipeWire connection. No consent dialog (GNOME's sharing indicator shows);
+`--portal` keeps the portal, which is also the fallback away from GNOME.
+
+Verified: the capture over DMA-BUF with no dialog; absolute positions in the stream's pixels across
+the whole screen in one step: a move to 80 %, 75 % (3072, 1620 of 3840×2160) put the pointer exactly
+there, nothing refused. So on GNOME's API the translator has no box (`absolute_everywhere`): no
+relative moves and no flash at a stroke's start.

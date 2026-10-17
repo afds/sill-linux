@@ -39,8 +39,9 @@ door, for a Debug build of the app.
 The host's key, recognition key and paired devices live in `~/.local/state/sill-linux/` (0600).
 Deleting `host-key.pk8` makes a new host as far as devices are concerned: each pairs again.
 
-The first run asks which monitor to share and to allow remote control (the RemoteDesktop portal);
-the answer is kept
+On GNOME it uses GNOME's own screen-cast API: no dialog (GNOME's sharing indicator shows while it
+runs), the primary monitor (`--monitor DP-3` for another). Elsewhere, or with `--portal`, the
+desktop portal asks once which monitor to share and to allow remote control; the answer is kept
 (`~/.local/state/sill-linux/remote-desktop-token`, delete it to be asked again; with
 `--view-only`, no remote control, `restore-token`). The device's Command key is Ctrl here
 (`--command-key super` to change it), so ⌘C copies; the app's Spotlight key (⌘Space) taps Super,

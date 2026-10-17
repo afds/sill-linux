@@ -126,6 +126,8 @@ pub struct Translator {
     /// stream's pixels.
     box_w: f64,
     box_h: f64,
+    /// No box: absolute positions reach the whole stream (GNOME's own API).
+    everywhere: bool,
     command: CommandKey,
     last_motion: Option<(f64, f64)>,
     /// When this translator last placed the pointer (with `last_motion`): within `RESYNC_AFTER`
@@ -183,6 +185,7 @@ impl Translator {
             height,
             box_w: width,
             box_h: height,
+            everywhere: false,
             command,
             last_motion: None,
             placed_at: None,
@@ -204,6 +207,12 @@ impl Translator {
 
     /// The stream's size in its own pixels, the space absolute motion is given in (GNOME at scale
     /// 2: 3840×2160 for a monitor the portal calls 1920×1080).
+    /// Absolute positions reach the whole stream: the box is the stream (GNOME's own API).
+    pub fn absolute_everywhere(mut self, on: bool) -> Translator {
+        self.everywhere = on;
+        self
+    }
+
     /// `--keep-all-taps`: every tap the device sends clicks.
     pub fn keep_all_taps(mut self, keep: bool) -> Translator {
         self.filter_taps = !keep;
@@ -240,7 +249,7 @@ impl Translator {
             self.placed_at = Some(now);
             return;
         }
-        let inside = (p.0.min(self.box_w - 1.0).max(0.0), p.1.min(self.box_h - 1.0).max(0.0));
+        let inside = if self.everywhere { p } else { (p.0.min(self.box_w - 1.0).max(0.0), p.1.min(self.box_h - 1.0).max(0.0)) };
         // Stream pixels per logical pixel.
         let (sx, sy) = (self.width / self.box_w, self.height / self.box_h);
         let recent = self.placed_at.is_some_and(|t| now.duration_since(t) <= RESYNC_AFTER);

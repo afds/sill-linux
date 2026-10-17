@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
                   [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
-                  [--choose-screen] [--no-notifications]
+                  [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
        sill-linux --forget-devices
@@ -25,6 +25,9 @@ const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plai
   --keep-all-taps   click on every tap the app sends, also one that ends a slow pointer move
   --choose-screen   ask which screen to share again (with several monitors), and keep the answer
   --no-notifications  the pairing code only on this terminal, not as a desktop notification
+  --portal          capture through the desktop portal even on GNOME (default there: GNOME's own
+                    screen-cast API, which needs no dialog and streams single windows)
+  --monitor C       with GNOME's API, the monitor to stream as the Desktop (a connector, e.g. DP-3)
   --forget-devices  remove every paired device, then exit
 
 By default the door speaks TLS and a device pairs once with a code this terminal shows (TXT p=1),
@@ -49,13 +52,15 @@ struct Args {
     keep_all_taps: bool,
     choose_screen: bool,
     notifications: bool,
+    portal: bool,
+    monitor: Option<String>,
     service: Option<bool>,
     /// The arguments to keep in the service's command line.
     pass: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, service: None, pass: Vec::new() };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, pass: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut taken = None;
@@ -82,6 +87,8 @@ fn parse_args() -> Result<Args, String> {
             "--show-cursor" => a.show_cursor = true,
             "--keep-all-taps" => a.keep_all_taps = true,
             "--choose-screen" => a.choose_screen = true,
+            "--portal" => a.portal = true,
+            "--monitor" => a.monitor = Some(value("--monitor")?),
             "--no-notifications" => a.notifications = false,
             "--install-service" => {
                 a.service = Some(true);
@@ -204,6 +211,11 @@ fn main() {
     quit_on_signal(server.clone());
 
     CHOOSE_SCREEN.store(args.choose_screen, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "capture")]
+    {
+        sill_linux::capture::set_force_portal(args.portal);
+        sill_linux::capture::set_monitor(args.monitor.clone());
+    }
     run_capture(&server, control_rx, args.input, args.show_cursor, args.keep_all_taps);
 }
 

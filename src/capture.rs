@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 const KEYFRAME_SPACING: Duration = Duration::from_millis(250);
 
 struct PortalCast {
-    fd: OwnedFd,
+    /// The portal's PipeWire remote; None: this process's own PipeWire connection (Mutter's API).
+    fd: Option<OwnedFd>,
     node: u32,
     size: Option<(i32, i32)>,
 }
@@ -51,7 +52,7 @@ fn captured_size() -> Option<(f64, f64)> {
 
 /// `input`: the Command key's meaning, or None for view only (no remote control asked for).
 pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey>) -> Result<()> {
-    let (cast, input_tx) = start_portal(input)?;
+    let (cast, input_tx) = start_capture(input)?;
     if let Some(tx) = input_tx {
         server.set_input(tx);
     }
@@ -117,8 +118,8 @@ fn run_pipeline(
         format!("videoconvert ! capsfilter name=head caps=video/x-raw,format={first}")
     };
     let description = format!(
-        "pipewiresrc fd={fd} path={node} {memory} ! valve name=gate drop={drop} drop-mode=forward-sticky-events ! {head}",
-        fd = cast.fd.as_raw_fd(),
+        "pipewiresrc {fd} path={node} {memory} ! valve name=gate drop={drop} drop-mode=forward-sticky-events ! {head}",
+        fd = cast.fd.as_ref().map(|f| format!("fd={}", f.as_raw_fd())).unwrap_or_default(),
         node = cast.node,
         drop = !*streaming,
     );
@@ -444,12 +445,25 @@ fn save_token(path: &PathBuf, token: Option<&str>) {
     }
 }
 
-/// Runs the portal on a thread of its own, which then keeps the session (and its D-Bus
-/// connection) alive for as long as this process runs. With `input`, the session is a
-/// RemoteDesktop one with the screen cast in it, and input runs on that thread too.
-fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>)> {
+static FORCE_PORTAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MONITOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `--portal`: the portal even where GNOME's own API is here.
+pub fn set_force_portal(on: bool) {
+    FORCE_PORTAL.store(on, Ordering::Relaxed);
+}
+
+/// `--monitor CONNECTOR` (GNOME's API): which monitor is the Desktop; the primary one otherwise.
+pub fn set_monitor(connector: Option<String>) {
+    *MONITOR.lock().unwrap() = connector;
+}
+
+/// Starts the capture on a thread of its own, which then keeps the session (and its D-Bus
+/// connection) alive for as long as this process runs; input runs on that thread too. GNOME's own
+/// API where it is here (`mutter`), else the portal.
+fn start_capture(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>)> {
     let (tx, rx) = mpsc::channel::<Result<(PortalCast, Option<UnboundedSender<InputCmd>>)>>();
-    std::thread::Builder::new().name("portal".into()).spawn(move || {
+    std::thread::Builder::new().name("capture".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
@@ -458,6 +472,55 @@ fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unbound
             }
         };
         rt.block_on(async move {
+            let use_mutter = !FORCE_PORTAL.load(Ordering::Relaxed)
+                && match ashpd::zbus::Connection::session().await {
+                    Ok(c) => crate::mutter::available(&c).await,
+                    Err(_) => false,
+                };
+            if use_mutter {
+                match mutter_session(input).await {
+                    Ok((cast, input_tx, keep)) => {
+                        let _ = tx.send(Ok((cast, input_tx)));
+                        let _keep = keep;
+                        std::future::pending::<()>().await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e.context("GNOME's screen-cast API (--portal uses the portal instead)")));
+                    }
+                }
+                return;
+            }
+            portal_thread(input, tx).await;
+        });
+    })?;
+    rx.recv().context("the capture thread ended")?
+}
+
+/// GNOME's own API: a remote-desktop session with the monitor's screen cast linked to it. No
+/// dialog; GNOME's sharing indicator shows while it runs.
+async fn mutter_session(input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, impl Send)> {
+    let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
+    let wanted = MONITOR.lock().unwrap().clone();
+    let connector = crate::mutter::monitor_connector(&conn, wanted.as_deref()).await?;
+    let mut session = crate::mutter::Session::new(conn).await?;
+    let cursor = if SHOW_CURSOR.load(Ordering::Relaxed) { 1 } else { 0 };
+    let stream = session.record(crate::mutter::Source::Monitor(&connector), cursor).await?;
+    println!("Capture: GNOME's own screen-cast API, monitor {connector}{}.", if input.is_some() { ", with remote control" } else { "" });
+    let cast = PortalCast { fd: None, node: stream.node, size: stream.size };
+    let session = Arc::new(session);
+    let input_tx = input.map(|command| {
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (w, h) = stream.size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
+        let sink = InputSink::Mutter { session: session.clone(), stream: stream.clone() };
+        tokio::spawn(run_input(sink, w, h, command, true, input_rx));
+        input_tx
+    });
+    Ok((cast, input_tx, session))
+}
+
+async fn portal_thread(input: Option<CommandKey>, tx: mpsc::Sender<Result<(PortalCast, Option<UnboundedSender<InputCmd>>)>>) {
+    {
+        {
             match input {
                 Some(command) => match remote_session(command).await {
                     Ok((cast, input_tx, keep)) => {
@@ -480,9 +543,8 @@ fn start_portal(input: Option<CommandKey>) -> Result<(PortalCast, Option<Unbound
                     }
                 },
             }
-        });
-    })?;
-    rx.recv().context("the portal thread ended")?
+        }
+    }
 }
 
 /// The pointer in the picture only with `--show-cursor`: like Sill for Mac, the app draws its own
@@ -557,7 +619,7 @@ async fn screencast_session() -> Result<(PortalCast, impl Send)> {
     let stream = streams.streams().first().ok_or_else(|| anyhow!("the portal returned no stream"))?;
     let (node, size) = (stream.pipe_wire_node_id(), stream.size());
     let fd = proxy.open_pipe_wire_remote(&session, Default::default()).await.context("OpenPipeWireRemote")?;
-    Ok((PortalCast { fd, node, size }, (proxy, session)))
+    Ok((PortalCast { fd: Some(fd), node, size }, (proxy, session)))
 }
 
 /// The screen and remote control in one RemoteDesktop session: one dialog, kept with its own
@@ -616,22 +678,28 @@ async fn remote_session(command: CommandKey) -> Result<(PortalCast, UnboundedSen
     let fd = sc.open_pipe_wire_remote(&session, Default::default()).await.context("OpenPipeWireRemote")?;
     let (w, h) = size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(run_input(rd, session, node, w, h, command, input_rx));
-    Ok((PortalCast { fd, node, size }, input_tx, sc))
+    tokio::spawn(run_input(InputSink::Portal { rd, session, node }, w, h, command, false, input_rx));
+    Ok((PortalCast { fd: Some(fd), node, size }, input_tx, sc))
 }
 
 /// Input events counted for the stats line.
 static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 
-/// Each device's events through its own `Translator`, executed in order on the portal.
+/// Where input goes: the portal's RemoteDesktop session, or GNOME's own.
+enum InputSink {
+    Portal { rd: RemoteDesktop, session: Session<RemoteDesktop>, node: u32 },
+    Mutter { session: Arc<crate::mutter::Session>, stream: crate::mutter::Stream },
+}
+
+/// Each device's events through its own `Translator`, executed in order. `everywhere`: absolute
+/// positions reach the whole stream (GNOME's own API has no box; the portal's does).
 async fn run_input(
-    rd: RemoteDesktop,
-    session: Session<RemoteDesktop>,
-    stream: u32,
+    sink: InputSink,
     width: f64,
     height: f64,
     command: CommandKey,
+    everywhere: bool,
     mut rx: UnboundedReceiver<InputCmd>,
 ) {
     let mut translators: HashMap<u64, Translator> = HashMap::new();
@@ -650,7 +718,7 @@ async fn run_input(
                     if log {
                         println!("{:>8} ms  device {id}: {event:?}", t0.elapsed().as_millis());
                     }
-                    let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command).keep_all_taps(keep_all_taps()));
+                    let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command).keep_all_taps(keep_all_taps()).absolute_everywhere(everywhere));
                     if let Some((w, h)) = captured_size() {
                         t.set_size(w, h);
                     }
@@ -672,25 +740,43 @@ async fn run_input(
             if log {
                 println!("{:>8} ms    → portal: {action:?}", t0.elapsed().as_millis());
             }
-            if let Err(e) = perform(&rd, &session, stream, &action).await {
+            if let Err(e) = perform(&sink, &action).await {
                 if !failed {
                     failed = true;
-                    eprintln!("Input: the portal refused {action:?}: {e} (further failures not shown)");
+                    eprintln!("Input: refused {action:?}: {e:#} (further failures not shown)");
                 }
             }
         }
     }
 }
 
-async fn perform(rd: &RemoteDesktop, session: &Session<RemoteDesktop>, stream: u32, action: &Action) -> ashpd::Result<()> {
-    let state = |pressed: bool| if pressed { KeyState::Pressed } else { KeyState::Released };
-    match *action {
-        Action::Motion { x, y } => rd.notify_pointer_motion_absolute(session, stream, x, y, Default::default()).await,
-        Action::RelMotion { dx, dy } => rd.notify_pointer_motion(session, dx, dy, Default::default()).await,
-        Action::Button { button, pressed } => rd.notify_pointer_button(session, button, state(pressed), Default::default()).await,
-        Action::Axis { dx, dy } => rd.notify_pointer_axis(session, dx, dy, NotifyPointerAxisOptions::default()).await,
-        Action::AxisStop => rd.notify_pointer_axis(session, 0.0, 0.0, NotifyPointerAxisOptions::default().set_finish(true)).await,
-        Action::Key { code, pressed } => rd.notify_keyboard_keycode(session, code, state(pressed), Default::default()).await,
-        Action::Keysym { sym, pressed } => rd.notify_keyboard_keysym(session, sym, state(pressed), Default::default()).await,
+async fn perform(sink: &InputSink, action: &Action) -> Result<()> {
+    match sink {
+        InputSink::Portal { rd, session, node } => {
+            let state = |pressed: bool| if pressed { KeyState::Pressed } else { KeyState::Released };
+            let stream = *node;
+            match *action {
+                Action::Motion { x, y } => rd.notify_pointer_motion_absolute(session, stream, x, y, Default::default()).await,
+                Action::RelMotion { dx, dy } => rd.notify_pointer_motion(session, dx, dy, Default::default()).await,
+                Action::Button { button, pressed } => rd.notify_pointer_button(session, button, state(pressed), Default::default()).await,
+                Action::Axis { dx, dy } => rd.notify_pointer_axis(session, dx, dy, NotifyPointerAxisOptions::default()).await,
+                Action::AxisStop => rd.notify_pointer_axis(session, 0.0, 0.0, NotifyPointerAxisOptions::default().set_finish(true)).await,
+                Action::Key { code, pressed } => rd.notify_keyboard_keycode(session, code, state(pressed), Default::default()).await,
+                Action::Keysym { sym, pressed } => rd.notify_keyboard_keysym(session, sym, state(pressed), Default::default()).await,
+            }
+            .map_err(Into::into)
+        }
+        InputSink::Mutter { session, stream } => {
+            use crate::mutter::{AXIS_FINISH, AXIS_SOURCE_FINGER};
+            match *action {
+                Action::Motion { x, y } => session.motion_absolute(stream, x, y).await,
+                Action::RelMotion { dx, dy } => session.motion_relative(dx, dy).await,
+                Action::Button { button, pressed } => session.button(button, pressed).await,
+                Action::Axis { dx, dy } => session.axis(dx, dy, AXIS_SOURCE_FINGER).await,
+                Action::AxisStop => session.axis(0.0, 0.0, AXIS_SOURCE_FINGER | AXIS_FINISH).await,
+                Action::Key { code, pressed } => session.keycode(code as u32, pressed).await,
+                Action::Keysym { sym, pressed } => session.keysym(sym as u32, pressed).await,
+            }
+        }
     }
 }
