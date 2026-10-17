@@ -138,6 +138,9 @@ struct Client {
     /// Kind 8 messages read from it (kind 26's `seen`), and the last kind 26 sent to it.
     inputs_read: u64,
     last_pointer: Option<Vec<u8>>,
+    /// Sent kind 32: this machine's copies go to it. With the times of its last second's asks.
+    clip_subscribed: bool,
+    clip_arrivals: Vec<f64>,
 }
 
 struct State {
@@ -175,6 +178,8 @@ pub struct Server {
     door: Door,
     /// The input side once the portal allows it; None: input is ignored (view only).
     input: Arc<Mutex<Option<mpsc::UnboundedSender<InputCmd>>>>,
+    /// Where a device's text goes to become this machine's clipboard; None: not shared.
+    clipboard: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 impl Server {
@@ -206,6 +211,7 @@ impl Server {
             launch_id: Arc::new(uuid::Uuid::new_v4().to_string()),
             door,
             input: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -386,6 +392,7 @@ impl Server {
             launch_id: Some((*self.launch_id).clone()),
             host_version: None,
             protocol: Some(protocol::PROTOCOL),
+            clipboard: self.clipboard.lock().unwrap().is_some().then_some(crate::clipboard::GENERATION),
         };
         protocol::message(kind::WINDOW_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
     }
@@ -423,6 +430,8 @@ impl Server {
                     fps: None,
                     inputs_read: 0,
                     last_pointer: None,
+                    clip_subscribed: false,
+                    clip_arrivals: Vec::new(),
                 },
             );
             if st.active != StreamSource::None {
@@ -484,6 +493,7 @@ impl Server {
                 }
                 kind::WINDOW_COMMAND => self.window_command(id, &payload),
                 kind::LAUNCH_APP => self.launch(id, &payload),
+                kind::CLIPBOARD => self.clipboard_from(id, &payload),
                 kind::CHANGE_SETTINGS => match serde_json::from_slice::<HostSettingsChange>(&payload) {
                     Ok(change) => self.change_settings(id, change),
                     Err(e) => eprintln!("Bad settings change from client {id}: {e}"),
@@ -758,6 +768,59 @@ impl Server {
             }
         }
         st.pointer.is_moving(now)
+    }
+
+    /// Shares the clipboard from now on: a device's text goes to `tx` to be written here.
+    pub fn set_clipboard(&self, tx: mpsc::UnboundedSender<String>) {
+        *self.clipboard.lock().unwrap() = Some(tx);
+    }
+
+    /// How many devices take this machine's copies.
+    pub fn clipboard_subscribers(&self) -> usize {
+        self.state.lock().unwrap().clients.values().filter(|c| c.clip_subscribed).count()
+    }
+
+    /// A copy made here, to every subscriber.
+    pub fn broadcast_clipboard(&self, text: &str) {
+        let Some(p) = crate::clipboard::payload(text) else { return };
+        let msg = protocol::message(kind::CLIPBOARD, protocol::now(), false, &p);
+        let st = self.state.lock().unwrap();
+        for c in st.clients.values().filter(|c| c.clip_subscribed) {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
+    /// A device's kind 32: subscribe, stop, or its text becomes this machine's clipboard (and goes to
+    /// the other subscribers). One line per subscription or stop, none per text, never contents.
+    fn clipboard_from(&self, id: u64, payload: &[u8]) {
+        use crate::clipboard::FromDevice;
+        let Some(writer) = self.clipboard.lock().unwrap().clone() else { return };
+        let mut st = self.state.lock().unwrap();
+        let Some(c) = st.clients.get_mut(&id) else { return };
+        let ask = crate::clipboard::host_receives(payload, &mut c.clip_arrivals, clock());
+        let label = c.label.clone();
+        match ask {
+            FromDevice::Subscribe | FromDevice::Set(_) if !c.clip_subscribed => {
+                c.clip_subscribed = true;
+                println!("Clipboard: {label} shares the clipboard.");
+            }
+            FromDevice::Stop if c.clip_subscribed => {
+                c.clip_subscribed = false;
+                println!("Clipboard: {label} stopped sharing the clipboard.");
+            }
+            FromDevice::Refuse(why) => println!("Clipboard: refused a message from {label} ({why})."),
+            _ => {}
+        }
+        if let FromDevice::Set(text) = ask {
+            if let Some(p) = crate::clipboard::payload(&text) {
+                let msg = protocol::message(kind::CLIPBOARD, protocol::now(), false, &p);
+                for (other, c) in st.clients.iter().filter(|(o, c)| **o != id && c.clip_subscribed) {
+                    let _ = other;
+                    let _ = c.tx.send(msg.clone());
+                }
+            }
+            let _ = writer.send(text);
+        }
     }
 
     /// Whether a source streams (the pointer is watched only then).

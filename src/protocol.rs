@@ -38,6 +38,7 @@ pub mod kind {
     pub const GOODBYE: u8 = 22;
     pub const HELLO: u8 = 23;
     pub const MAC_POINTER: u8 = 26;
+    pub const CLIPBOARD: u8 = 32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,6 +210,9 @@ pub struct WindowList {
     pub host_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<i64>,
+    /// What of the clipboard this host shares (1: text); None: nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<i64>,
 }
 
 /// `Viewport` (kind 9).
@@ -310,9 +314,12 @@ mod tests {
             launch_id: Some("L".into()),
             host_version: None,
             protocol: Some(1),
+            clipboard: None,
         };
         let v: serde_json::Value = serde_json::to_value(&l).unwrap();
         assert_eq!(v, serde_json::json!({"macName":"linux","windows":[],"active":{"desktop":{}},"launchID":"L","protocol":1}));
+        let v = serde_json::to_value(WindowList { clipboard: Some(1), ..l }).unwrap();
+        assert_eq!(v["clipboard"], 1);
         let w = WindowInfo { id: 3, title: "t".into(), app_name: "a".into(), bundle_id: "b".into(), width: 1, height: 2 };
         assert_eq!(
             serde_json::to_value(&w).unwrap(),

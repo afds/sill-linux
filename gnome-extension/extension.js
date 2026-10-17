@@ -11,6 +11,10 @@
 //                                 screen cast shows): left, top, right and bottom insets (the
 //                                 shadow), and the buffer's width and height, logical pixels;
 //                                 all 0 for no such window
+//   ClipboardTypes() -> as        the clipboard's MIME types (read without its contents)
+//   ClipboardText() -> s          its text ("" for none)
+//   SetClipboard(s text) -> b     the clipboard's text, from a device
+//   ClipboardChanged              the clipboard has new contents
 //   WindowsChanged                a window came, went, was retitled, resized, minimized or
 //                                 unminimized (coalesced, 250 ms)
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window, at most maxSize on its longer side,
@@ -79,6 +83,10 @@ const XML = `
     <method name="Close"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
     <method name="Minimize"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
     <method name="ToggleFullscreen"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="ClipboardTypes"><arg type="as" direction="out" name="types"/></method>
+    <method name="ClipboardText"><arg type="s" direction="out" name="text"/></method>
+    <method name="SetClipboard"><arg type="s" direction="in" name="text"/><arg type="b" direction="out" name="ok"/></method>
+    <signal name="ClipboardChanged"/>
     <signal name="WindowsChanged"/>
   </interface>
 </node>`;
@@ -229,6 +237,21 @@ class Service {
         return [x, y, f.x, f.y, f.width, f.height, true];
     }
 
+    ClipboardTypes() {
+        return St.Clipboard.get_default().get_mimetypes(St.ClipboardType.CLIPBOARD);
+    }
+
+    ClipboardTextAsync(_params, invocation) {
+        St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
+            invocation.return_value(new GLib.Variant('(s)', [text ?? '']));
+        });
+    }
+
+    SetClipboard(text) {
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+        return true;
+    }
+
     Activate(id) {
         const w = byId(id);
         if (!w)
@@ -306,6 +329,12 @@ class Service {
         this._name = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
         for (const w of global.display.list_all_windows())
             this._watch(w);
+        const selection = global.display.get_selection();
+        this._selection = selection;
+        this._selectionSignal = selection.connect('owner-changed', (_s, type) => {
+            if (type === Meta.SelectionType.SELECTION_CLIPBOARD)
+                this._dbus?.emit_signal('ClipboardChanged', null);
+        });
         this._signals.push(global.display.connect('window-created', (_d, w) => {
             this._watch(w);
             this.changed();
@@ -315,6 +344,10 @@ class Service {
     disable() {
         for (const id of this._signals)
             global.display.disconnect(id);
+        if (this._selectionSignal) {
+            this._selection.disconnect(this._selectionSignal);
+            this._selectionSignal = 0;
+        }
         this._signals = [];
         for (const w of [...this._windowSignals.keys()])
             this._unwatch(w);

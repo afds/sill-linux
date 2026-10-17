@@ -183,6 +183,26 @@ impl Client {
         Some(((x as f64, y as f64), on.then_some((fx as f64, fy as f64, fw as f64, fh as f64))))
     }
 
+    pub async fn clipboard_types(&self) -> Option<Vec<String>> {
+        self.proxy.call_method("ClipboardTypes", &()).await.ok()?.body().deserialize().ok()
+    }
+
+    pub async fn clipboard_text(&self) -> Option<String> {
+        self.proxy.call_method("ClipboardText", &()).await.ok()?.body().deserialize().ok()
+    }
+
+    pub async fn set_clipboard(&self, text: &str) -> bool {
+        match self.proxy.call_method("SetClipboard", &(text,)).await {
+            Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Fires on every `ClipboardChanged`.
+    pub async fn clipboard_changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
+        Ok(self.proxy.receive_signal("ClipboardChanged").await?)
+    }
+
     pub async fn command(&self, method: &str, id: u64) -> bool {
         match self.proxy.call_method(method, &(id,)).await {
             Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),

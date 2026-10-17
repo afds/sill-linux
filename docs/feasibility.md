@@ -528,3 +528,30 @@ Verified in the nested shell: with a second test client moving the pointer to 0.
 0, the first got exactly those fractions on the Desktop and over a window (`inside:false` while the
 pointer was off the window). The driving client got none. The host-mouse rule has unit tests only:
 the nested shell has no mouse of its own.
+
+## The clipboard both ways (2026-10-17)
+
+Kind 32 as Sill's main has it since PR #78 (`Clipboard {text, image, stop}`; `WindowList.clipboard`
+1 for text). The App Store build 0.5.1 predates it and sends no kind 32, so this waits for the next
+Sill release to be tried on a device. `clipboard.rs` ports Sill's `ClipboardPolicy`:
+- any kind 32 subscribes and `{"stop":true}` ends it;
+- text (at most 256 KB, the JSON at most 1 MiB) becomes this machine's clipboard and goes to every
+  other subscriber;
+- a subscription or text is taken at most 4 times a second per connection, a stop always;
+- a copy whose MIME types carry a password manager's marker (KDE's `x-kde-passwordManagerHint`,
+  which KeePassXC sets, and the nspasteboard.org markers) is never sent, and its text is never read;
+- this host's own write of a device's text is not sent back out;
+- only copies made while a device shares the clipboard are sent.
+
+Through the extension: `ClipboardChanged` (Meta.Selection's `owner-changed` for the clipboard),
+`ClipboardTypes`, `ClipboardText` and `SetClipboard` (St.Clipboard). GNOME on Wayland gives an
+ordinary process no clipboard of its own. It is on by default, as in Sill.app; `--no-clipboard`
+turns it off. One line per subscription or stop, never contents.
+
+Verified in the nested shell (its own clipboard, never this machine's) with Sill's
+`Scripts/sillclient.py --clipboard [--copy=TEXT@T]`, two clients:
+- B's text reached A once and never came back to B;
+- a copy made in that session reached both;
+- the window lists said `clipboard=1`.
+
+The marker rule has unit tests only (St.Clipboard writes one type).

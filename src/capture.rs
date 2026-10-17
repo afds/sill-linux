@@ -723,6 +723,9 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
                 let desktop = stream.size.map(|(w, h)| (origin.0 as f64, origin.1 as f64, w as f64, h as f64));
                 tokio::spawn(watch_pointer(server.clone(), s.clone(), desktop));
             }
+            if SHARE_CLIPBOARD.load(Ordering::Relaxed) {
+                tokio::spawn(watch_clipboard(server.clone(), s.clone()));
+            }
             tokio::spawn(watch_windows(server, s.clone()));
         }
         None => println!(
@@ -848,6 +851,59 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 match &shell {
                     Some(s) if s.command(method, id).await => {}
                     _ => println!("Window command {action} did not reach the window."),
+                }
+            }
+        }
+    }
+}
+
+static SHARE_CLIPBOARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `--no-clipboard`: nothing of the clipboard is shared with devices.
+pub fn set_share_clipboard(on: bool) {
+    SHARE_CLIPBOARD.store(on, Ordering::Relaxed);
+}
+
+/// The clipboard both ways, through the extension: each new copy here goes to the devices that
+/// share it (not one a password manager marks, whose text is never read, and not this host's own
+/// write of a device's text); a device's text becomes the clipboard here. Only copies made while a
+/// device shares it are sent, so what was on the clipboard before is not.
+async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
+    use futures_util::StreamExt;
+    if shell.clipboard_types().await.is_none() {
+        println!("Clipboard: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
+        return;
+    }
+    let Ok(mut changes) = shell.clipboard_changes().await else { return };
+    let (tx, mut writes) = tokio::sync::mpsc::unbounded_channel::<String>();
+    server.set_clipboard(tx);
+    println!("Clipboard: shared with devices that ask (--no-clipboard: never).");
+    // The text this host just wrote: the change it makes is not sent back out.
+    let mut own: Option<String> = None;
+    loop {
+        tokio::select! {
+            change = changes.next() => {
+                if change.is_none() {
+                    return;
+                }
+                if server.clipboard_subscribers() == 0 {
+                    own = None;
+                    continue;
+                }
+                let Some(types) = shell.clipboard_types().await else { continue };
+                if types.is_empty() || crate::clipboard::marked(&types) {
+                    continue;
+                }
+                let Some(text) = shell.clipboard_text().await else { continue };
+                if own.take().is_some_and(|o| o == text) {
+                    continue;
+                }
+                server.broadcast_clipboard(&text);
+            }
+            write = writes.recv() => {
+                let Some(text) = write else { return };
+                if shell.set_clipboard(&text).await {
+                    own = Some(text);
                 }
             }
         }
