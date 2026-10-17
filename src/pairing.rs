@@ -32,7 +32,7 @@ pub fn b64url(data: &[u8]) -> String {
 /// Plain base64 with padding (RFC 4648 §4), as Foundation's `base64EncodedString`.
 pub fn b64(data: &[u8]) -> String {
     let mut out: String = b64url(data).chars().map(|c| match c { '-' => '+', '_' => '/', c => c }).collect();
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push('=');
     }
     out
