@@ -119,7 +119,7 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             announced = Some(dmabuf);
         }
         // Standard is the monitor's logical size; a window streams at its own size.
-        let logical = if source == Source::Desktop { cast.size } else { None };
+        let logical = if source == Source::Desktop || is_display(source) { cast.size } else { None };
         let shape = TailShape { gl, dmabuf, formats, encoder: encoder_desc.clone(), logical, crop: None };
         let switch_to = match run_pipeline(server, &control, &cast, &shape, &mut apply, &mut streaming, source, recorder.as_ref())? {
             Outcome::Ended => break,
@@ -241,7 +241,7 @@ fn run_pipeline(
 ) -> Result<Outcome> {
     let mut shape = shape.clone();
     let shape = &mut shape;
-    let window = source != Source::Desktop;
+    let window = source != Source::Desktop && !is_display(source);
     CROP.store(0, Ordering::Relaxed);
     CAPTURED_SIZE.store(0, Ordering::Relaxed);
     *INPUT_REGION.lock().unwrap() = None;
@@ -821,7 +821,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
                 tokio::spawn(watch_clipboard(server.clone(), s.clone()));
             }
             tokio::spawn(watch_cursor(server.clone(), s.clone()));
-            tokio::spawn(watch_windows(server, s.clone()));
+            tokio::spawn(watch_windows(server, s.clone(), conn.clone(), connector.clone(), running >= 4));
         }
         None => println!(
             "Windows: the sill-linux GNOME Shell extension is not running, so only the Desktop streams \
@@ -832,8 +832,34 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     Ok((cast, input_tx, rec_tx, shown))
 }
 
+/// A monitor other than the Desktop's goes to the devices as a "window" with an id that has this
+/// bit (Mutter's window ids are 32-bit), and a hash of its connector: picked, it streams that
+/// whole monitor.
+const DISPLAY_ID: u64 = 1 << 63;
+
+/// The monitors offered as windows, with their ids.
+static DISPLAYS: std::sync::Mutex<Vec<(u64, crate::mutter::Monitor)>> = std::sync::Mutex::new(Vec::new());
+
+fn display_id(connector: &str) -> u64 {
+    // FNV-1a: the same id for the same connector across restarts.
+    let hash = connector.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    DISPLAY_ID | (hash & 0xffff_ffff)
+}
+
+/// The monitor a display id names.
+fn display(id: u64) -> Option<crate::mutter::Monitor> {
+    if id & DISPLAY_ID == 0 {
+        return None;
+    }
+    DISPLAYS.lock().unwrap().iter().find(|(i, _)| *i == id).map(|(_, m)| m.clone())
+}
+
+fn is_display(source: Source) -> bool {
+    matches!(source, Source::Window(id) if id & DISPLAY_ID != 0)
+}
+
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 3;
+const EXTENSION_VERSION: u32 = 4;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -943,6 +969,8 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 };
                 println!("Gesture {name}: {}.", did.as_deref().unwrap_or("nothing to do"));
             }
+            // A display has no frame to size, nor lights.
+            RecReq::Fit(id, ..) | RecReq::Command(id, _) if id & DISPLAY_ID != 0 => {}
             RecReq::Fit(id, w, h) => {
                 let Some(s) = &shell else { continue };
                 // Never a window in full screen; a maximized one is unmaximized first (and maximized
@@ -1008,16 +1036,21 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     Source::Desktop => None,
                 };
                 restore(&shell, &mut fitted, keep).await;
-                if let (Source::Window(id), Some(s)) = (source, &shell) {
+                let monitor = match source {
+                    Source::Window(id) => display(id),
+                    Source::Desktop => None,
+                };
+                if let (Source::Window(id), Some(s), None) = (source, &shell, &monitor) {
                     // Raised and focused, as Sill for Mac raises a picked window: keys go to it.
                     s.command("Activate", id).await;
                     *FRAME_INSETS.lock().unwrap() = s.geometry(id).await.map(|i| (id, i));
                 }
                 let recorded = async {
                     let session = crate::mutter::Session::new(conn.clone()).await?;
-                    let stream = match source {
-                        Source::Desktop => session.record(crate::mutter::Source::Monitor(&connector), cursor).await,
-                        Source::Window(id) => session.record(crate::mutter::Source::Window(id), cursor).await,
+                    let stream = match (source, &monitor) {
+                        (_, Some(m)) => session.record(crate::mutter::Source::Monitor(&m.connector), cursor).await,
+                        (Source::Desktop, None) => session.record(crate::mutter::Source::Monitor(&connector), cursor).await,
+                        (Source::Window(id), None) => session.record(crate::mutter::Source::Window(id), cursor).await,
                     };
                     match stream {
                         Ok(s) => Ok((session, s)),
@@ -1189,8 +1222,13 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
             continue;
         }
         let window = server.active_window();
-        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else { continue };
-        let rect = if window.is_some() { frame } else { desktop };
+        let monitor = window.and_then(display);
+        let Some((p, frame)) = shell.pointer_over(if monitor.is_some() { 0 } else { window.unwrap_or(0) }).await else { continue };
+        let rect = match (monitor, window) {
+            (Some(m), _) => Some((m.rect.0 as f64, m.rect.1 as f64, m.rect.2 as f64, m.rect.3 as f64)),
+            (None, Some(_)) => frame,
+            (None, None) => desktop,
+        };
         moving = server.pointer_sample(p, rect);
     }
 }
@@ -1198,7 +1236,9 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
 /// The window list into the server, again on every change, and thumbnails while devices watch:
 /// as Sill for Mac, each at most 208×132, every 2 s for a window that changed or streams, else
 /// every 6 s, and all again when a device joins.
-async fn watch_windows(server: Server, shell: crate::shell::Client) {
+/// Monitors other than the Desktop's are listed too (`DISPLAY_ID`), first, with thumbnails of the
+/// whole monitor when the extension takes them (`monitor_thumbs`, version 4).
+async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd::zbus::Connection, desktop: String, monitor_thumbs: bool) {
     use futures_util::StreamExt;
     const BOX: u32 = 208;
     let mut changes = match shell.changes().await {
@@ -1214,6 +1254,8 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut failed = false;
     let mut apps_sent = false;
+    let mut displays: Vec<(u64, crate::mutter::Monitor)> = Vec::new();
+    let mut display_stamps: HashMap<u64, Instant> = HashMap::new();
     loop {
         let changed = tokio::select! {
             c = async { match changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => c.is_some(),
@@ -1224,18 +1266,6 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
                 Ok(l) => {
                     failed = false;
                     list = l;
-                    server.set_windows(
-                        list.iter()
-                            .map(|w| HostWindow {
-                                mutter_id: w.id,
-                                title: w.title.clone(),
-                                app_name: w.app_name.clone(),
-                                app_id: w.app_id.clone(),
-                                width: w.width as i64,
-                                height: w.height as i64,
-                            })
-                            .collect(),
-                    );
                 }
                 Err(e) if !failed => {
                     failed = true;
@@ -1248,6 +1278,39 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
                     *FRAME_INSETS.lock().unwrap() = Some((id, i));
                 }
         }
+        // The monitors, looked at on every change and every 2 s (one could be plugged in).
+        let now_displays: Vec<(u64, crate::mutter::Monitor)> = crate::mutter::monitors(&conn)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.connector != desktop)
+            .map(|m| (display_id(&m.connector), m))
+            .collect();
+        if now_displays != displays {
+            for (_, m) in now_displays.iter().filter(|d| !displays.contains(d)) {
+                println!("Displays: {} ({}, {}×{}) is offered with the windows.", m.name, m.connector, m.rect.2, m.rect.3);
+            }
+            displays = now_displays;
+            *DISPLAYS.lock().unwrap() = displays.clone();
+        }
+        // The server sends the list only when it changed.
+        let hosts = displays.iter().map(|(id, m)| HostWindow {
+            mutter_id: *id,
+            title: format!("{} ({})", m.name, m.connector),
+            app_name: "Display".into(),
+            app_id: "sill-linux.display".into(),
+            width: m.rect.2 as i64,
+            height: m.rect.3 as i64,
+        });
+        let windows = list.iter().map(|w| HostWindow {
+            mutter_id: w.id,
+            title: w.title.clone(),
+            app_name: w.app_name.clone(),
+            app_id: w.app_id.clone(),
+            width: w.width as i64,
+            height: w.height as i64,
+        });
+        server.set_windows(hosts.chain(windows).collect());
         let pending = PENDING_LAUNCH.lock().unwrap().clone();
         if let Some((app, at)) = pending {
             if at.elapsed() > LAUNCH_WAIT {
@@ -1286,11 +1349,13 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
         let clients = server.client_count();
         if clients == 0 {
             stamps.clear();
+            display_stamps.clear();
             last_clients = 0;
             continue;
         }
         if clients > last_clients {
             stamps.clear();
+            display_stamps.clear();
         }
         last_clients = clients;
         stamps.retain(|id, _| list.iter().any(|w| w.id == *id));
@@ -1307,6 +1372,18 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
             stamps.insert(w.id, (w.clone(), now));
             if let Some(png) = shell.thumbnail(w.id, BOX).await {
                 server.broadcast_thumbnail(w.id, &png);
+            }
+        }
+        if monitor_thumbs {
+            for (id, m) in &displays {
+                let due = display_stamps.get(id).is_none_or(|at| active == Some(*id) || now.duration_since(*at) >= Duration::from_secs(6));
+                if !due {
+                    continue;
+                }
+                display_stamps.insert(*id, now);
+                if let Some(png) = shell.monitor_thumbnail(&m.connector, BOX).await {
+                    server.broadcast_thumbnail(*id, &png);
+                }
             }
         }
     }

@@ -700,3 +700,22 @@ clicks the Cancel button. Steps: an ask shows the window; pairing with the code 
 key's ask shows it; Cancel closes it, the host logs the cancel, and that key's next ask gets
 `openOnMac`. The screenshot shows the window as intended. Not checked: the app's camera on the QR
 code.
+
+## More than one monitor (2026-10-17)
+
+The app has one Desktop button, so the other monitors go in the window list: each is a "window"
+whose id has the high bit set (Mutter's window ids are 32-bit) and a hash of its connector, app
+name "Display", title "‹name› (‹connector›)", its logical size, and a thumbnail of the whole
+monitor (extension version 4: `MonitorThumbnail`, a screenshot of its area, scaled). The list
+comes from `DisplayConfig.GetCurrentState` (logical sizes: the current mode over the scale in the
+logical layout mode, swapped for a quarter turn), looked at with every window change and every
+2 s, so a monitor plugged in shows within 2 s and one unplugged while streaming ends that stream as
+a closed window does. Picking one records that monitor (`RecordMonitor`) in a fresh session, as a
+window switch does; Standard is its logical size; input is absolute in its stream; the pointer
+(kind 26) is measured against its rectangle. Aa and the window lights do nothing on a display.
+
+Checked in the nested shell with two virtual monitors (1280×800, 1024×768): one display entry
+listed, its stream 1024×768 while the Desktop stays 1280×800, four 208×156 thumbnails of it, and a
+tap at the middle of its picture put the pointer at (1792, 384), the second monitor's middle.
+Not checked: the pointer shown on the device over a display, a monitor plugged in or out while
+streaming, mixed scales.

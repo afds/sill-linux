@@ -154,6 +154,18 @@ impl Client {
         png
     }
 
+    /// A PNG of a whole monitor, at most `max` on its longer side (extension version 4).
+    pub async fn monitor_thumbnail(&self, connector: &str, max: u32) -> Option<Vec<u8>> {
+        let reply = self.proxy.call_method("MonitorThumbnail", &(connector, max)).await.ok()?;
+        let path: String = reply.body().deserialize().ok()?;
+        if path.is_empty() {
+            return None;
+        }
+        let png = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        png
+    }
+
     /// Where the frame sits in the window's buffer: left, top, right, bottom insets and the
     /// buffer's width and height, logical pixels (None: no such window, or an older extension).
     pub async fn geometry(&self, id: u64) -> Option<Insets> {

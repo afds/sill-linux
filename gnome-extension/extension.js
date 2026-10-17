@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (3)
+//   Version() -> u                this interface's version (4)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -20,6 +20,8 @@
 //   MoveResize(t id, i x, i y, i w, i h) -> b, SetMaximized(t id, b on) -> b
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window's frame, at most maxSize on its longer
 //                                 side, in $XDG_RUNTIME_DIR/sill-linux/ (0700); "" when it has none
+//   MonitorThumbnail(s connector, u maxSize) -> s   a PNG of a whole monitor (its windows as
+//                                 shown, no pointer), at most maxSize on its longer side, there too
 //   Activate(t id) -> b           unminimize, raise and focus
 //   Close(t id) -> b, Minimize(t id) -> b, ToggleFullscreen(t id) -> b
 //   ListApps() -> a(ss)           installed apps shown in the app grid: .desktop id, name
@@ -115,6 +117,7 @@ const XML = `
     <method name="SwitchWorkspace"><arg type="i" direction="in" name="delta"/><arg type="i" direction="out" name="index"/></method>
     <method name="MinimizeWorkspace"><arg type="at" direction="out" name="ids"/></method>
     <method name="Unminimize"><arg type="at" direction="in" name="ids"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="MonitorThumbnail"><arg type="s" direction="in" name="connector"/><arg type="u" direction="in" name="maxSize"/><arg type="s" direction="out" name="path"/></method>
     <method name="ShowPairing"><arg type="s" direction="in" name="title"/><arg type="s" direction="in" name="code"/><arg type="s" direction="in" name="modules"/><arg type="u" direction="in" name="width"/><arg type="u" direction="in" name="seconds"/><arg type="b" direction="out" name="ok"/></method>
     <method name="ClosePairing"/>
     <signal name="PairingCancelled"/>
@@ -124,7 +127,7 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 3;
+const VERSION = 4;
 
 function listed(w) {
     return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
@@ -232,6 +235,36 @@ class Service {
             logError(e, 'sill-linux: thumbnail');
             return '';
         }
+    }
+
+    MonitorThumbnailAsync([connector, maxSize], invocation) {
+        const reply = path => invocation.return_value(new GLib.Variant('(s)', [path]));
+        const index = global.backend.get_monitor_manager().get_monitor_for_connector(connector);
+        const m = index >= 0 ? Main.layoutManager.monitors[index] : null;
+        if (!m)
+            return reply('');
+        const full = GLib.build_filenamev([this._dir, `monitor-${index}-full.png`]);
+        const path = GLib.build_filenamev([this._dir, `monitor-${index}.png`]);
+        let stream;
+        try {
+            stream = Gio.File.new_for_path(full).replace(null, false, Gio.FileCreateFlags.PRIVATE, null);
+        } catch (e) {
+            return reply('');
+        }
+        new Shell.Screenshot().screenshot_area(m.x, m.y, m.width, m.height, stream, (shot, res) => {
+            let out = '';
+            try {
+                shot.screenshot_area_finish(res);
+                stream.close(null);
+                const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(full, maxSize, maxSize, true);
+                pixbuf.savev(path, 'png', [], []);
+                out = path;
+            } catch (e) {
+                logError(e, 'sill-linux: monitor thumbnail');
+            }
+            GLib.unlink(full);
+            reply(out);
+        });
     }
 
     ListApps() {

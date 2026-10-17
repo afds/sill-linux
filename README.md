@@ -20,6 +20,9 @@ protocol (pinned in [SILL_REFERENCE.md](SILL_REFERENCE.md)), so the app needs no
   - close, minimize and full screen from a held thumbnail;
   - All Apps, with icons, to start an app;
   - Aa sizes the window to the device's panel, and it goes back when it stops streaming.
+- **More than one monitor:** each monitor but the main one is an entry with the windows ("Display —
+  ‹its name›", with a thumbnail); a tap streams that monitor, and input goes there. Desktop is the
+  main monitor (`--monitor` picks another).
 - **This machine's pointer** shown on the device while the local mouse moves it, in its current
   shape.
 - **Three-finger gestures** on the app's trackpad work as GNOME's own: swipe up for Activities and

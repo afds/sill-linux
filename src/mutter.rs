@@ -74,6 +74,49 @@ pub async fn monitor_origin(conn: &zbus::Connection, connector: &str) -> Result<
     logical.iter().find(|l| l.5.iter().any(|m| m.0 == connector)).map(|l| (l.0, l.1)).ok_or_else(|| anyhow!("no monitor {connector}"))
 }
 
+/// A monitor in the logical layout: its connector, the name GNOME's Displays settings show, and
+/// where it sits (x, y, width, height, logical pixels).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Monitor {
+    pub connector: String,
+    pub name: String,
+    pub rect: (i32, i32, i32, i32),
+}
+
+/// Every monitor in use, in the layout's order.
+pub async fn monitors(conn: &zbus::Connection) -> Result<Vec<Monitor>> {
+    type Mode = (String, i32, i32, f64, f64, Vec<f64>, HashMap<String, OwnedValue>);
+    type MonitorInfo = ((String, String, String, String), Vec<Mode>, HashMap<String, OwnedValue>);
+    type Logical = (i32, i32, f64, u32, bool, Vec<(String, String, String, String)>, HashMap<String, OwnedValue>);
+    let reply = conn
+        .call_method(Some("org.gnome.Mutter.DisplayConfig"), "/org/gnome/Mutter/DisplayConfig", Some("org.gnome.Mutter.DisplayConfig"), "GetCurrentState", &())
+        .await
+        .context("DisplayConfig.GetCurrentState")?;
+    let (_serial, monitors, logical, props): (u32, Vec<MonitorInfo>, Vec<Logical>, HashMap<String, OwnedValue>) =
+        reply.body().deserialize().context("reading the monitor layout")?;
+    // 1: logical (sizes are the mode over the scale), 2: physical.
+    let layout_logical = props.get("layout-mode").and_then(|v| u32::try_from(v.clone()).ok()).unwrap_or(1) == 1;
+    let mut out = Vec::new();
+    for l in &logical {
+        for spec in &l.5 {
+            let Some(m) = monitors.iter().find(|m| m.0 .0 == spec.0) else { continue };
+            let current = m.1.iter().find(|mode| mode.6.get("is-current").and_then(|v| bool::try_from(v.clone()).ok()).unwrap_or(false));
+            let Some(mode) = current else { continue };
+            let (mut w, mut h) = (mode.1 as f64, mode.2 as f64);
+            if layout_logical && l.2 > 0.0 {
+                (w, h) = (w / l.2, h / l.2);
+            }
+            // Turned a quarter: transforms 1, 3, 5 and 7.
+            if l.3 % 2 == 1 {
+                (w, h) = (h, w);
+            }
+            let name = m.2.get("display-name").and_then(|v| String::try_from(v.clone()).ok()).unwrap_or_else(|| spec.0.clone());
+            out.push(Monitor { connector: spec.0.clone(), name, rect: (l.0, l.1, w.round() as i32, h.round() as i32) });
+        }
+    }
+    Ok(out)
+}
+
 /// One linked remote-desktop and screen-cast session.
 pub struct Session {
     pub conn: zbus::Connection,
