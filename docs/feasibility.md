@@ -814,3 +814,19 @@ difference to quality at these bitrates.
 
 Found too: x265enc takes at most 102,400 kbit/s, and Extreme (150 Mbit/s) panicked the host on a
 machine with neither NVENC nor VA-API. The bitrate is now at most what the encoder takes.
+
+## A video on the host logged the user out (2026-10-17)
+
+With a device connected, opening a video on this machine crashed GNOME Shell (signal 11, so the
+session ended): `meta_multi_texture_get_n_planes: assertion 'META_IS_MULTI_TEXTURE
+(multi_texture)' failed`, then a segfault in the extension's `Thumbnail()`, at `actor.get_image()`.
+Mutter 50's `get_image` dereferences a surface's texture without looking, and a surface can have
+none: a window still being made, or the single-pixel buffer a video player or a browser puts
+behind its video (the probe saw `MetaShapedTexture` contents whose `get_texture()` was null). The
+streamed window's thumbnail is taken on every list pass, so it came soon.
+
+The extension (version 6) now takes a window's thumbnail only when every one of its surfaces has a
+texture (`allTextured`); otherwise it answers none, and the device keeps the last. Reproduced in
+the nested shell with mpv (`--vo=dmabuf-wayland`) and a thumbnail asked every 50 ms: version 5
+crashed the shell in the first round every time, version 6 ran six rounds; an ordinary window's
+thumbnail as before.

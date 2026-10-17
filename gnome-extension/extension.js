@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (5)
+//   Version() -> u                this interface's version (6)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -127,7 +127,17 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 5;
+const VERSION = 6;
+
+// Whether every surface of a window actor has a texture. Mutter 50's get_image crashes GNOME Shell
+// on a surface without one (a window still being made, or the single-pixel buffer a video player
+// or a browser puts behind its video), so such a window gets no new thumbnail.
+function allTextured(actor) {
+    const content = actor.get_content();
+    if (content instanceof Meta.ShapedTexture && !content.get_texture())
+        return false;
+    return actor.get_children().every(allTextured);
+}
 
 function listed(w) {
     return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
@@ -210,7 +220,7 @@ class Service {
     Thumbnail(id, maxSize) {
         const w = byId(id);
         const actor = w?.get_compositor_private();
-        if (!actor)
+        if (!actor || !allTextured(actor))
             return '';
         try {
             // The frame alone, without the shadow around it.

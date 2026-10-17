@@ -944,7 +944,7 @@ fn is_display(source: Source) -> bool {
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 5;
+const EXTENSION_VERSION: u32 = 6;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
