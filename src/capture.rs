@@ -557,14 +557,19 @@ async fn run_input(
     let mut translators: HashMap<u64, Translator> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut failed = false;
-    // TEST: SILL_LINUX_INPUT_LOG=1 prints every action sent to the portal.
+    // TEST: SILL_LINUX_INPUT_LOG=1 prints every event from a device and every action sent to the
+    // portal, with milliseconds since the first.
     let log = std::env::var_os("SILL_LINUX_INPUT_LOG").is_some();
+    let t0 = Instant::now();
     loop {
         let actions: Vec<Action> = tokio::select! {
             cmd = rx.recv() => match cmd {
                 None => break,
                 Some(InputCmd::Event(id, event)) => {
                     INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+                    if log {
+                        println!("{:>8} ms  device {id}: {event:?}", t0.elapsed().as_millis());
+                    }
                     let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command));
                     if let Some((w, h)) = captured_size() {
                         t.set_size(w, h);
@@ -580,7 +585,7 @@ async fn run_input(
         };
         for action in actions {
             if log {
-                println!("Test input: {action:?}");
+                println!("{:>8} ms    → portal: {action:?}", t0.elapsed().as_millis());
             }
             if let Err(e) = perform(&rd, &session, stream, &action).await {
                 if !failed {
