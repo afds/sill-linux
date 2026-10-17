@@ -70,7 +70,7 @@ stays on (NVENC's lowest-latency preset); there is no virtual display on Linux.
 
 This machine's pointer is left out of the picture, as Sill for Mac does: the app draws its own
 where it needs one (the trackpad held upright, Pencil hover). While this machine's mouse moves the pointer, the app
-shows it where it is (on GNOME, with the extension). `--show-cursor` draws it into the
+shows it where it is, in its current shape (on GNOME, with the extension). `--show-cursor` draws it into the
 picture instead (then moves of the local mouse show too, at the cost of a frame per move).
 
 The app's trackpad can count a slow, small pointer nudge followed by a lift as a tap; such a tap

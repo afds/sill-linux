@@ -208,6 +208,24 @@ impl Client {
         self.proxy.call_method("Gesture", &(name,)).await.ok()?.body().deserialize().ok()
     }
 
+    /// The pointer's image: hotspot and size in logical pixels, and its PNG (Some(None): no image
+    /// now; None: the extension has no such call, an older one).
+    pub async fn cursor_shape(&self) -> Option<Option<((f64, f64, f64, f64), Vec<u8>)>> {
+        let reply = self.proxy.call_method("CursorShape", &()).await.ok()?;
+        let ((hx, hy, w, h, path),): ((f64, f64, f64, f64, String),) = reply.body().deserialize().ok()?;
+        if path.is_empty() {
+            return Some(None);
+        }
+        let png = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        Some(png.map(|p| ((hx, hy, w, h), p)))
+    }
+
+    /// Fires on every `CursorChanged`.
+    pub async fn cursor_changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
+        Ok(self.proxy.receive_signal("CursorChanged").await?)
+    }
+
     pub async fn command(&self, method: &str, id: u64) -> bool {
         match self.proxy.call_method(method, &(id,)).await {
             Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),

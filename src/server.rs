@@ -166,6 +166,8 @@ struct State {
     /// Installed apps (.desktop id, name) and their icons, sent to every device as it connects.
     apps: Vec<(String, String)>,
     icons: Vec<(String, Vec<u8>)>,
+    /// The pointer's current image (kind 14's payload), for devices as they connect.
+    cursor: Option<Vec<u8>>,
     /// Who moves this machine's pointer (kind 26).
     pointer: crate::pointer::PointerControl,
     /// The last viewport any device sent (one stream: the last to report wins, as Sill for Mac).
@@ -210,6 +212,7 @@ impl Server {
                 icons: Vec::new(),
                 viewport: None,
                 pointer: Default::default(),
+                cursor: None,
             })),
             control,
             host_name: Arc::new(host_name),
@@ -424,6 +427,9 @@ impl Server {
                 let _ = tx.send(icon_message(app, png));
             }
             let _ = tx.send(apps_message(&st.apps));
+            if let Some(c) = &st.cursor {
+                let _ = tx.send(protocol::message(kind::CURSOR_SHAPE, protocol::now(), false, c));
+            }
             st.clients.insert(
                 id,
                 Client {
@@ -864,6 +870,25 @@ impl Server {
         drop(st);
         println!("Gesture from {label}: {}", g.gesture);
         let _ = self.control.send(Control::Gesture(g.gesture));
+    }
+
+    /// The pointer's image changed: hotspot and size in points, and a PNG. Sent to every device
+    /// when it differs from the last.
+    pub fn set_cursor_shape(&self, (hx, hy, w, h): (f64, f64, f64, f64), png: &[u8]) {
+        let mut p = Vec::with_capacity(16 + png.len());
+        for v in [hx, hy, w, h] {
+            p.extend_from_slice(&(v as f32).to_be_bytes());
+        }
+        p.extend_from_slice(png);
+        let mut st = self.state.lock().unwrap();
+        if st.cursor.as_ref() == Some(&p) {
+            return;
+        }
+        let msg = protocol::message(kind::CURSOR_SHAPE, protocol::now(), false, &p);
+        st.cursor = Some(p);
+        for c in st.clients.values() {
+            let _ = c.tx.send(msg.clone());
+        }
     }
 
     /// Whether a source streams (the pointer is watched only then).

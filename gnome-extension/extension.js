@@ -15,6 +15,9 @@
 //   ClipboardText() -> s          its text ("" for none)
 //   SetClipboard(s text) -> b     the clipboard's text, from a device
 //   ClipboardChanged              the clipboard has new contents
+//   CursorShape() -> (dddds)      the pointer's current image: hotspot x, y and size w, h in
+//                                 logical pixels, and a PNG of it (path; "" when there is none)
+//   CursorChanged                 the pointer's image changed
 //   Gesture(s name) -> s          a trackpad gesture from a device, as GNOME's own: swipeUp
 //                                 Activities then the app grid, swipeDown back, swipeLeft and
 //                                 swipeRight the next and previous workspace, pinch the app grid,
@@ -93,6 +96,8 @@ const XML = `
     <method name="ClipboardText"><arg type="s" direction="out" name="text"/></method>
     <method name="SetClipboard"><arg type="s" direction="in" name="text"/><arg type="b" direction="out" name="ok"/></method>
     <method name="Gesture"><arg type="s" direction="in" name="name"/><arg type="s" direction="out" name="did"/></method>
+    <method name="CursorShape"><arg type="(dddds)" direction="out" name="shape"/></method>
+    <signal name="CursorChanged"/>
     <signal name="ClipboardChanged"/>
     <signal name="WindowsChanged"/>
   </interface>
@@ -315,6 +320,35 @@ class Service {
         return '';
     }
 
+    CursorShapeAsync(_params, invocation) {
+        const none = () => invocation.return_value(new GLib.Variant('((dddds))', [[0, 0, 0, 0, '']]));
+        try {
+            const tracker = global.backend.get_cursor_tracker();
+            const sprite = tracker.get_sprite();
+            if (!sprite)
+                return none();
+            const w = sprite.get_width(), h = sprite.get_height();
+            const [hx, hy] = tracker.get_hot();
+            const scale = tracker.get_scale?.() || 1;
+            const path = GLib.build_filenamev([this._dir, 'cursor.png']);
+            const stream = Gio.File.new_for_path(path).replace(null, false, Gio.FileCreateFlags.NONE, null);
+            // The sprite's pixels as GNOME's screenshots write them (Cogl's get_data gives JS nothing).
+            Shell.Screenshot.composite_to_stream(sprite, 0, 0, w, h, 1, null, 0, 0, 1, stream, (_o, res) => {
+                try {
+                    Shell.Screenshot.composite_to_stream_finish(res);
+                    stream.close(null);
+                    invocation.return_value(new GLib.Variant('((dddds))', [[hx / scale, hy / scale, w / scale, h / scale, path]]));
+                } catch (e) {
+                    logError(e, 'sill-linux: cursor shape');
+                    none();
+                }
+            });
+        } catch (e) {
+            logError(e, 'sill-linux: cursor shape');
+            none();
+        }
+    }
+
     ClipboardTypes() {
         return St.Clipboard.get_default().get_mimetypes(St.ClipboardType.CLIPBOARD);
     }
@@ -407,6 +441,8 @@ class Service {
         this._name = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
         for (const w of global.display.list_all_windows())
             this._watch(w);
+        this._cursorTracker = global.backend.get_cursor_tracker();
+        this._cursorSignal = this._cursorTracker.connect('cursor-changed', () => this._dbus?.emit_signal('CursorChanged', null));
         const selection = global.display.get_selection();
         this._selection = selection;
         this._selectionSignal = selection.connect('owner-changed', (_s, type) => {
@@ -422,6 +458,10 @@ class Service {
     disable() {
         for (const id of this._signals)
             global.display.disconnect(id);
+        if (this._cursorSignal) {
+            this._cursorTracker.disconnect(this._cursorSignal);
+            this._cursorSignal = 0;
+        }
         if (this._selectionSignal) {
             this._selection.disconnect(this._selectionSignal);
             this._selectionSignal = 0;

@@ -522,7 +522,7 @@ one again. The extension's `PointerOver(window)` reads the pointer and the strea
 `watch_pointer` polls it at the stream's rate while the pointer moves and every 30 ms otherwise,
 only while a device watches a stream and never with `--show-cursor` (the pointer is then in the
 picture). The Desktop's rectangle is the monitor's logical origin (`DisplayConfig`) and the stream's
-size, read once. The cursor's shape (kind 14) is not sent: the app draws its default arrow.
+size, read once. The cursor's shape follows (below).
 
 Verified in the nested shell: with a second test client moving the pointer to 0.25, 0.5, 0.999 and
 0, the first got exactly those fractions on the Desktop and over a window (`inside:false` while the
@@ -574,3 +574,19 @@ window picker (GNOME 50), while setting the Show Apps button's `checked` switche
 
 Verified there with a test client sending each gesture: every step answered as listed (Activities,
 the app grid, nothing at the top; back down; workspace 2 and 1; the desktop and the windows back).
+
+## Cursor shapes (2026-10-17)
+
+Kind 14 (`CursorShapeBlob`: hotspot x, y and size w, h as big-endian Float32 points, then a PNG),
+so the app's arrow takes the pointer's shape here (arrow, I-beam, hand, resize). GNOME names no
+cursor; Mutter's `CursorTracker` holds the current sprite as a Cogl texture, and the extension's
+`CursorShape` writes it with `Shell.Screenshot.composite_to_stream`, as GNOME's screenshots do.
+Found in the nested shell: Cogl's `get_data` fills nothing a GJS caller can read (every pixel
+transparent). `CursorChanged` follows `cursor-changed`; the host reads the shape at each change
+(the last of a burst, 30 ms on) while a device is connected, keeps the last for devices that
+connect, and sends it only when it differs. Hotspot and size are the sprite's pixels over the
+cursor's scale (points).
+
+Verified in the nested shell with a test client moving the pointer from a corner onto the Text
+Editor and back: an arrow (hotspot 4, 4), an I-beam (11, 12), the arrow again, each 24×24 points,
+each a PNG. A headless shell has no sprite until the pointer first moves.

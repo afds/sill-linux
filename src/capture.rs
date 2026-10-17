@@ -732,6 +732,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
             if SHARE_CLIPBOARD.load(Ordering::Relaxed) {
                 tokio::spawn(watch_clipboard(server.clone(), s.clone()));
             }
+            tokio::spawn(watch_cursor(server.clone(), s.clone()));
             tokio::spawn(watch_windows(server, s.clone()));
         }
         None => println!(
@@ -921,6 +922,48 @@ async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
                     own = Some(text);
                 }
             }
+        }
+    }
+}
+
+/// The pointer's image (kind 14) to the devices, so the app's arrow takes its shape: read at each
+/// change (the last of a burst, 30 ms on) while a device is connected, and once when the first
+/// connects.
+async fn watch_cursor(server: Server, shell: crate::shell::Client) {
+    use futures_util::StreamExt;
+    let Ok(mut changes) = shell.cursor_changes().await else { return };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut had_clients = false;
+    let mut warned = false;
+    loop {
+        let changed = tokio::select! {
+            c = changes.next() => {
+                if c.is_none() {
+                    return;
+                }
+                true
+            }
+            _ = tick.tick() => false,
+        };
+        let clients = server.client_count() > 0;
+        let first = clients && !had_clients;
+        had_clients = clients;
+        if !clients || !(changed || first) {
+            continue;
+        }
+        if changed {
+            // A move across a window's edge changes it several times in a row: only the last counts.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            while futures_util::FutureExt::now_or_never(changes.next()).flatten().is_some() {}
+        }
+        match shell.cursor_shape().await {
+            Some(Some((geometry, png))) => server.set_cursor_shape(geometry, &png),
+            Some(None) => {}
+            None if !warned => {
+                warned = true;
+                println!("Cursor: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
+            }
+            None => {}
         }
     }
 }
