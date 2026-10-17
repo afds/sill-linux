@@ -8,6 +8,7 @@ pub mod identity;
 pub mod tls;
 pub mod door;
 pub mod input;
+pub mod pointer;
 pub mod settings;
 pub mod notify;
 pub mod service;

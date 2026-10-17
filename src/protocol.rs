@@ -37,6 +37,7 @@ pub mod kind {
     pub const PAIR_RESULT: u8 = 20;
     pub const GOODBYE: u8 = 22;
     pub const HELLO: u8 = 23;
+    pub const MAC_POINTER: u8 = 26;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

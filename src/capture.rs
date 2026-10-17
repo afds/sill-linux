@@ -717,6 +717,12 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     match &shell {
         Some(s) => {
             println!("Windows: from the Sill for Linux GNOME Shell extension.");
+            // This machine's pointer on the devices (kind 26), unless it is in the picture already.
+            if cursor == 0 {
+                let origin = crate::mutter::monitor_origin(&conn, &connector).await.unwrap_or((0, 0));
+                let desktop = stream.size.map(|(w, h)| (origin.0 as f64, origin.1 as f64, w as f64, h as f64));
+                tokio::spawn(watch_pointer(server.clone(), s.clone(), desktop));
+            }
             tokio::spawn(watch_windows(server, s.clone()));
         }
         None => println!(
@@ -845,6 +851,26 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 }
             }
         }
+    }
+}
+
+/// Reads this machine's pointer while devices watch a stream: at the stream's rate while it
+/// moves, every 30 ms otherwise (Sill for Mac's rule), against the streamed window's frame or the
+/// Desktop's monitor.
+/// shortcut: the Desktop's rectangle is read once; a monitor layout change needs a restart.
+async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Option<(f64, f64, f64, f64)>) {
+    let mut moving = false;
+    loop {
+        let wait = if moving { Duration::from_micros(1_000_000 / server.current_apply().fps.max(30) as u64) } else { Duration::from_millis(30) };
+        tokio::time::sleep(wait).await;
+        if server.client_count() == 0 || !server.streaming() {
+            moving = false;
+            continue;
+        }
+        let window = server.active_window();
+        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else { continue };
+        let rect = if window.is_some() { frame } else { desktop };
+        moving = server.pointer_sample(p, rect);
     }
 }
 

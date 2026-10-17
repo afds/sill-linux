@@ -24,6 +24,9 @@
 //                                 (unmaximized first); answers its frame before (x, y, w, h) and
 //                                 whether it was maximized; w 0: not touched (full screen, or gone)
 //   Restore(t id, i x, i y, i w, i h, b maximized) -> b   put a fitted window back
+//   PointerOver(t id) -> (iiiiiib) the pointer (x, y, logical pixels) and that window's frame
+//                                 (x, y, w, h), and whether the window is on screen (false for id
+//                                 0, a minimized window or none)
 //   Close(t id) -> b, Minimize(t id) -> b, ToggleFullscreen(t id) -> b
 //
 // Mutter's own screen-cast API already lets any unsandboxed process of this user record a window;
@@ -68,6 +71,9 @@ const XML = `
       <arg type="i" direction="in" name="y"/><arg type="i" direction="in" name="width"/>
       <arg type="i" direction="in" name="height"/><arg type="b" direction="in" name="maximized"/>
       <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="PointerOver">
+      <arg type="t" direction="in" name="id"/><arg type="(iiiiiib)" direction="out" name="pointer"/>
     </method>
     <method name="Activate"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
     <method name="Close"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
@@ -212,6 +218,15 @@ class Service {
         if (maximized)
             w.maximize();
         return true;
+    }
+
+    PointerOver(id) {
+        const [x, y] = global.get_pointer();
+        const w = id ? byId(id) : null;
+        if (!w || w.minimized)
+            return [x, y, 0, 0, 0, 0, false];
+        const f = w.get_frame_rect();
+        return [x, y, f.x, f.y, f.width, f.height, true];
     }
 
     Activate(id) {

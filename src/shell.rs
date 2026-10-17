@@ -176,6 +176,13 @@ impl Client {
         }
     }
 
+    /// The pointer and, for a window id, that window's frame if it is on screen.
+    pub async fn pointer_over(&self, id: u64) -> Option<((f64, f64), Option<(f64, f64, f64, f64)>)> {
+        let reply = self.proxy.call_method("PointerOver", &(id,)).await.ok()?;
+        let ((x, y, fx, fy, fw, fh, on),): ((i32, i32, i32, i32, i32, i32, bool),) = reply.body().deserialize().ok()?;
+        Some(((x as f64, y as f64), on.then_some((fx as f64, fy as f64, fw as f64, fh as f64))))
+    }
+
     pub async fn command(&self, method: &str, id: u64) -> bool {
         match self.proxy.call_method(method, &(id,)).await {
             Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),

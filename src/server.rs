@@ -35,6 +35,12 @@ const EVICT_GRACE: Duration = Duration::from_secs(8);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Seconds on a monotonic clock, for the pointer's rules.
+fn clock() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 /// Kind 4: bundleID length (u16 BE), the id, the PNG.
 fn icon_message(app: &str, png: &[u8]) -> Vec<u8> {
     let mut p = (app.len() as u16).to_be_bytes().to_vec();
@@ -129,6 +135,9 @@ struct Client {
     needs_keyframe: bool,
     /// The rate its viewport asks for (nil: 60).
     fps: Option<i64>,
+    /// Kind 8 messages read from it (kind 26's `seen`), and the last kind 26 sent to it.
+    inputs_read: u64,
+    last_pointer: Option<Vec<u8>>,
 }
 
 struct State {
@@ -151,6 +160,8 @@ struct State {
     /// Installed apps (.desktop id, name) and their icons, sent to every device as it connects.
     apps: Vec<(String, String)>,
     icons: Vec<(String, Vec<u8>)>,
+    /// Who moves this machine's pointer (kind 26).
+    pointer: crate::pointer::PointerControl,
     /// The last viewport any device sent (one stream: the last to report wins, as Sill for Mac).
     viewport: Option<Viewport>,
 }
@@ -188,6 +199,7 @@ impl Server {
                 apps: Vec::new(),
                 icons: Vec::new(),
                 viewport: None,
+                pointer: Default::default(),
             })),
             control,
             host_name: Arc::new(host_name),
@@ -409,6 +421,8 @@ impl Server {
                     connected_at: Instant::now(),
                     needs_keyframe: true,
                     fps: None,
+                    inputs_read: 0,
+                    last_pointer: None,
                 },
             );
             if st.active != StreamSource::None {
@@ -515,7 +529,17 @@ impl Server {
                 }
                 kind::INPUT => {
                     let input = self.input.lock().unwrap().clone();
-                    match (input, InputEvent::parse(&payload)) {
+                    let event = InputEvent::parse(&payload);
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        if let Some(c) = st.clients.get_mut(&id) {
+                            c.inputs_read += 1;
+                            c.last_pointer = None; // it drives: the host's next move reaches it again
+                        }
+                        let moves = event.as_ref().is_some_and(crate::pointer::moves_pointer);
+                        st.pointer.input_arrived(id, moves, clock());
+                    }
+                    match (input, event) {
                         (Some(tx), Some(event)) => {
                             let _ = tx.send(InputCmd::Event(id, event));
                         }
@@ -714,6 +738,33 @@ impl Server {
         }
     }
 
+    /// One read of this machine's pointer (global logical pixels) against the streamed source's
+    /// rectangle (None: nothing to judge it against, so off the stream). Every device but the one
+    /// driving gets kind 26 when its payload changed. Whether the pointer is moving.
+    pub fn pointer_sample(&self, p: (f64, f64), rect: Option<(f64, f64, f64, f64)>) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let now = clock();
+        st.pointer.read(p, now);
+        let at = rect.map(|r| crate::pointer::fraction(p, r)).filter(|f| f.2).map(|f| (f.0, f.1));
+        let driver = st.pointer.controller;
+        for (id, c) in st.clients.iter_mut() {
+            if driver == crate::pointer::Controller::Client(*id) {
+                continue;
+            }
+            let payload = crate::pointer::payload(at, c.inputs_read);
+            if c.last_pointer.as_deref() != Some(&payload[..]) {
+                let _ = c.tx.send(protocol::message(kind::MAC_POINTER, protocol::now(), false, &payload));
+                c.last_pointer = Some(payload);
+            }
+        }
+        st.pointer.is_moving(now)
+    }
+
+    /// Whether a source streams (the pointer is watched only then).
+    pub fn streaming(&self) -> bool {
+        self.state.lock().unwrap().active != StreamSource::None
+    }
+
     /// The streamed window's Mutter id, if a window streams.
     pub fn active_window(&self) -> Option<u64> {
         let st = self.state.lock().unwrap();
@@ -744,6 +795,7 @@ impl Server {
     fn remove(&self, id: u64, reason: &str) {
         let mut st = self.state.lock().unwrap();
         let Some(c) = st.clients.remove(&id) else { return };
+        st.pointer.client_left(id);
         let _ = c.close.send(true);
         if let Some(tx) = self.input.lock().unwrap().as_ref() {
             let _ = tx.send(InputCmd::Left(id));

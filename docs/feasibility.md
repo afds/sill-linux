@@ -504,3 +504,27 @@ Verified in the nested shell (`tools/windows.py --scale 1 --launch org.gnome.Cal
 172 apps and 172 icons of 64×64; both windows streamed at 1180×760 with Aa at 1× (from 700×520 and
 360×616) and each put back at its old frame and place when the next source took over; launching
 the running Calculator streamed its window. Not tried there: launching an app that is not running.
+
+## This machine's pointer on the device (2026-10-17)
+
+Kind 26 (`MacPointer`): while this machine's own mouse moves the pointer (or another device does),
+every device but the one driving is sent where it is over the streamed source, and the app draws
+its arrow there. Its portrait trackpad then carries on from that point. `pointer.rs` ports Sill for
+Mac's `PointerControl`:
+- any kind 8 hands its device the pointer, and a pointer or scroll input opens a settle of 0.25 s;
+- after the settle, a read 0.5 px or more from the last position that counted is this machine's
+  mouse, and a read more than 0.25 s after the one before only resets that position;
+- fractions are rounded to 4 places, the far edges count as outside, and `seen` is the count of
+  kind 8 messages read on that connection.
+
+Each device is sent a report only when its own report changed, and one that drives is sent its next
+one again. The extension's `PointerOver(window)` reads the pointer and the streamed window's frame.
+`watch_pointer` polls it at the stream's rate while the pointer moves and every 30 ms otherwise,
+only while a device watches a stream and never with `--show-cursor` (the pointer is then in the
+picture). The Desktop's rectangle is the monitor's logical origin (`DisplayConfig`) and the stream's
+size, read once. The cursor's shape (kind 14) is not sent: the app draws its default arrow.
+
+Verified in the nested shell: with a second test client moving the pointer to 0.25, 0.5, 0.999 and
+0, the first got exactly those fractions on the Desktop and over a window (`inside:false` while the
+pointer was off the window). The driving client got none. The host-mouse rule has unit tests only:
+the nested shell has no mouse of its own.
