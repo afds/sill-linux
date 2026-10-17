@@ -65,9 +65,27 @@ impl Insets {
     }
 }
 
+/// A cursor sprite's hotspot and size in points: the sprite is drawn for the monitor's scale (a
+/// size-24 cursor is 48 px at 200 %), so its scale is its size over the cursor size set in GNOME,
+/// rounded, at least 1. The app draws it at that many of its own points, as a Mac's cursor.
+/// shortcut: a theme whose images are not square at the nominal size reads slightly off.
+pub fn cursor_points((hx, hy, w, h): (i32, i32, i32, i32), nominal: i32) -> (f64, f64, f64, f64) {
+    let nominal = if nominal > 0 { nominal } else { 24 } as f64;
+    let scale = (w.max(h) as f64 / nominal).round().max(1.0);
+    (hx as f64 / scale, hy as f64 / scale, w as f64 / scale, h as f64 / scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_in_points() {
+        assert_eq!(cursor_points((4, 4, 24, 24), 24), (4.0, 4.0, 24.0, 24.0));
+        assert_eq!(cursor_points((8, 8, 48, 48), 24), (4.0, 4.0, 24.0, 24.0), "200 %");
+        assert_eq!(cursor_points((8, 8, 48, 48), 48), (8.0, 8.0, 48.0, 48.0), "a larger cursor set");
+        assert_eq!(cursor_points((11, 12, 24, 24), 0), (11.0, 12.0, 24.0, 24.0));
+    }
 
     #[test]
     fn frame_inside_the_crop() {
@@ -107,12 +125,20 @@ impl Client {
         Some(Client { proxy })
     }
 
+    /// The extension's interface version (None: one from before versions, 1).
+    pub async fn version(&self) -> Option<u32> {
+        self.proxy.call_method("Version", &()).await.ok()?.body().deserialize().ok()
+    }
+
+    /// The windows the device's bar lists: normal ones, not minimized (Sill for Mac lists only
+    /// windows on screen).
     pub async fn list(&self) -> Result<Vec<ShellWindow>> {
         let reply = self.proxy.call_method("ListWindows", &()).await.context("ListWindows")?;
-        let rows: Vec<(u64, String, String, String, i32, i32)> = reply.body().deserialize()?;
+        let rows: Vec<(u64, String, String, String, i32, i32, bool, bool)> = reply.body().deserialize()?;
         Ok(rows
             .into_iter()
-            .map(|(id, title, app_name, app_id, width, height)| ShellWindow { id, title, app_name, app_id, width, height })
+            .filter(|r| r.7 && !r.6)
+            .map(|(id, title, app_name, app_id, width, height, _, _)| ShellWindow { id, title, app_name, app_id, width, height })
             .collect())
     }
 
@@ -154,23 +180,53 @@ impl Client {
         png
     }
 
-    pub async fn launch(&self, app: &str) -> bool {
-        match self.proxy.call_method("Launch", &(app,)).await {
-            Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
-            Err(_) => false,
+    pub async fn app_running(&self, app: &str) -> bool {
+        self.flag("AppRunning", &(app,)).await
+    }
+    pub async fn activate_app(&self, app: &str) -> bool {
+        self.flag("ActivateApp", &(app,)).await
+    }
+    pub async fn launch_app(&self, app: &str) -> bool {
+        self.flag("LaunchApp", &(app,)).await
+    }
+
+    /// The window's frame, whether it is maximized and full screen; None: no such window.
+    pub async fn frame_state(&self, id: u64) -> Option<(Frame, bool)> {
+        let reply = self.proxy.call_method("FrameState", &(id,)).await.ok()?;
+        let ((x, y, width, height, maximized, fullscreen, exists),): ((i32, i32, i32, i32, bool, bool, bool),) = reply.body().deserialize().ok()?;
+        exists.then_some((Frame { x, y, width, height, maximized }, fullscreen))
+    }
+    pub async fn move_resize(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> bool {
+        self.flag("MoveResize", &(id, x, y, w, h)).await
+    }
+    pub async fn set_maximized(&self, id: u64, on: bool) -> bool {
+        self.flag("SetMaximized", &(id, on)).await
+    }
+
+    /// Activities' state: "hidden", "windows" or "apps".
+    pub async fn overview_state(&self) -> Option<String> {
+        self.proxy.call_method("OverviewState", &()).await.ok()?.body().deserialize().ok()
+    }
+    pub async fn set_overview(&self, state: &str) -> bool {
+        self.flag("SetOverview", &(state,)).await
+    }
+    /// The workspace `delta` to the right; its index, None when there is none.
+    pub async fn switch_workspace(&self, delta: i32) -> Option<i32> {
+        let i: i32 = self.proxy.call_method("SwitchWorkspace", &(delta,)).await.ok()?.body().deserialize().ok()?;
+        (i >= 0).then_some(i)
+    }
+    pub async fn minimize_workspace(&self) -> Vec<u64> {
+        match self.proxy.call_method("MinimizeWorkspace", &()).await {
+            Ok(r) => r.body().deserialize().unwrap_or_default(),
+            Err(_) => Vec::new(),
         }
     }
-
-    /// Resizes the window's frame to `w`×`h` logical pixels; its frame before and whether it was
-    /// maximized (None: not touched).
-    pub async fn fit(&self, id: u64, w: i32, h: i32) -> Option<Frame> {
-        let reply = self.proxy.call_method("Fit", &(id, w, h)).await.ok()?;
-        let ((x, y, width, height, maximized),): ((i32, i32, i32, i32, bool),) = reply.body().deserialize().ok()?;
-        (width > 0).then_some(Frame { x, y, width, height, maximized })
+    pub async fn unminimize(&self, ids: &[u64]) -> bool {
+        self.flag("Unminimize", &(ids,)).await
     }
 
-    pub async fn restore(&self, id: u64, f: Frame) -> bool {
-        match self.proxy.call_method("Restore", &(id, f.x, f.y, f.width, f.height, f.maximized)).await {
+    async fn flag<B: serde::Serialize + zbus::zvariant::DynamicType>(&self, method: &str, body: &B) -> bool {
+        match self.proxy.call_method(method, body).await {
             Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
             Err(_) => false,
         }
@@ -203,22 +259,17 @@ impl Client {
         Ok(self.proxy.receive_signal("ClipboardChanged").await?)
     }
 
-    /// A trackpad gesture as GNOME's own; what it did ("" for nothing; None: an older extension).
-    pub async fn gesture(&self, name: &str) -> Option<String> {
-        self.proxy.call_method("Gesture", &(name,)).await.ok()?.body().deserialize().ok()
-    }
-
     /// The pointer's image: hotspot and size in logical pixels, and its PNG (Some(None): no image
     /// now; None: the extension has no such call, an older one).
     pub async fn cursor_shape(&self) -> Option<Option<((f64, f64, f64, f64), Vec<u8>)>> {
         let reply = self.proxy.call_method("CursorShape", &()).await.ok()?;
-        let ((hx, hy, w, h, path),): ((f64, f64, f64, f64, String),) = reply.body().deserialize().ok()?;
+        let ((hx, hy, w, h, path, nominal),): ((i32, i32, i32, i32, String, i32),) = reply.body().deserialize().ok()?;
         if path.is_empty() {
             return Some(None);
         }
         let png = std::fs::read(&path).ok();
         let _ = std::fs::remove_file(&path);
-        Some(png.map(|p| ((hx, hy, w, h), p)))
+        Some(png.map(|p| (cursor_points((hx, hy, w, h), nominal), p)))
     }
 
     /// Fires on every `CursorChanged`.

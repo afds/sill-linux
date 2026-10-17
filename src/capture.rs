@@ -722,6 +722,13 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     match &shell {
         Some(s) => {
             println!("Windows: from the Sill for Linux GNOME Shell extension.");
+            let running = s.version().await.unwrap_or(1);
+            if running < EXTENSION_VERSION {
+                println!(
+                    "The GNOME Shell extension running is older (version {running}, this host has {EXTENSION_VERSION}): \
+                     --install-extension, then log out and in. Until then some features stay off."
+                );
+            }
             server.set_gestures();
             // This machine's pointer on the devices (kind 26), unless it is in the picture already.
             if cursor == 0 {
@@ -743,6 +750,9 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     tokio::spawn(recorder(conn, connector, shown.clone(), shell, cursor, rec_rx));
     Ok((cast, input_tx, rec_tx, shown))
 }
+
+/// The extension's interface version this host is built with (gnome-extension/extension.js).
+const EXTENSION_VERSION: u32 = 2;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -782,38 +792,76 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
     // shortcut: always the whole old frame, also after the user resized or moved it here; Sill for
     // Mac leaves a window resized meanwhile (WindowRestore), worth it if that bites.
     let mut fitted: HashMap<u64, crate::shell::Frame> = HashMap::new();
+    // The windows a spread minimized, which the next pinch or spread brings back.
+    let mut shown_desktop: Option<Vec<u64>> = None;
     async fn restore(shell: &Option<crate::shell::Client>, fitted: &mut HashMap<u64, crate::shell::Frame>, keep: Option<u64>) {
         let Some(s) = shell else { return };
         let ids: Vec<u64> = fitted.keys().copied().filter(|id| Some(*id) != keep).collect();
         for id in ids {
             let f = fitted.remove(&id).unwrap();
-            if s.restore(id, f).await {
+            let restored = s.move_resize(id, f.x, f.y, f.width, f.height).await && (!f.maximized || s.set_maximized(id, true).await);
+            if restored {
                 println!("Restored window {id} to {}×{} at {},{}{}.", f.width, f.height, f.x, f.y, if f.maximized { ", maximized" } else { "" });
             }
         }
     }
     while let Some(req) = rx.recv().await {
         match req {
-            RecReq::Launch(app) => match &shell {
-                Some(s) if s.launch(&app).await => *PENDING_LAUNCH.lock().unwrap() = Some((app, Instant::now())),
-                _ => println!("Could not launch {app}."),
-            },
-            RecReq::Gesture(name) => match &shell {
-                Some(s) => match s.gesture(&name).await {
-                    Some(did) if !did.is_empty() => println!("Gesture {name}: {did}."),
-                    Some(_) => println!("Gesture {name}: nothing to do."),
-                    None => println!("Gesture {name}: the GNOME Shell extension running is older than this host; --install-extension, then log out and in."),
-                },
-                None => {}
-            },
+            RecReq::Launch(app) => {
+                let Some(s) = &shell else { continue };
+                // A running app is raised (its window then picked), else started.
+                let ok = if s.app_running(&app).await { s.activate_app(&app).await } else { s.launch_app(&app).await };
+                if ok {
+                    *PENDING_LAUNCH.lock().unwrap() = Some((app, Instant::now()));
+                } else {
+                    println!("Could not launch {app}.");
+                }
+            }
+            RecReq::Gesture(name) => {
+                let Some(s) = &shell else { continue };
+                let Some(state) = s.overview_state().await.as_deref().and_then(crate::gestures::Overview::parse) else { continue };
+                use crate::gestures::Action;
+                let did = match crate::gestures::decide(&name, state, shown_desktop.is_some()) {
+                    Action::Overview(o) => s.set_overview(o.name()).await.then(|| {
+                        use crate::gestures::Overview::*;
+                        match o {
+                            Hidden => "Activities closed",
+                            Windows => "Activities",
+                            Apps => "the app grid",
+                        }
+                        .to_string()
+                    }),
+                    Action::Workspace(d) => s.switch_workspace(d).await.map(|i| format!("workspace {}", i + 1)),
+                    Action::ShowDesktop => {
+                        let ids = s.minimize_workspace().await;
+                        (!ids.is_empty()).then(|| {
+                            shown_desktop = Some(ids);
+                            "the desktop".to_string()
+                        })
+                    }
+                    Action::WindowsBack => {
+                        let ids = shown_desktop.take().unwrap_or_default();
+                        s.unminimize(&ids).await.then(|| "the windows back".to_string())
+                    }
+                    Action::Nothing => None,
+                };
+                println!("Gesture {name}: {}.", did.as_deref().unwrap_or("nothing to do"));
+            }
             RecReq::Fit(id, w, h) => {
                 let Some(s) = &shell else { continue };
-                match s.fit(id, w, h).await {
-                    Some(before) => {
-                        println!("Resized window {id} to {w}×{h} for the device (Aa), from {}×{}.", before.width, before.height);
-                        fitted.entry(id).or_insert(before);
+                // Never a window in full screen; a maximized one is unmaximized first (and maximized
+                // again when it goes back).
+                match s.frame_state(id).await {
+                    Some((before, false)) => {
+                        if before.maximized {
+                            s.set_maximized(id, false).await;
+                        }
+                        if s.move_resize(id, before.x, before.y, w, h).await {
+                            println!("Resized window {id} to {w}×{h} for the device (Aa), from {}×{}.", before.width, before.height);
+                            fitted.entry(id).or_insert(before);
+                        }
                     }
-                    None => println!("Window {id} is full screen or gone; not resizing."),
+                    _ => println!("Window {id} is full screen or gone; not resizing."),
                 }
             }
             RecReq::Release => restore(&shell, &mut fitted, None).await,
@@ -887,8 +935,7 @@ pub fn set_share_clipboard(on: bool) {
 async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
     use futures_util::StreamExt;
     if shell.clipboard_types().await.is_none() {
-        println!("Clipboard: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
-        return;
+        return; // an older extension (said at start)
     }
     let Ok(mut changes) = shell.clipboard_changes().await else { return };
     let (tx, mut writes) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -934,7 +981,6 @@ async fn watch_cursor(server: Server, shell: crate::shell::Client) {
     let Ok(mut changes) = shell.cursor_changes().await else { return };
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut had_clients = false;
-    let mut warned = false;
     loop {
         let changed = tokio::select! {
             c = changes.next() => {
@@ -958,12 +1004,7 @@ async fn watch_cursor(server: Server, shell: crate::shell::Client) {
         }
         match shell.cursor_shape().await {
             Some(Some((geometry, png))) => server.set_cursor_shape(geometry, &png),
-            Some(None) => {}
-            None if !warned => {
-                warned = true;
-                println!("Cursor: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
-            }
-            None => {}
+            Some(None) | None => {}
         }
     }
 }
@@ -974,7 +1015,6 @@ async fn watch_cursor(server: Server, shell: crate::shell::Client) {
 /// shortcut: the Desktop's rectangle is read once; a monitor layout change needs a restart.
 async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Option<(f64, f64, f64, f64)>) {
     let mut moving = false;
-    let mut warned = false;
     loop {
         let wait = if moving { Duration::from_micros(1_000_000 / server.current_apply().fps.max(30) as u64) } else { Duration::from_millis(30) };
         tokio::time::sleep(wait).await;
@@ -983,13 +1023,7 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
             continue;
         }
         let window = server.active_window();
-        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else {
-            if !warned {
-                warned = true;
-                println!("Pointer: the GNOME Shell extension running is older than this host; --install-extension, then log out and in.");
-            }
-            continue;
-        };
+        let Some((p, frame)) = shell.pointer_over(window.unwrap_or(0)).await else { continue };
         let rect = if window.is_some() { frame } else { desktop };
         moving = server.pointer_sample(p, rect);
     }

@@ -1,45 +1,47 @@
 // Sill for Linux: the window list for the sill-linux host, on the session bus.
 //
-// org.sill_linux.Shell at /org/sill_linux/Shell:
-//   ListWindows() -> a(tsssii)   normal windows: Mutter's window id (what
-//                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title,
-//                                 app name, app id (.desktop id, or WM class), width, height
-//                                 (frame, logical pixels), in stacking order, bottom first;
-//                                 minimized windows are left out, as Sill for Mac lists only
-//                                 windows on screen
+// org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
+// plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
+// a change here costs a log-out, while sill-linux restarts in a second).
+//   Version() -> u                this interface's version (2)
+//   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
+//                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
+//                                 app id (.desktop id, or WM class), frame width and height (logical
+//                                 pixels), minimized, and listed (normal, not skipping the taskbar);
+//                                 in stacking order, bottom first
+//   WindowsChanged                a window came, went, was retitled, resized, minimized or
+//                                 unminimized (coalesced, 250 ms)
 //   Geometry(t id) -> (iiiiii)    where the frame sits in the window's buffer (what a window's
 //                                 screen cast shows): left, top, right and bottom insets (the
 //                                 shadow), and the buffer's width and height, logical pixels;
 //                                 all 0 for no such window
-//   ClipboardTypes() -> as        the clipboard's MIME types (read without its contents)
-//   ClipboardText() -> s          its text ("" for none)
-//   SetClipboard(s text) -> b     the clipboard's text, from a device
-//   ClipboardChanged              the clipboard has new contents
-//   CursorShape() -> (dddds)      the pointer's current image: hotspot x, y and size w, h in
-//                                 logical pixels, and a PNG of it (path; "" when there is none)
-//   CursorChanged                 the pointer's image changed
-//   Gesture(s name) -> s          a trackpad gesture from a device, as GNOME's own: swipeUp
-//                                 Activities then the app grid, swipeDown back, swipeLeft and
-//                                 swipeRight the next and previous workspace, pinch the app grid,
-//                                 spread the desktop shown (pinch or spread again: the windows
-//                                 back); answers what it did, "" for nothing
-//   WindowsChanged                a window came, went, was retitled, resized, minimized or
-//                                 unminimized (coalesced, 250 ms)
-//   Thumbnail(t id, u maxSize) -> s   a PNG of the window, at most maxSize on its longer side,
-//                                 in $XDG_RUNTIME_DIR/sill-linux/ (0700); "" when it has none
+//   FrameState(t id) -> (iiiibbb) the frame (x, y, w, h), maximized, full screen, and whether the
+//                                 window exists
+//   MoveResize(t id, i x, i y, i w, i h) -> b, SetMaximized(t id, b on) -> b
+//   Thumbnail(t id, u maxSize) -> s   a PNG of the window's frame, at most maxSize on its longer
+//                                 side, in $XDG_RUNTIME_DIR/sill-linux/ (0700); "" when it has none
 //   Activate(t id) -> b           unminimize, raise and focus
+//   Close(t id) -> b, Minimize(t id) -> b, ToggleFullscreen(t id) -> b
 //   ListApps() -> a(ss)           installed apps shown in the app grid: .desktop id, name
-//   AppIcon(s app, u size) -> s   a PNG of the app's icon, size×size, beside the thumbnails; ""
-//                                 when it has none
-//   Launch(s app) -> b            start the app (a running one is raised)
-//   Fit(t id, i w, i h) -> (iiiib)  resize the window's frame to w×h logical pixels where it is
-//                                 (unmaximized first); answers its frame before (x, y, w, h) and
-//                                 whether it was maximized; w 0: not touched (full screen, or gone)
-//   Restore(t id, i x, i y, i w, i h, b maximized) -> b   put a fitted window back
+//   AppIcon(s app, u size) -> s   a PNG of the app's icon, size×size; "" when it has none
+//   AppRunning(s app) -> b, ActivateApp(s app) -> b, LaunchApp(s app) -> b
 //   PointerOver(t id) -> (iiiiiib) the pointer (x, y, logical pixels) and that window's frame
 //                                 (x, y, w, h), and whether the window is on screen (false for id
 //                                 0, a minimized window or none)
-//   Close(t id) -> b, Minimize(t id) -> b, ToggleFullscreen(t id) -> b
+//   CursorShape() -> (iiiisi)     the pointer's image: hotspot x, y and size w, h in the sprite's
+//                                 pixels, a PNG of it (path; "" when there is none), and the cursor
+//                                 size set in GNOME (cursor-size)
+//   CursorChanged                 the pointer's image changed
+//   ClipboardTypes() -> as        the clipboard's MIME types (read without its contents)
+//   ClipboardText() -> s          its text ("" for none)
+//   SetClipboard(s text) -> b     the clipboard's text
+//   ClipboardChanged              the clipboard has new contents
+//   OverviewState() -> s          "hidden", "windows" (Activities) or "apps" (the app grid)
+//   SetOverview(s state) -> b     one of those three
+//   SwitchWorkspace(i delta) -> i the workspace that many to the right (negative: left), its index;
+//                                 -1 when there is none
+//   MinimizeWorkspace() -> at     minimizes the active workspace's listed windows; their ids
+//   Unminimize(at ids) -> b
 //
 // Mutter's own screen-cast API already lets any unsandboxed process of this user record a window;
 // this adds titles and a window list, which GNOME keeps from ordinary apps. Sandboxed (Flatpak)
@@ -61,7 +63,8 @@ const PATH = '/org/sill_linux/Shell';
 const XML = `
 <node>
   <interface name="org.sill_linux.Shell">
-    <method name="ListWindows"><arg type="a(tsssii)" direction="out" name="windows"/></method>
+    <method name="Version"><arg type="u" direction="out" name="version"/></method>
+    <method name="ListWindows"><arg type="a(tsssiibb)" direction="out" name="windows"/></method>
     <method name="Thumbnail">
       <arg type="t" direction="in" name="id"/><arg type="u" direction="in" name="maxSize"/>
       <arg type="s" direction="out" name="path"/>
@@ -69,22 +72,26 @@ const XML = `
     <method name="Geometry">
       <arg type="t" direction="in" name="id"/><arg type="(iiiiii)" direction="out" name="geometry"/>
     </method>
+    <method name="FrameState">
+      <arg type="t" direction="in" name="id"/><arg type="(iiiibbb)" direction="out" name="frame"/>
+    </method>
+    <method name="MoveResize">
+      <arg type="t" direction="in" name="id"/><arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/><arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/><arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SetMaximized">
+      <arg type="t" direction="in" name="id"/><arg type="b" direction="in" name="on"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
     <method name="ListApps"><arg type="a(ss)" direction="out" name="apps"/></method>
     <method name="AppIcon">
       <arg type="s" direction="in" name="app"/><arg type="u" direction="in" name="size"/>
       <arg type="s" direction="out" name="path"/>
     </method>
-    <method name="Launch"><arg type="s" direction="in" name="app"/><arg type="b" direction="out" name="ok"/></method>
-    <method name="Fit">
-      <arg type="t" direction="in" name="id"/><arg type="i" direction="in" name="width"/>
-      <arg type="i" direction="in" name="height"/><arg type="(iiiib)" direction="out" name="before"/>
-    </method>
-    <method name="Restore">
-      <arg type="t" direction="in" name="id"/><arg type="i" direction="in" name="x"/>
-      <arg type="i" direction="in" name="y"/><arg type="i" direction="in" name="width"/>
-      <arg type="i" direction="in" name="height"/><arg type="b" direction="in" name="maximized"/>
-      <arg type="b" direction="out" name="ok"/>
-    </method>
+    <method name="AppRunning"><arg type="s" direction="in" name="app"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="ActivateApp"><arg type="s" direction="in" name="app"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="LaunchApp"><arg type="s" direction="in" name="app"/><arg type="b" direction="out" name="ok"/></method>
     <method name="PointerOver">
       <arg type="t" direction="in" name="id"/><arg type="(iiiiiib)" direction="out" name="pointer"/>
     </method>
@@ -95,21 +102,26 @@ const XML = `
     <method name="ClipboardTypes"><arg type="as" direction="out" name="types"/></method>
     <method name="ClipboardText"><arg type="s" direction="out" name="text"/></method>
     <method name="SetClipboard"><arg type="s" direction="in" name="text"/><arg type="b" direction="out" name="ok"/></method>
-    <method name="Gesture"><arg type="s" direction="in" name="name"/><arg type="s" direction="out" name="did"/></method>
-    <method name="CursorShape"><arg type="(dddds)" direction="out" name="shape"/></method>
+    <method name="CursorShape"><arg type="(iiiisi)" direction="out" name="shape"/></method>
+    <method name="OverviewState"><arg type="s" direction="out" name="state"/></method>
+    <method name="SetOverview"><arg type="s" direction="in" name="state"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="SwitchWorkspace"><arg type="i" direction="in" name="delta"/><arg type="i" direction="out" name="index"/></method>
+    <method name="MinimizeWorkspace"><arg type="at" direction="out" name="ids"/></method>
+    <method name="Unminimize"><arg type="at" direction="in" name="ids"/><arg type="b" direction="out" name="ok"/></method>
     <signal name="CursorChanged"/>
     <signal name="ClipboardChanged"/>
     <signal name="WindowsChanged"/>
   </interface>
 </node>`;
 
+const VERSION = 2;
+
 function listed(w) {
-    return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar() && !w.minimized;
+    return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
 }
 
 function windows() {
-    const all = global.display.list_all_windows().filter(listed);
-    return global.display.sort_windows_by_stacking(all);
+    return global.display.sort_windows_by_stacking(global.display.list_all_windows());
 }
 
 function byId(id) {
@@ -126,6 +138,10 @@ class Service {
         this._windowSignals = new Map();
     }
 
+    Version() {
+        return VERSION;
+    }
+
     ListWindows() {
         return windows().map(w => {
             const app = this._tracker.get_window_app(w);
@@ -137,8 +153,37 @@ class Service {
                 app?.get_id() ?? w.get_wm_class() ?? '',
                 r.width,
                 r.height,
+                w.minimized,
+                listed(w),
             ];
         });
+    }
+
+    FrameState(id) {
+        const w = byId(id);
+        if (!w)
+            return [0, 0, 0, 0, false, false, false];
+        const f = w.get_frame_rect();
+        return [f.x, f.y, f.width, f.height, w.is_maximized(), w.is_fullscreen(), true];
+    }
+
+    MoveResize(id, x, y, width, height) {
+        const w = byId(id);
+        if (!w || width < 1 || height < 1)
+            return false;
+        w.move_resize_frame(false, x, y, width, height);
+        return true;
+    }
+
+    SetMaximized(id, on) {
+        const w = byId(id);
+        if (!w)
+            return false;
+        if (on)
+            w.maximize();
+        else
+            w.unmaximize();
+        return true;
     }
 
     Geometry(id) {
@@ -207,37 +252,20 @@ class Service {
         }
     }
 
-    Launch(appId) {
+    AppRunning(appId) {
+        return (Shell.AppSystem.get_default().lookup_app(appId)?.get_n_windows() ?? 0) > 0;
+    }
+
+    ActivateApp(appId) {
         const app = Shell.AppSystem.get_default().lookup_app(appId);
-        if (!app)
-            return false;
-        if (app.get_n_windows() > 0)
-            app.activate();
-        else
-            app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
-        return true;
+        app?.activate();
+        return !!app;
     }
 
-    Fit(id, width, height) {
-        const w = byId(id);
-        if (!w || w.is_fullscreen() || width < 1 || height < 1)
-            return [0, 0, 0, 0, false];
-        const f = w.get_frame_rect();
-        const maximized = w.is_maximized();
-        if (maximized)
-            w.unmaximize();
-        w.move_resize_frame(false, f.x, f.y, width, height);
-        return [f.x, f.y, f.width, f.height, maximized];
-    }
-
-    Restore(id, x, y, width, height, maximized) {
-        const w = byId(id);
-        if (!w || w.is_fullscreen())
-            return false;
-        w.move_resize_frame(false, x, y, width, height);
-        if (maximized)
-            w.maximize();
-        return true;
+    LaunchApp(appId) {
+        const app = Shell.AppSystem.get_default().lookup_app(appId);
+        app?.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
+        return !!app;
     }
 
     PointerOver(id) {
@@ -249,92 +277,70 @@ class Service {
         return [x, y, f.x, f.y, f.width, f.height, true];
     }
 
-    Gesture(name) {
+    OverviewState() {
         const overview = Main.overview;
-        const apps = overview.visible && overview.dash?.showAppsButton?.checked;
-        const time = global.get_current_time();
-        const workspace = dir => {
-            const ws = global.workspace_manager.get_active_workspace().get_neighbor(dir);
-            if (ws === global.workspace_manager.get_active_workspace())
-                return '';
-            ws.activate(time);
-            return `workspace ${ws.index() + 1}`;
-        };
-        if (this._shownDesktop && (name === 'pinch' || name === 'spread')) {
-            for (const w of this._shownDesktop)
-                w.unminimize();
-            this._shownDesktop = null;
-            return 'the windows back';
-        }
-        switch (name) {
-        case 'swipeUp':
-            if (apps)
-                return '';
-            if (overview.visible) {
-                // showApps() does not leave the window picker once Activities is open (GNOME 50);
-                // the Show Apps button, which the overview follows, does.
-                overview.dash.showAppsButton.checked = true;
-                return 'the app grid';
-            }
-            overview.show();
-            return 'Activities';
-        case 'swipeDown':
-            if (apps) {
+        if (!overview.visible)
+            return 'hidden';
+        return overview.dash?.showAppsButton?.checked ? 'apps' : 'windows';
+    }
+
+    SetOverview(state) {
+        const overview = Main.overview;
+        switch (state) {
+        case 'hidden':
+            overview.hide();
+            return true;
+        case 'windows':
+            if (overview.visible)
                 overview.dash.showAppsButton.checked = false;
-                return 'Activities';
-            }
-            if (overview.visible) {
-                overview.hide();
-                return 'Activities closed';
-            }
-            return '';
-        case 'swipeLeft':
-            return workspace(Meta.MotionDirection.RIGHT);
-        case 'swipeRight':
-            return workspace(Meta.MotionDirection.LEFT);
-        case 'pinch':
-            if (apps) {
-                overview.hide();
-                return 'the app grid closed';
-            }
+            else
+                overview.show();
+            return true;
+        case 'apps':
+            // showApps() does not leave the window picker once Activities is open (GNOME 50);
+            // the Show Apps button, which the overview follows, does.
             if (overview.visible)
                 overview.dash.showAppsButton.checked = true;
             else
                 overview.showApps();
-            return 'the app grid';
-        case 'spread': {
-            if (overview.visible) {
-                overview.hide();
-                return 'Activities closed';
-            }
-            const active = global.workspace_manager.get_active_workspace();
-            const shown = windows().filter(w => w.located_on_workspace(active) && w.can_minimize());
-            if (!shown.length)
-                return '';
-            for (const w of shown)
-                w.minimize();
-            this._shownDesktop = shown;
-            return 'the desktop';
+            return true;
         }
-        }
-        return '';
+        return false;
+    }
+
+    SwitchWorkspace(delta) {
+        const manager = global.workspace_manager;
+        const index = manager.get_active_workspace_index() + delta;
+        if (delta === 0 || index < 0 || index >= manager.get_n_workspaces())
+            return -1;
+        manager.get_workspace_by_index(index).activate(global.get_current_time());
+        return index;
+    }
+
+    MinimizeWorkspace() {
+        const active = global.workspace_manager.get_active_workspace();
+        const shown = windows().filter(w => listed(w) && !w.minimized && w.located_on_workspace(active) && w.can_minimize());
+        for (const w of shown)
+            w.minimize();
+        return shown.map(w => w.get_id());
+    }
+
+    Unminimize(ids) {
+        for (const id of ids)
+            byId(id)?.unminimize();
+        return true;
     }
 
     CursorShapeAsync(_params, invocation) {
-        const none = () => invocation.return_value(new GLib.Variant('((dddds))', [[0, 0, 0, 0, '']]));
+        const nominal = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'}).get_int('cursor-size');
+        const reply = (hx, hy, w, h, path) => invocation.return_value(new GLib.Variant('((iiiisi))', [[hx, hy, w, h, path, nominal]]));
         try {
             const tracker = global.backend.get_cursor_tracker();
             const sprite = tracker.get_sprite();
             if (!sprite)
-                return none();
+                return reply(0, 0, 0, 0, '');
             const w = sprite.get_width(), h = sprite.get_height();
             const [hx, hy] = tracker.get_hot();
-            // The sprite is drawn for the monitor's scale (a size-24 cursor is 48 px at 200 %); its
-            // size in points is the cursor size the person set, as a Mac's cursor is in points.
-            // shortcut: the scale as the sprite's width over that size, rounded; a theme whose images
-            // are not square at the nominal size would read slightly off.
-            const nominal = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'}).get_int('cursor-size') || 24;
-            const scale = Math.max(1, Math.round(Math.max(w, h) / nominal));
             const path = GLib.build_filenamev([this._dir, 'cursor.png']);
             const stream = Gio.File.new_for_path(path).replace(null, false, Gio.FileCreateFlags.NONE, null);
             // The sprite's pixels as GNOME's screenshots write them (Cogl's get_data gives JS nothing).
@@ -342,15 +348,15 @@ class Service {
                 try {
                     Shell.Screenshot.composite_to_stream_finish(res);
                     stream.close(null);
-                    invocation.return_value(new GLib.Variant('((dddds))', [[hx / scale, hy / scale, w / scale, h / scale, path]]));
+                    reply(hx, hy, w, h, path);
                 } catch (e) {
                     logError(e, 'sill-linux: cursor shape');
-                    none();
+                    reply(0, 0, 0, 0, '');
                 }
             });
         } catch (e) {
             logError(e, 'sill-linux: cursor shape');
-            none();
+            reply(0, 0, 0, 0, '');
         }
     }
 

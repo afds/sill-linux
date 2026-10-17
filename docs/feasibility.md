@@ -592,3 +592,25 @@ iPad mini the first build drew a 200 % cursor at 48 points, twice a Mac's.
 Verified in the nested shell with a test client moving the pointer from a corner onto the Text
 Editor and back: an arrow (hotspot 4, 4), an I-beam (11, 12), the arrow again, each 24×24 points,
 each a PNG. A headless shell has no sprite until the pointer first moves.
+
+## A thin extension (2026-10-17)
+
+GNOME on Wayland loads an extension's code once per login, so an extension change costs a log-out,
+while sill-linux restarts in a second. The extension (interface version 2, `Version`) now only
+reads GNOME's state and does plain actions, and sill-linux decides:
+- which windows the bar lists (`ListWindows` reports every window, with `minimized` and
+  `listed`);
+- a cursor's size in points (`CursorShape` gives the sprite's pixels and `cursor-size`;
+  `shell::cursor_points`);
+- what a gesture does (`OverviewState`, `SetOverview`, `SwitchWorkspace`, `MinimizeWorkspace` and
+  `Unminimize`; `gestures.rs`);
+- Aa and its way back (`FrameState`, `MoveResize`, `SetMaximized`);
+- whether a launch raises or starts an app (`AppRunning`, `ActivateApp`, `LaunchApp`).
+
+At start the host says once when the running extension is older than its own. A log-out is needed
+only when the extension's interface changes (a new kind of read or action), not for a change in
+behaviour.
+
+Verified in the nested shell, every earlier check again with the same results: windows, Aa and
+its way back, launching, minimize, every gesture step, the pointer fractions, and the cursor
+shapes in points.

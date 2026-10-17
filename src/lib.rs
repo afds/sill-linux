@@ -8,6 +8,7 @@ pub mod identity;
 pub mod tls;
 pub mod door;
 pub mod input;
+pub mod gestures;
 pub mod clipboard;
 pub mod pointer;
 pub mod settings;

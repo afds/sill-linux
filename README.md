@@ -48,7 +48,9 @@ then shows each window with a thumbnail, and a tap streams that window alone (ra
 here, so typing goes to it), cropped to its frame. Holding a thumbnail gives its lights: close,
 minimize, full screen. All Apps lists the installed apps with their icons and starts one (its
 window then streams), and Aa sizes the streamed window to the iPad's panel (it goes back when it
-stops streaming). After updating sill-linux, run `--install-extension` again and log out and in.
+stops streaming). After updating sill-linux, restart it (`systemctl --user restart
+sill-linux`); only when it says the running extension is older, run `--install-extension` and log
+out and in.
 Without the extension, or with `--portal`, only the Desktop streams. Three-finger gestures on the app's trackpad work as GNOME's own:
 swipe up for Activities and the app grid, left and right for workspaces, pinch for the app grid,
 spread for the desktop. The clipboard is shared both ways too
