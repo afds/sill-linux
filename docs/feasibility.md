@@ -343,3 +343,24 @@ dropped only the stray one.
 
 For Sill's app (Noah): the trackpad's tap recognizer could require that the touch moved the
 pointer less than a few points, or fail it once the finger tracker has moved the cursor.
+
+## Fullscreen video and DMA-BUF (2026-10-17)
+
+Reported on the iPad: a YouTube video put fullscreen stopped updating. The log: 2 frames a
+second (the keep-alive alone) while fullscreen, 18–33 outside it. Known: mutter #3074 (PipeWire
+capture broken on unredirected windows, Wayland, NVIDIA): a fullscreen window shown by direct
+scanout gives a shared-memory screen cast no new frames.
+
+DMA-BUF is now the default for NVENC, shared memory the automatic fallback (when the pipeline
+fails before its first frame) and `SILL_LINUX_SHM=1`. The garbage picture of phase 1 came from
+glupload's indirect DMA-BUF import, which read NVIDIA's tiled buffers as linear (GNOME 50 offers
+only NVIDIA block-linear modifiers, `AR24:0x03…`, no linear); asking glupload for an
+`external-oes` texture selects its direct import, which hands EGL the modifier, and the picture is
+right. The upload and colour conversion moved into the half that stays (a new glupload would not
+take the running DMA-BUF format, "not-negotiated"), so a resolution change replaces only scaler,
+encoder, parser and appsink, linked without the up-front caps check. Verified: four Retina/Standard
+switches on each path, a keyframe each, decoded by ffmpeg; a crop of the dock correct.
+
+To check on the iPad: a fullscreen YouTube video keeps updating with DMA-BUF (if not, the system
+switch `MUTTER_DEBUG_PAINT=disable-direct-scanout` in `~/.config/environment.d/`, then a new
+login, makes GNOME always composite).

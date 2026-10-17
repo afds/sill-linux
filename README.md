@@ -67,8 +67,11 @@ connects, by its row or with the launch argument `-SillConnect <IP>:47460`.
 code to `SILL_LINUX_TEST_CODE_FILE`). `tools/receive.py HOST PORT [SECONDS] [--join-late]`, on a
 `--plain` door, checks every message's layout and decodes the stream with ffmpeg.
 
-Testing switches: `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder; `SILL_LINUX_DMABUF=1`
-tries zero copy for NVENC (broken on NVIDIA here, see the doc); `SILL_LINUX_INPUT_LOG=1` prints
+With NVENC the screen comes over DMA-BUF straight into the GPU (no copy, and a fullscreen video
+keeps updating, which shared memory does not on NVIDIA); shared memory is the fallback.
+
+Testing switches: `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder; `SILL_LINUX_SHM=1` forces
+shared memory; `SILL_LINUX_INPUT_LOG=1` prints
 every input action sent to the portal.
 
 ## Dependency policy

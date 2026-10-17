@@ -1,7 +1,7 @@
 //! The Desktop: the screen-cast portal hands over a PipeWire stream of one monitor, and a
 //! GStreamer pipeline turns it into HEVC access units for the server.
 //!
-//! pipewiresrc → valve (closed while nobody watches) → scaler and `size` filter (Retina or
+//! pipewiresrc (DMA-BUF for NVENC, else shared memory) → valve (closed while nobody watches) → scaler and `size` filter (Retina or
 //! Standard, on the GPU for NVENC) → HEVC encoder (NVENC, else VA-API, else x265; Main profile, no
 //! B-frames, low latency) → h265parse (parameter sets before every IDR, one access unit per
 //! buffer, Annex-B) → appsink → `protocol::convert_annex_b` → `Server::broadcast_access_unit`.
@@ -64,34 +64,85 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     let mut apply = server.current_apply();
     let (formats, encoder_desc, name) = encoder(apply.kbps())?;
     server.set_software_encoder(name.contains("software"));
-    // Shared memory by default. SILL_LINUX_DMABUF=1 tries zero copy for NVENC (the compositor's
-    // DMA-BUF imported into GL, which nvh265enc reads), but on GNOME 50 with an RTX 3060 glupload
-    // read the buffer with the wrong layout (NVIDIA's tiled modifiers) and the picture was garbage.
     let gl = name.starts_with("NVENC");
-    let dmabuf = gl && std::env::var_os("SILL_LINUX_DMABUF").is_some();
-    println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
-    let shape = TailShape { gl, formats, encoder: encoder_desc, logical: cast.size };
+    // NVENC takes the compositor's DMA-BUF straight into GL (zero copy; also the only way frames
+    // keep coming while a fullscreen window is shown by direct scanout, mutter #3074), falling back
+    // to shared memory if that does not negotiate. SILL_LINUX_SHM=1 forces shared memory.
+    let mut dmabuf = gl && std::env::var_os("SILL_LINUX_SHM").is_none();
+    let mut streaming = false;
+    loop {
+        println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
+        let shape = TailShape { gl, dmabuf, formats, encoder: encoder_desc.clone(), logical: cast.size };
+        match run_pipeline(server, &control, &cast, &shape, &mut apply, &mut streaming)? {
+            Outcome::Ended => break,
+            Outcome::NoDmaBuf(why) if dmabuf => {
+                println!("DMA-BUF did not work here ({why}); using shared memory.");
+                dmabuf = false;
+            }
+            Outcome::NoDmaBuf(why) => bail!(why),
+        }
+    }
+    drop(cast);
+    Ok(())
+}
 
+enum Outcome {
+    Ended,
+    /// The pipeline failed before its first frame (with DMA-BUF: try shared memory).
+    NoDmaBuf(String),
+}
+
+fn run_pipeline(
+    server: &Server,
+    control: &Receiver<Control>,
+    cast: &PortalCast,
+    shape: &TailShape,
+    apply: &mut Apply,
+    streaming: &mut bool,
+) -> Result<Outcome> {
     // The source half stays for the whole run: the PipeWire stream and the valve (closed while
     // nobody watches; it passes caps on, so opening it renegotiates nothing). The fd stays open in
-    // `cast` for as long as the pipeline runs (pipewiresrc does not own it).
-    let memory = if dmabuf { "keepalive-time=500 ! video/x-raw(memory:DMABuf)" } else { "always-copy=true keepalive-time=500 ! video/x-raw" };
+    // `cast` for as long as the pipeline runs (pipewiresrc dups it).
+    let memory = if shape.dmabuf { "keepalive-time=500 ! video/x-raw(memory:DMABuf)" } else { "always-copy=true keepalive-time=500 ! video/x-raw" };
+    // The upload and colour conversion stay too (a new glupload would not take the running
+    // DMA-BUF format): a new tail starts from plain RGBA in GL memory, or raw video.
+    let head = if shape.gl {
+        // From DMA-BUF, glupload's direct import (an external-oes texture) is the one that gives
+        // EGL the buffer's modifier: NVIDIA's buffers are tiled, and the other import read them as
+        // linear (garbage, 2026-10-17).
+        let upload = if shape.dmabuf { "glupload ! video/x-raw(memory:GLMemory),texture-target=external-oes" } else { "glupload" };
+        format!("{upload} ! glcolorconvert ! capsfilter name=head caps=video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D")
+    } else {
+        let first = shape.formats.split(',').next().unwrap_or("I420");
+        format!("videoconvert ! capsfilter name=head caps=video/x-raw,format={first}")
+    };
     let description = format!(
-        "pipewiresrc fd={fd} path={node} {memory} ! valve name=gate drop=true drop-mode=forward-sticky-events",
+        "pipewiresrc fd={fd} path={node} {memory} ! valve name=gate drop={drop} drop-mode=forward-sticky-events ! {head}",
         fd = cast.fd.as_raw_fd(),
         node = cast.node,
+        drop = !*streaming,
     );
     let pipeline = gst::parse::launch(&description)
         .context("building the pipeline")?
         .dynamic_cast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
     let gate = pipeline.by_name("gate").ok_or_else(|| anyhow!("no valve"))?;
+    let head = pipeline.by_name("head").ok_or_else(|| anyhow!("no head"))?;
+    if let Some(pad) = head.static_pad("src") {
+        // A new tail asks upstream to renegotiate as it links: stopped here, the half that stays
+        // keeps its caps (a renegotiating pipewiresrc failed or reconnected).
+        pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| match info.event() {
+            Some(e) if e.type_() == gst::EventType::Reconfigure => gst::PadProbeReturn::Drop,
+            _ => gst::PadProbeReturn::Ok,
+        });
+    }
 
     // Counters for the once-a-second line (buffers out of pipewiresrc, encoded units), the
     // captured size for input, and the frame-rate limit (frames sooner than it are dropped before
     // the encoder; the compositor sends at most its refresh rate anyway).
     let captured = Arc::new(AtomicU64::new(0));
     let encoded = Arc::new(AtomicU64::new(0));
+    let encoded_total = Arc::new(AtomicU64::new(0));
     let min_interval_us = Arc::new(AtomicU64::new(0));
     if let Some(pad) = gate.static_pad("sink") {
         let c = captured.clone();
@@ -129,12 +180,12 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
         // 90 % of the frame interval: a frame a little early is not dropped.
         min_interval_us.store(900_000 / a.fps.max(1) as u64, Ordering::Relaxed);
     };
-    set_rate(&apply);
-    let mut tail = build_tail(&shape, &apply, server, &encoded)?;
+    set_rate(apply);
+    let counters = (encoded.clone(), encoded_total.clone());
+    let mut tail = build_tail(shape, apply, server, &counters)?;
     pipeline.add(&tail.bin)?;
-    gate.link(&tail.bin).context("linking the encoder")?;
-    describe(&shape, &apply);
-    let mut streaming = false;
+    head.link(&tail.bin).context("linking the encoder")?;
+    describe(shape, apply);
     let mut last_stats = Instant::now();
 
     // The system clock, not the one pipewiresrc offers: PipeWire's stops while the compositor sends
@@ -143,45 +194,45 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     pipeline.set_state(gst::State::Playing).context("starting the pipeline")?;
     let bus = pipeline.bus().ok_or_else(|| anyhow!("no bus"))?;
     let mut last_keyframe = Instant::now() - KEYFRAME_SPACING;
-    let mut keyframe_pending = false;
+    let mut keyframe_pending = *streaming;
     let result = loop {
         match control.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Start) => {
-                streaming = true;
+                *streaming = true;
                 gate.set_property("drop", false);
                 keyframe_pending = true;
             }
             Ok(Control::Stop) => {
-                streaming = false;
+                *streaming = false;
                 gate.set_property("drop", true);
             }
             Ok(Control::Keyframe) => keyframe_pending = true,
-            Ok(Control::Apply(a)) if a != apply => {
+            Ok(Control::Apply(a)) if a != *apply => {
                 let new_size = a.retina != apply.retina;
-                apply = a;
-                set_rate(&apply);
+                *apply = a;
+                set_rate(apply);
                 if new_size {
                     // A resolution change replaces the tail: changing the size live failed in
                     // GStreamer (the scaler would not renegotiate mid-stream, then pipewiresrc
                     // renegotiated and the capture ended, Retina → Standard, 2026-10-17).
-                    match replace_tail(&pipeline, &gate, tail, &shape, &apply, server, &encoded, streaming) {
+                    match replace_tail(&pipeline, &gate, &head, tail, shape, apply, server, &counters, *streaming) {
                         Ok(t) => tail = t,
                         Err(e) => break Err(e.context("changing the resolution")),
                     }
                 } else {
                     tail.enc.set_property("bitrate", apply.kbps());
                 }
-                describe(&shape, &apply);
+                describe(shape, apply);
                 keyframe_pending = true;
             }
             Ok(Control::Apply(_)) => {}
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break Ok(()),
+            Err(RecvTimeoutError::Disconnected) => break Ok(Outcome::Ended),
         }
         if last_stats.elapsed() >= Duration::from_secs(1) {
             last_stats = Instant::now();
             let (cap, enc) = (captured.swap(0, Ordering::Relaxed), encoded.swap(0, Ordering::Relaxed));
-            if streaming {
+            if *streaming {
                 let inputs = INPUT_EVENTS.swap(0, Ordering::Relaxed);
                 println!("[1s] cap {cap} enc {enc} {} in {inputs}", server.take_stats());
             }
@@ -192,29 +243,30 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
             tail.sink.send_event(event);
         }
+        let mut failure = None;
         while let Some(msg) = bus.pop() {
             use gst::MessageView;
             match msg.view() {
-                MessageView::Error(e) => {
-                    break_err(&pipeline);
-                    return Err(anyhow!("{} ({:?})", e.error(), e.debug()));
-                }
-                MessageView::Eos(_) => {
-                    break_err(&pipeline);
-                    bail!("the screen cast ended (the portal session was closed)");
-                }
+                MessageView::Error(e) => failure = Some(format!("{} ({:?})", e.error(), e.debug())),
+                MessageView::Eos(_) => failure = Some("the screen cast ended (the portal session was closed)".into()),
                 _ => {}
             }
         }
+        if let Some(why) = failure {
+            if encoded_total.load(Ordering::Relaxed) == 0 {
+                break Ok(Outcome::NoDmaBuf(why));
+            }
+            break Err(anyhow!(why));
+        }
     };
     let _ = pipeline.set_state(gst::State::Null);
-    drop(cast);
     result
 }
 
 /// What every tail is made of.
 struct TailShape {
     gl: bool,
+    dmabuf: bool,
     formats: &'static str,
     encoder: String,
     logical: Option<(i32, i32)>,
@@ -237,16 +289,16 @@ fn describe(shape: &TailShape, a: &Apply) {
     println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
 }
 
-fn build_tail(shape: &TailShape, a: &Apply, server: &Server, encoded: &Arc<AtomicU64>) -> Result<Tail> {
+fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<AtomicU64>, Arc<AtomicU64>)) -> Result<Tail> {
     let size = match (a.retina, shape.logical) {
         (false, Some((w, h))) => format!(",width={w},height={h}"),
         _ => String::new(),
     };
     let scale = if shape.gl {
-        format!("glupload ! glcolorconvert ! glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}")
+        format!("glcolorscale ! video/x-raw(memory:GLMemory),format=RGBA{size}")
     } else {
         let first = shape.formats.split(',').next().unwrap_or("I420");
-        format!("videoconvertscale ! video/x-raw,format={first}{size}")
+        format!("videoscale ! video/x-raw,format={first}{size}")
     };
     // The encoder's bitrate is the one asked for now (the template carries the first one).
     let encoder = shape.encoder.clone();
@@ -281,9 +333,10 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, encoded: &Arc<Atomi
             .build(),
     );
     if let Some(pad) = sink.static_pad("sink") {
-        let c = encoded.clone();
+        let (c, total) = (counters.0.clone(), counters.1.clone());
         pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             c.fetch_add(1, Ordering::Relaxed);
+            total.fetch_add(1, Ordering::Relaxed);
             gst::PadProbeReturn::Ok
         });
     }
@@ -297,31 +350,36 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, encoded: &Arc<Atomi
 fn replace_tail(
     pipeline: &gst::Pipeline,
     gate: &gst::Element,
+    head: &gst::Element,
     old: Tail,
     shape: &TailShape,
     a: &Apply,
     server: &Server,
-    encoded: &Arc<AtomicU64>,
+    counters: &(Arc<AtomicU64>, Arc<AtomicU64>),
     streaming: bool,
 ) -> Result<Tail> {
     gate.set_property("drop", true);
     // A buffer already past the valve finishes its trip through the old tail first.
     std::thread::sleep(Duration::from_millis(40));
-    gate.unlink(&old.bin);
+    head.unlink(&old.bin);
     old.bin.set_state(gst::State::Null).context("stopping the old encoder")?;
     pipeline.remove(&old.bin)?;
-    let tail = build_tail(shape, a, server, encoded)?;
+    let tail = build_tail(shape, a, server, counters)?;
     pipeline.add(&tail.bin)?;
-    gate.link(&tail.bin).context("linking the new encoder")?;
+    // Linked without the up-front caps check (a GL element with no context yet cannot vouch for
+    // GL caps); the caps are still checked when the first buffer's arrive.
+    let (src, sink) = (head.static_pad("src"), tail.bin.static_pad("sink"));
+    match (src, sink) {
+        (Some(src), Some(sink)) => {
+            src.link_full(&sink, gst::PadLinkCheck::empty()).map_err(|e| anyhow!("linking the new encoder: {e:?}"))?;
+        }
+        _ => bail!("linking the new encoder: no pads"),
+    }
     tail.bin.sync_state_with_parent().context("starting the new encoder")?;
     if streaming {
         gate.set_property("drop", false);
     }
     Ok(tail)
-}
-
-fn break_err(pipeline: &gst::Pipeline) {
-    let _ = pipeline.set_state(gst::State::Null);
 }
 
 /// The first HEVC encoder this machine has: the input formats it takes, the element with its
