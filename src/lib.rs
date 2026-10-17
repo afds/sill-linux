@@ -11,6 +11,7 @@ pub mod input;
 pub mod gestures;
 pub mod clipboard;
 pub mod pointer;
+#[cfg(feature = "capture")]
 pub mod restore;
 pub mod remote;
 pub mod icon;

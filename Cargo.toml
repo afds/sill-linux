@@ -3,7 +3,11 @@ name = "sill-linux"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A Linux (Wayland) host for the Sill iPhone and iPad app (unofficial, separate project)"
+description = "Linux (Wayland) host for the Sill iPhone and iPad app (unofficial)"
+repository = "https://github.com/afds/sill-linux"
+readme = "README.md"
+# Let chains (2024 edition) and u32::is_multiple_of.
+rust-version = "1.88"
 publish = false
 
 [dependencies]
@@ -30,3 +34,22 @@ default = ["capture"]
 # without it (--no-default-features) the protocol and server still build and test.
 capture = ["dep:ashpd", "dep:futures-util", "dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 futures-util = ["dep:futures-util"]
+
+# `cargo deb` (cargo-deb): the Ubuntu package. Runtime: GStreamer's PipeWire source, GL upload,
+# the HEVC encoders and h265parse (plugins-bad: nvh265enc, vah265enc, x265enc), and Avahi's
+# avahi-publish for discovery; the GStreamer libraries themselves come from $auto.
+[package.metadata.deb]
+maintainer = "Deniss Afonin <deniss.afonin@gmail.com>"
+copyright = "2026 Deniss Afonin"
+license-file = ["LICENSE", "0"]
+section = "video"
+priority = "optional"
+depends = "$auto, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-bad, gstreamer1.0-gl, avahi-utils"
+suggests = "qrencode"
+extended-description = "Streams this Linux desktop, or a single window or monitor, to the Sill app on an iPhone or iPad, which takes the input back: taps, the trackpad, keys and the clipboard. Pairing by code, TLS 1.3 with pinned keys. GNOME on Wayland gets the most (single windows need the extension it installs); other Wayland desktops stream the whole desktop through the portal. Unofficial: not made or supported by Sill's author."
+assets = [
+    ["target/release/sill-linux", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/sill-linux/README.md", "644"],
+    ["NOTICE", "usr/share/doc/sill-linux/NOTICE", "644"],
+]
+

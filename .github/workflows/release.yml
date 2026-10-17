@@ -1,0 +1,51 @@
+# A pushed tag vX.Y.Z (Cargo.toml's version) builds, tests and packages on Ubuntu 24.04, and makes
+# the GitHub release with the .deb and its SHA-256.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The tag names Cargo.toml's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME is not v$version (Cargo.toml)." >&2
+            exit 1
+          fi
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Package
+        run: |
+          cargo install cargo-deb --locked --version 3.8.0
+          cargo deb --locked
+          cd target/debian
+          sha256sum ./*.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/debian/*.deb target/debian/SHA256SUMS --verify-tag --generate-notes --title "sill-linux $GITHUB_REF_NAME"

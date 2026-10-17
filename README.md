@@ -34,7 +34,7 @@ protocol (pinned in [SILL_REFERENCE.md](SILL_REFERENCE.md)), so the app needs no
   once at home, and the app keeps this machine as a "Remote" row it dials from anywhere the VPN
   reaches, on the same port and with the same encryption. `--no-remote` turns it off.
 
-Not supported: audio, a virtual display, and connections from the open internet (port forwarding).
+Not supported: audio and a virtual display.
 
 ## Requirements
 
@@ -45,14 +45,27 @@ Not supported: audio, a virtual display, and connections from the open internet 
 - Avahi's `avahi-publish`, for discovery.
 - The Sill app 0.5.1 or later, on the same network.
 
-## Build and install
+## Install
+
+On Ubuntu 24.04 or later, download the `.deb` from the
+[latest release](https://github.com/afds/sill-linux/releases/latest), then:
+
+```
+sudo apt install ./sill-linux_*_amd64.deb
+sill-linux --install-extension   # GNOME: windows, displays, pointer, gestures, clipboard, the pairing window
+sill-linux --install-service     # starts with your session
+```
+
+To build from source instead (any distribution with Rust 1.88 or later):
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
 cargo build --release
-./target/release/sill-linux --install-extension   # GNOME: windows, pointer, gestures, clipboard
-./target/release/sill-linux --install-service     # starts with your session
+./target/release/sill-linux --install-extension
+./target/release/sill-linux --install-service
 ```
+
+`cargo deb` (from `cargo install cargo-deb`) makes the package in `target/debian/`.
 
 After `--install-extension`, log out and in once: GNOME loads an extension's code only at login.
 The extension is a thin layer that reports GNOME's state and carries out plain actions; the
@@ -63,7 +76,7 @@ GNOME's orange sharing indicator shows only while a device streams. Its stop but
 session: the device says sharing was stopped and waits for a tap to connect again.
 
 The service's output: `journalctl --user -u sill-linux -f`. Remove it with
-`--uninstall-service`. To run in a terminal instead: `./target/release/sill-linux`. Ctrl-C tells
+`--uninstall-service`. To run in a terminal instead: `sill-linux`. Ctrl-C tells
 devices the host quit, and they reconnect by themselves when it is back.
 
 A firewall must let the device in: TCP on the port (47460 by default) and mDNS, e.g.

@@ -673,7 +673,7 @@ both, and sill-linux puts its own port in `remotePort` (`remote.rs`, `PairingDoo
   WireGuard into home needs no tunnel on this machine: the device dials the home-network address
   through its own tunnel. The door already admits private, CGNAT (Tailscale) and ULA sources.
 - `--no-remote`: `remoteAccess` false and no addresses.
-- Not here: Sill for Mac's MagicDNS name, the internet switch (router, port forwards, global IPv6),
+- Not here: Sill for Mac's MagicDNS name,
   pairing from away (the pairing link carries no addresses), and its 8-session cap and 8 s eviction
   for remote clients (this door's eviction applies to every client).
 
@@ -721,3 +721,21 @@ listed, its stream 1024×768 while the Desktop stays 1280×800, four 208×156 th
 tap at the middle of its picture put the pointer at (1792, 384), the second monitor's middle.
 Not checked: the pointer shown on the device over a display, a monitor plugged in or out while
 streaming, mixed scales.
+
+## Packaging and CI (2026-10-17)
+
+- `cargo deb` (cargo-deb 3.8.0, `[package.metadata.deb]` in Cargo.toml) makes
+  `sill-linux_‹version›-1_amd64.deb`: the binary, README, NOTICE and the license. Depends: the
+  GStreamer libraries ($auto), gstreamer1.0-pipewire (pipewiresrc), -plugins-base (videoconvert,
+  appsink), -gl (glupload), -plugins-bad (nvh265enc, vah265enc, x265enc, h265parse) and
+  avahi-utils (avahi-publish); suggests qrencode (the terminal's QR code).
+- `.github/workflows/ci.yml`: pushes to main, pull requests and by hand, on Ubuntu 24.04: build,
+  test, test without the capture feature, clippy (warnings allowed), and the package as an
+  artifact. `release.yml`: a pushed tag `v‹version›` (refused unless it matches Cargo.toml) tests,
+  packages and makes the GitHub release with the .deb and SHA256SUMS. Actions pinned by commit
+  (checkout v7.0.1, cache v6.1.0, upload-artifact v7.0.1, as Sill's own CI).
+- Checked here: the CI steps in a clean ubuntu:24.04 container (51 tests, 47 without capture, the
+  package), and that package installing and running in a clean ubuntu:26.04 (no missing library,
+  every GStreamer plugin above present). Not run on GitHub yet.
+- Found doing it: the build without the capture feature had broken (`restore.rs` uses the
+  extension client's frame type); it is now built only with capture.
