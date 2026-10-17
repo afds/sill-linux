@@ -128,6 +128,10 @@ pub struct Translator {
     box_h: f64,
     command: CommandKey,
     last_motion: Option<(f64, f64)>,
+    /// When this translator last placed the pointer (with `last_motion`): within `RESYNC_AFTER`
+    /// the pointer is taken to be there still, so a place outside the box is reached by relative
+    /// motion alone, from there.
+    placed_at: Option<Instant>,
     /// evdev keycodes this device holds down, with how many of its keys hold each (both Ctrl and
     /// Command can be Ctrl).
     held: BTreeMap<i32, u32>,
@@ -162,6 +166,9 @@ pub struct Translator {
 /// (a twitch of tens of milliseconds, or a pause first) and a drag (the app's press and hold needs
 /// 0.45 s of stillness) are kept; a press with no release within `TAP_WINDOW` (the Pencil after
 /// hovering) goes through that much later.
+/// How long the pointer is taken to stay where this translator put it (see `motion`).
+const RESYNC_AFTER: Duration = Duration::from_secs(1);
+
 const TAP_AFTER_MOVE: Duration = Duration::from_millis(120);
 const MOVE_RUN: Duration = Duration::from_millis(150);
 const STROKE_GAP: Duration = Duration::from_millis(150);
@@ -178,6 +185,7 @@ impl Translator {
             box_h: height,
             command,
             last_motion: None,
+            placed_at: None,
             held: BTreeMap::new(),
             buttons: Vec::new(),
             command_down: 0,
@@ -220,22 +228,32 @@ impl Translator {
 
     /// To `x`, `y` (fractions of the picture). GNOME at scale 2 accepts absolute positions only
     /// inside the size it reports (1920×1080) yet reads them in the stream's pixels (3840×2160),
-    /// so absolute motion reaches only the top-left quarter (measured, 2026-10-17): a place past
-    /// the box is reached by the nearest point inside it, then relative motion in logical pixels.
-    fn motion(&mut self, x: f64, y: f64, out: &mut Vec<Action>) {
+    /// so absolute motion reaches only the top-left quarter (measured, 2026-10-17). Outside that
+    /// box the pointer moves by relative motion in logical pixels from where this translator put it
+    /// last; only when it has not placed the pointer for `RESYNC_AFTER` (the local mouse may have
+    /// moved it) does it first jump to the box's nearest point. A jump on every move made the
+    /// pointer flicker to the screen's middle and back on the host (2026-10-17).
+    fn motion(&mut self, x: f64, y: f64, now: Instant, out: &mut Vec<Action>) {
         // At most the last pixel: the portal refuses a position at the stream's width or height.
         let p = ((x.clamp(0.0, 1.0) * self.width).min(self.width - 1.0), (y.clamp(0.0, 1.0) * self.height).min(self.height - 1.0));
         if self.last_motion == Some(p) {
+            self.placed_at = Some(now);
             return;
         }
-        self.last_motion = Some(p);
         let inside = (p.0.min(self.box_w - 1.0).max(0.0), p.1.min(self.box_h - 1.0).max(0.0));
-        out.push(Action::Motion { x: inside.0, y: inside.1 });
-        if inside != p {
-            // Stream pixels per logical pixel.
-            let (sx, sy) = (self.width / self.box_w, self.height / self.box_h);
-            out.push(Action::RelMotion { dx: (p.0 - inside.0) / sx, dy: (p.1 - inside.1) / sy });
+        // Stream pixels per logical pixel.
+        let (sx, sy) = (self.width / self.box_w, self.height / self.box_h);
+        let recent = self.placed_at.is_some_and(|t| now.duration_since(t) <= RESYNC_AFTER);
+        match self.last_motion {
+            _ if inside == p => out.push(Action::Motion { x: p.0, y: p.1 }),
+            Some(from) if recent => out.push(Action::RelMotion { dx: (p.0 - from.0) / sx, dy: (p.1 - from.1) / sy }),
+            _ => {
+                out.push(Action::Motion { x: inside.0, y: inside.1 });
+                out.push(Action::RelMotion { dx: (p.0 - inside.0) / sx, dy: (p.1 - inside.1) / sy });
+            }
         }
+        self.last_motion = Some(p);
+        self.placed_at = Some(now);
     }
 
     fn press(&mut self, code: i32, out: &mut Vec<Action>) {
@@ -288,7 +306,7 @@ impl Translator {
         }
         match event {
             InputEvent::Pointer { action, x, y } => {
-                self.motion(x, y, &mut out);
+                self.motion(x, y, now, &mut out);
                 if action == PointerAction::Move {
                     if self.last_move.is_none_or(|l| now.duration_since(l) > STROKE_GAP) {
                         self.moves_since = Some(now);
@@ -321,11 +339,11 @@ impl Translator {
                 }
             }
             InputEvent::Scroll { x, y, dx, dy } => {
-                self.motion(x, y, &mut out);
+                self.motion(x, y, now, &mut out);
                 out.push(Action::Axis { dx: -dx * self.width, dy: -dy * self.height });
             }
             InputEvent::ScrollGesture { phase, x, y } => {
-                self.motion(x, y, &mut out);
+                self.motion(x, y, now, &mut out);
                 match phase {
                     ScrollPhase::Began => {
                         self.in_gesture = true;
@@ -585,12 +603,20 @@ mod tests {
         tr.set_size(3840.0, 2160.0); // GNOME at scale 2: the stream's own pixels
         let a = tr.handle(InputEvent::Pointer { action: PointerAction::Move, x: 0.2, y: 0.3 }, now);
         assert_eq!(a, vec![Action::Motion { x: 768.0, y: 648.0 }]);
-        // Past the 1920×1080 box the portal accepts: its edge, then the rest relative (logical).
+        // Past the 1920×1080 box the portal accepts, right after placing it at (768, 648): relative
+        // from there, in logical pixels.
         let a = tr.handle(InputEvent::Pointer { action: PointerAction::Move, x: 0.8, y: 0.75 }, now);
-        assert_eq!(a, vec![Action::Motion { x: 1919.0, y: 1079.0 }, Action::RelMotion { dx: 576.5, dy: 270.5 }]);
-        // The far corner.
+        assert_eq!(a, vec![Action::RelMotion { dx: 1152.0, dy: 486.0 }]);
+        // Then the far corner, straight after: relative from there, no jump through the middle.
         let a = tr.handle(InputEvent::Pointer { action: PointerAction::Move, x: 1.0, y: 1.0 }, now);
-        assert_eq!(a, vec![Action::Motion { x: 1919.0, y: 1079.0 }, Action::RelMotion { dx: 960.0, dy: 540.0 }]);
+        assert_eq!(a, vec![Action::RelMotion { dx: 383.5, dy: 269.5 }]);
+        // After a pause the local mouse may have moved it: one jump to the box first.
+        let later = now + Duration::from_secs(2);
+        let a = tr.handle(InputEvent::Pointer { action: PointerAction::Move, x: 0.9, y: 0.9 }, later);
+        assert_eq!(a, vec![Action::Motion { x: 1919.0, y: 1079.0 }, Action::RelMotion { dx: 768.5, dy: 432.5 }]);
+        // Back inside the box: absolute again.
+        let a = tr.handle(InputEvent::Pointer { action: PointerAction::Move, x: 0.1, y: 0.1 }, later);
+        assert_eq!(a, vec![Action::Motion { x: 384.0, y: 216.0 }]);
         // At scale 1 the box is the picture: never relative.
         let mut one = t();
         let a = one.handle(InputEvent::Pointer { action: PointerAction::Move, x: 1.0, y: 1.0 }, now);
