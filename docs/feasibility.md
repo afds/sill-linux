@@ -655,3 +655,30 @@ right after it opened, then sizing it, sometimes crashed GNOME Shell 50 ("Failed
 content to framebuffer", then `meta_multi_texture_get_n_planes: assertion failed`, then a
 segfault). After these two fixes it did not happen in six runs, but the cause is GNOME's and
 timing-dependent, so it may not be gone. On a real session a GNOME Shell crash logs the user out.
+
+## Away from home (2026-10-17)
+
+The app has no separate protocol for away from home. A host sends kind 18 (Sill's
+`SignedMacInfo`) in every session; a device that paired with it saves the addresses (only from a
+TLS session pinned to that key, only when `remoteAccess` is true and the list is not empty). Off
+the host's network, the saved host shows as a "Remote" row, and a tap dials those addresses with
+the same TLS 1.3 handshake, ALPN `sill/1`, at `address.port ?? remotePort`. So one port serves
+both, and sill-linux puts its own port in `remotePort` (`remote.rs`, `PairingDoor::mac_info_message`).
+
+- Signed with the TLS key (DER ECDSA P-256/SHA-256 over the exact JSON bytes; plain padded base64
+  for `info`, `key` (the 65-byte point) and `sig`). Sent after the window list and the settings,
+  as Sill for Mac does, and again to every session when the addresses change (looked at every 30 s).
+- Addresses, at most 12: Tailscale's IPv4, other tunnels' (WireGuard, tun, point-to-point)
+  IPv4, tunnels' IPv6, then this network's IPv4; never loopback, link-local or container bridges.
+  WireGuard into home needs no tunnel on this machine: the device dials the home-network address
+  through its own tunnel. The door already admits private, CGNAT (Tailscale) and ULA sources.
+- `--no-remote`: `remoteAccess` false and no addresses.
+- Not here: Sill for Mac's MagicDNS name, the internet switch (router, port forwards, global IPv6),
+  pairing from away (the pairing link carries no addresses), and its 8-session cap and 8 s eviction
+  for remote clients (this door's eviction applies to every client).
+
+Checked with Sill's own `sillclient.py` in the nested shell: kind 18 arrives third (kinds 2, 16,
+18), and its check passes: openssl verifies the signature, the Mac ID matches the key and the
+key matches the pin. With `--no-remote`: `remoteAccess` 0 and no addresses. Not checked on a
+device: the Remote row, the dial through WireGuard, and the app moving a remote session home by
+itself.

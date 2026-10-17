@@ -12,6 +12,7 @@ pub mod gestures;
 pub mod clipboard;
 pub mod pointer;
 pub mod restore;
+pub mod remote;
 pub mod settings;
 pub mod notify;
 pub mod service;

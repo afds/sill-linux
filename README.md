@@ -27,7 +27,11 @@ protocol (pinned in [SILL_REFERENCE.md](SILL_REFERENCE.md)), so the app needs no
 - **The clipboard both ways**, text only. It skips copies a password manager marks; turn it off
   with `--no-clipboard`. The app's 0.5.1 lacks this; it needs a later app version.
 
-Not supported: audio, a virtual display, and Sill's remote access (away from home) door.
+- **Away from home** through your own VPN (WireGuard into your home network, Tailscale): connect
+  once at home, and the app keeps this machine as a "Remote" row it dials from anywhere the VPN
+  reaches, on the same port and with the same encryption. `--no-remote` turns it off.
+
+Not supported: audio, a virtual display, and connections from the open internet (port forwarding).
 
 ## Requirements
 
@@ -85,7 +89,8 @@ QR code if `qrencode` is installed). Each device pairs once; after that a tap co
 ```
 sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
            [--show-cursor] [--keep-all-taps] [--choose-screen] [--portal] [--monitor CONNECTOR]
-           [--no-notifications] [--no-clipboard] [--command-key ctrl|super] [--forget-devices]
+           [--no-notifications] [--no-clipboard] [--no-remote] [--command-key ctrl|super]
+           [--forget-devices]
 ```
 
 - `--monitor DP-3` picks another monitor on GNOME (the primary by default).
@@ -94,6 +99,7 @@ sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-
 - `--keep-all-taps` clicks every tap. By default, a slow nudge followed by a lift is not clicked,
   since the app's trackpad can report it as a tap.
 - `--view-only` takes no input.
+- `--no-remote` keeps this machine's addresses from paired devices, so there is no Remote row.
 
 With a device streaming, the host prints a `[1s]` line: frames captured, encoded, sent and
 dropped, and the device's own frame age and round trip.

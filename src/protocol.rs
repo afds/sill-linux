@@ -34,6 +34,7 @@ pub mod kind {
     pub const WINDOW_COMMAND: u8 = 15;
     pub const HOST_SETTINGS: u8 = 16;
     pub const CHANGE_SETTINGS: u8 = 17;
+    pub const MAC_INFO: u8 = 18;
     pub const PAIR_REQUEST: u8 = 19;
     pub const PAIR_RESULT: u8 = 20;
     pub const GOODBYE: u8 = 22;

@@ -29,6 +29,15 @@ pub fn b64url(data: &[u8]) -> String {
     out
 }
 
+/// Plain base64 with padding (RFC 4648 §4), as Foundation's `base64EncodedString`.
+pub fn b64(data: &[u8]) -> String {
+    let mut out: String = b64url(data).chars().map(|c| match c { '-' => '+', '_' => '/', c => c }).collect();
+    while out.len() % 4 != 0 {
+        out.push('=');
+    }
+    out
+}
+
 /// Decodes canonical unpadded base64url; None for anything else.
 pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
@@ -270,6 +279,10 @@ mod tests {
         assert!(!is_valid_device_proof(&mac_proof(&qr, &fp_mac, &fp_dev), &qr, &fp_dev, &fp_mac));
 
         assert_eq!(mac_id(&sha256(b"example")), "A3C5HR4RBV67YR21");
+        assert_eq!(b64(b"f"), "Zg==");
+        assert_eq!(b64(b"fo"), "Zm8=");
+        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(&[0xfb, 0xff]), "+/8=");
         assert_eq!(mac_id(&[0u8; 32]), "0000000000000000");
         assert_eq!(mac_id(&[0xffu8; 32]), "ZZZZZZZZZZZZZZZZ");
 

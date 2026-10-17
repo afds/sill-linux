@@ -404,6 +404,10 @@ impl Server {
         })?;
         let ticker = self.clone();
         thread::Builder::new().name("ticker".into()).spawn(move || ticker.tick_loop())?;
+        if matches!(self.door, Door::Tls(_)) {
+            let watcher = self.clone();
+            thread::Builder::new().name("addresses".into()).spawn(move || watcher.watch_addresses())?;
+        }
         Ok(local)
     }
 
@@ -479,6 +483,11 @@ impl Server {
             st.next_id += 1;
             let _ = tx.send(self.window_list(&st));
             let _ = tx.send(self.settings_message(&st, None));
+            // After the window list and the settings, as Sill for Mac: where to find this machine
+            // from away (only over TLS, where the device can check the signature).
+            if let Some(m) = self.mac_info_message(&crate::remote::addresses()) {
+                let _ = tx.send(m);
+            }
             for (app, png) in &st.icons {
                 let _ = tx.send(icon_message(app, png));
             }
@@ -1000,6 +1009,40 @@ impl Server {
             let _ = self.control.send(Control::Stop);
         }
         self.reapply(&st);
+    }
+
+    fn mac_info_message(&self, addresses: &[crate::remote::Address]) -> Option<Vec<u8>> {
+        match &self.door {
+            Door::Tls(d) => d.mac_info_message(addresses),
+            Door::Plain => None,
+        }
+    }
+
+    /// Away from home: says which addresses devices are told, and tells every device again when
+    /// they change (a VPN up or down, another network). Looked at every 30 s.
+    fn watch_addresses(&self) {
+        let mut last = None;
+        loop {
+            let now = crate::remote::addresses();
+            if last.as_ref() != Some(&now) {
+                if !crate::remote::enabled() {
+                    println!("Away from home: off (--no-remote); devices are not told this machine's addresses.");
+                } else if now.is_empty() {
+                    println!("Away from home: no address to give devices yet.");
+                } else {
+                    let list: Vec<String> = now.iter().map(|a| format!("{} ({})", a.host, a.via)).collect();
+                    println!("Away from home: paired devices are told {} (--no-remote: never).", list.join(", "));
+                }
+                if last.is_some()
+                    && let Some(m) = self.mac_info_message(&now) {
+                        for c in self.state.lock().unwrap().clients.values() {
+                            let _ = c.tx.send(m.clone());
+                        }
+                    }
+                last = Some(now);
+            }
+            thread::sleep(Duration::from_secs(30));
+        }
     }
 
     /// Sharing was stopped on this machine (GNOME's indicator): every device is told, in words the

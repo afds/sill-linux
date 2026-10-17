@@ -109,6 +109,23 @@ impl PairingDoor {
         }))
     }
 
+    /// Kind 18: this machine's name, port and addresses, signed with the key its TLS certificate
+    /// carries (Sill's `SignedMacInfo`: plain base64 of the JSON bytes, the 65-byte point and a
+    /// DER ECDSA P-256 / SHA-256 signature over those bytes).
+    pub fn mac_info_message(&self, addresses: &[crate::remote::Address]) -> Option<Vec<u8>> {
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let rng = ring::rand::SystemRandom::new();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &self.identity.key_pkcs8, &rng).ok()?;
+        let info = crate::remote::mac_info(&self.identity.mac_id, &self.host_name, self.port, addresses, protocol::now());
+        let sig = pair.sign(&rng, &info).ok()?;
+        let payload = serde_json::json!({
+            "info": pairing::b64(&info),
+            "key": pairing::b64(pair.public_key().as_ref()),
+            "sig": pairing::b64(sig.as_ref()),
+        });
+        Some(protocol::message(kind::MAC_INFO, protocol::now(), false, payload.to_string().as_bytes()))
+    }
+
     pub fn acceptor(&self) -> &TlsAcceptor {
         &self.acceptor
     }
@@ -511,5 +528,35 @@ mod tests {
         assert!(ok("2001:db8:1:2::9", &[("2001:db8:1:2::1", 64)]));
         assert!(!ok("2001:db8:1:3::9", &[("2001:db8:1:2::1", 64)]));
         assert!(!ok("8.8.8.8", &[("0.0.0.0", 0)]), "a /0 never admits everything");
+    }
+
+    #[test]
+    fn signed_mac_info() {
+        let dir = std::env::temp_dir().join(format!("sill-linux-test-{}", uuid::Uuid::new_v4()));
+        let identity = Identity::load_or_create(&dir).unwrap();
+        let (fp, mac_id) = (identity.fingerprint, identity.mac_id.clone());
+        let door = PairingDoor::new(identity, true, "plexy".into(), 47460).unwrap();
+        let a = [crate::remote::Address { host: "10.8.0.2".into(), kind: "vpn", via: "VPN (wg0)".into() }];
+        let msg = door.mac_info_message(&a).unwrap();
+        let h = protocol::Header::parse(msg[..protocol::HEADER_LEN].try_into().unwrap());
+        assert_eq!(h.kind, kind::MAC_INFO);
+        let v: serde_json::Value = serde_json::from_slice(&msg[protocol::HEADER_LEN..]).unwrap();
+        let unb64 = |k: &str| b64url_decode(v[k].as_str().unwrap().trim_end_matches('=').replace('+', "-").replace('/', "_").as_str()).unwrap();
+        let (info, key, sig) = (unb64("info"), unb64("key"), unb64("sig"));
+        // As the app checks: the DER signature over the exact bytes, by that 65-byte point...
+        assert_eq!(key.len(), 65);
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &key).verify(&info, &sig).unwrap();
+        // ...whose SPKI fingerprint is the TLS key's, and whose Mac ID is the one inside.
+        let mut spki = hex_bytes("3059301306072a8648ce3d020106082a8648ce3d030107034200");
+        spki.extend_from_slice(&key);
+        assert_eq!(pairing::sha256(&spki), fp);
+        let info: serde_json::Value = serde_json::from_slice(&info).unwrap();
+        assert_eq!(info["macID"], mac_id.as_str());
+        assert_eq!(info["addresses"][0]["host"], "10.8.0.2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn hex_bytes(h: &str) -> Vec<u8> {
+        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
     }
 }

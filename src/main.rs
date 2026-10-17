@@ -10,6 +10,7 @@ use std::sync::mpsc;
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
                   [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
                   [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR] [--no-clipboard]
+                  [--no-remote]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
        sill-linux --install-extension                 GNOME: list single windows in the app's bar
@@ -95,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
             "--monitor" => a.monitor = Some(value("--monitor")?),
             "--no-notifications" => a.notifications = false,
             "--no-clipboard" => a.clipboard = false,
+            "--no-remote" => sill_linux::remote::set_enabled(false),
             "--install-service" => {
                 a.service = Some(true);
                 continue;
