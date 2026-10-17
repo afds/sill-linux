@@ -854,6 +854,11 @@ fn display(id: u64) -> Option<crate::mutter::Monitor> {
     DISPLAYS.lock().unwrap().iter().find(|(i, _)| *i == id).map(|(_, m)| m.clone())
 }
 
+/// A display's app id: its own, so each is a row of its own in the app's Apps drawer.
+fn display_app(m: &crate::mutter::Monitor) -> String {
+    format!("sill-linux.display.{}", m.connector)
+}
+
 fn is_display(source: Source) -> bool {
     matches!(source, Source::Window(id) if id & DISPLAY_ID != 0)
 }
@@ -1289,16 +1294,19 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
         if now_displays != displays {
             for (_, m) in now_displays.iter().filter(|d| !displays.contains(d)) {
                 println!("Displays: {} ({}, {}×{}) is offered with the windows.", m.name, m.connector, m.rect.2, m.rect.3);
+                server.add_icon(&display_app(m), crate::icon::display_icon());
             }
             displays = now_displays;
             *DISPLAYS.lock().unwrap() = displays.clone();
         }
         // The server sends the list only when it changed.
+        // The app shows a window's app name and icon, not its title: each display is an app of
+        // its own, named after the monitor.
         let hosts = displays.iter().map(|(id, m)| HostWindow {
             mutter_id: *id,
             title: format!("{} ({})", m.name, m.connector),
-            app_name: "Display".into(),
-            app_id: "sill-linux.display".into(),
+            app_name: format!("{} ({})", m.name, m.connector),
+            app_id: display_app(m),
             width: m.rect.2 as i64,
             height: m.rect.3 as i64,
         });

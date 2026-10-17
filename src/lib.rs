@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod pointer;
 pub mod restore;
 pub mod remote;
+pub mod icon;
 pub mod settings;
 pub mod notify;
 pub mod service;

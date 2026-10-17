@@ -704,8 +704,10 @@ code.
 ## More than one monitor (2026-10-17)
 
 The app has one Desktop button, so the other monitors go in the window list: each is a "window"
-whose id has the high bit set (Mutter's window ids are 32-bit) and a hash of its connector, app
-name "Display", title "‹name› (‹connector›)", its logical size, and a thumbnail of the whole
+whose id has the high bit set (Mutter's window ids are 32-bit) and a hash of its connector, its
+own app (`sill-linux.display.‹connector›`, named "‹name› (‹connector›)", with a monitor icon drawn
+here, `icon.rs`: the app shows a window's app name and icon, never its title, so a shared "Display"
+app read "Di" in the strip and "Display" in the drawer), its logical size, and a thumbnail of the whole
 monitor (extension version 4: `MonitorThumbnail`, a screenshot of its area, scaled). The list
 comes from `DisplayConfig.GetCurrentState` (logical sizes: the current mode over the scale in the
 logical layout mode, swapped for a quarter turn), looked at with every window change and every
