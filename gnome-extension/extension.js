@@ -329,7 +329,12 @@ class Service {
                 return none();
             const w = sprite.get_width(), h = sprite.get_height();
             const [hx, hy] = tracker.get_hot();
-            const scale = tracker.get_scale?.() || 1;
+            // The sprite is drawn for the monitor's scale (a size-24 cursor is 48 px at 200 %); its
+            // size in points is the cursor size the person set, as a Mac's cursor is in points.
+            // shortcut: the scale as the sprite's width over that size, rounded; a theme whose images
+            // are not square at the nominal size would read slightly off.
+            const nominal = new Gio.Settings({schema_id: 'org.gnome.desktop.interface'}).get_int('cursor-size') || 24;
+            const scale = Math.max(1, Math.round(Math.max(w, h) / nominal));
             const path = GLib.build_filenamev([this._dir, 'cursor.png']);
             const stream = Gio.File.new_for_path(path).replace(null, false, Gio.FileCreateFlags.NONE, null);
             // The sprite's pixels as GNOME's screenshots write them (Cogl's get_data gives JS nothing).

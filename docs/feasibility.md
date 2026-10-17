@@ -584,8 +584,10 @@ cursor; Mutter's `CursorTracker` holds the current sprite as a Cogl texture, and
 Found in the nested shell: Cogl's `get_data` fills nothing a GJS caller can read (every pixel
 transparent). `CursorChanged` follows `cursor-changed`; the host reads the shape at each change
 (the last of a burst, 30 ms on) while a device is connected, keeps the last for devices that
-connect, and sends it only when it differs. Hotspot and size are the sprite's pixels over the
-cursor's scale (points).
+connect, and sends it only when it differs. The app draws it at the size given, in its own points,
+as Sill for Mac sends the Mac's cursor in points. So the sprite's pixels are divided by its scale,
+taken as the sprite's size over the cursor size set in GNOME (`cursor-size`, 24), rounded: on the
+iPad mini the first build drew a 200 % cursor at 48 points, twice a Mac's.
 
 Verified in the nested shell with a test client moving the pointer from a corner onto the Text
 Editor and back: an arrow (hotspot 4, 4), an I-beam (11, 12), the arrow again, each 24×24 points,
