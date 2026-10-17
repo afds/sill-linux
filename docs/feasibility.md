@@ -365,3 +365,22 @@ On the iPad (2026-10-17): fullscreen YouTube keeps updating with DMA-BUF, "it wo
 Kept for anyone where it does not: a fullscreen YouTube video should keep updating with DMA-BUF (if not, the system
 switch `MUTTER_DEBUG_PAINT=disable-direct-scanout` in `~/.config/environment.d/`, then a new
 login, makes GNOME always composite).
+
+## Sound (parked, 2026-10-17)
+
+The App Store app plays no sound yet. Sill pull request #94 (Code-Tomato, "The Mac's sound on the
+device: Send Audio, kind 43, AAC-ELD", open and conflicting with main on 2026-10-17) adds it:
+kind 43 `audio`, host to device, only to a device whose hello lists `aac-eld`. Its payload is
+either `0x01` + JSON `AudioFormat` (`codec`, `sampleRate`, `channels`, `framesPerPacket`,
+`primingFrames`, `bitrate`, `epoch`, `cookie` (base64), `source`, `app`) or `0x02` + binary
+`AudioPackets`: `epoch` u16, `seq` u32, `segmentStart` u8, count u8, then each packet as length u16 +
+bytes (at most 255 packets, 16 KiB a message). Kinds 16 and 17 gain `sendAudio`, kind 16
+`audioNote`, ClientStats `audioBehindMs` and `audioLate`. 48 kHz stereo, 128 kbps.
+
+For this host once #94 ships: capture the default output's monitor from PipeWire (the Desktop's
+sound; one app's node once single windows exist), encode AAC-ELD with libfdk-aac directly
+(GStreamer's fdkaacenc offers lc, he-aac-v1/v2 and ld, not ELD; the library itself has AOT 39),
+and frame kind 43 as above. To settle first: the `cookie` the device's AudioToolbox decoder
+accepts (an AudioSpecificConfig, or an ESDS as Apple's encoder gives it); the PR's
+`AudioDecoder` and `docs/audio-plan.md` say. Decided (2026-10-17): wait until #94 ships rather than
+test against a Debug build of its branch.
