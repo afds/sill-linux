@@ -100,7 +100,7 @@ pub fn install_extension() -> Result<()> {
         std::fs::write(dir.join(name), text)?;
     }
     println!("Wrote the GNOME Shell extension to {}.", dir.display());
-    let enabled = Command::new("gnome-extensions").args(["enable", EXTENSION_UUID]).status();
+    let enabled = Command::new("gnome-extensions").args(["enable", EXTENSION_UUID]).stderr(std::process::Stdio::null()).status();
     match enabled {
         Ok(s) if s.success() => println!("Enabled it."),
         _ => {
