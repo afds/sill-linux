@@ -302,10 +302,6 @@ impl Client {
     pub async fn show_pairing(&self, title: &str, code: &str, modules: &str, width: u32, seconds: u32) -> bool {
         self.flag("ShowPairing", &(title, code, modules, width, seconds)).await
     }
-    /// Extension version 5: GNOME keeps screen casting on the lock screen while this process runs.
-    pub async fn set_unlock_from_device(&self, on: bool) -> bool {
-        self.flag("SetUnlockFromDevice", &(on,)).await
-    }
     pub async fn close_pairing(&self) {
         let _ = self.proxy.call_method("ClosePairing", &()).await;
     }

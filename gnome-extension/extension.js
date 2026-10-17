@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (5)
+//   Version() -> u                this interface's version (4)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -44,12 +44,6 @@
 //                                 -1 when there is none
 //   MinimizeWorkspace() -> at     minimizes the active workspace's listed windows; their ids
 //   Unminimize(at ids) -> b
-//   SetUnlockFromDevice(b on) -> b  on: GNOME no longer stops screen casting and remote control
-//                                 on the lock screen (main.js inhibits remote access there), so a
-//                                 device sees the lock screen and can unlock it; only while the
-//                                 caller (sill-linux, with --unlock-from-device) is on the bus. The
-//                                 extension stays enabled on the lock screen for this
-//                                 (session-modes); off, or the caller gone: GNOME's rule again
 //   ShowPairing(s title, s code, s modules, u width, u seconds) -> b   a pairing window in the
 //                                 middle of the primary monitor, above windows and without taking
 //                                 the keyboard: the title, a QR code (modules: width×width of '1'
@@ -124,7 +118,6 @@ const XML = `
     <method name="MinimizeWorkspace"><arg type="at" direction="out" name="ids"/></method>
     <method name="Unminimize"><arg type="at" direction="in" name="ids"/><arg type="b" direction="out" name="ok"/></method>
     <method name="MonitorThumbnail"><arg type="s" direction="in" name="connector"/><arg type="u" direction="in" name="maxSize"/><arg type="s" direction="out" name="path"/></method>
-    <method name="SetUnlockFromDevice"><arg type="b" direction="in" name="on"/><arg type="b" direction="out" name="ok"/></method>
     <method name="ShowPairing"><arg type="s" direction="in" name="title"/><arg type="s" direction="in" name="code"/><arg type="s" direction="in" name="modules"/><arg type="u" direction="in" name="width"/><arg type="u" direction="in" name="seconds"/><arg type="b" direction="out" name="ok"/></method>
     <method name="ClosePairing"/>
     <signal name="PairingCancelled"/>
@@ -134,7 +127,7 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 5;
+const VERSION = 4;
 
 function listed(w) {
     return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
@@ -528,52 +521,6 @@ class Service {
         return true;
     }
 
-    SetUnlockFromDeviceAsync([on], invocation) {
-        this._unlockFromDevice(on, invocation.get_sender());
-        invocation.return_value(new GLib.Variant('(b)', [true]));
-    }
-
-    // GNOME Shell's main.js calls inhibit_remote_access() as the lock screen comes up and
-    // uninhibit_remote_access() as it goes. While on, the inhibit made for the lock screen is
-    // skipped, and so is the uninhibit that matches it; everything else goes through.
-    _unlockFromDevice(on, sender) {
-        const c = global.backend.get_remote_access_controller();
-        if (!c)
-            return;
-        if (on && !this._unlockPatched) {
-            const proto = Object.getPrototypeOf(c);
-            this._skipped = 0;
-            c.inhibit_remote_access = () => {
-                if (Main.sessionMode.currentMode === 'unlock-dialog') {
-                    this._skipped++;
-                    return;
-                }
-                proto.inhibit_remote_access.call(c);
-            };
-            c.uninhibit_remote_access = () => {
-                if (this._skipped > 0) {
-                    this._skipped--;
-                    return;
-                }
-                proto.uninhibit_remote_access.call(c);
-            };
-            this._unlockPatched = c;
-            this._unlockWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, sender,
-                Gio.BusNameWatcherFlags.NONE, null, () => this._unlockFromDevice(false));
-        } else if (!on && this._unlockPatched) {
-            delete c.inhibit_remote_access;
-            delete c.uninhibit_remote_access;
-            this._unlockPatched = null;
-            if (this._unlockWatch) {
-                Gio.bus_unwatch_name(this._unlockWatch);
-                this._unlockWatch = 0;
-            }
-            // A lock screen still up: GNOME's inhibit, owed since it was skipped, now.
-            for (; this._skipped > 0; this._skipped--)
-                c.inhibit_remote_access();
-        }
-    }
-
     ClosePairing() {
         if (this._pairingTimer) {
             GLib.source_remove(this._pairingTimer);
@@ -642,7 +589,6 @@ class Service {
 
     disable() {
         this.ClosePairing();
-        this._unlockFromDevice(false);
         for (const id of this._signals)
             global.display.disconnect(id);
         if (this._cursorSignal) {

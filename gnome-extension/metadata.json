@@ -9,9 +9,5 @@
     "51"
   ],
   "url": "https://github.com/afds/sill-linux",
-  "version": 1,
-  "session-modes": [
-    "user",
-    "unlock-dialog"
-  ]
+  "version": 1
 }
