@@ -1,0 +1,14 @@
+sill-linux
+Copyright 2026 Deniss Afonin
+
+This product speaks the wire protocol of Sill (https://github.com/Saffsanity/sill),
+Copyright 2026 Noah Saffer, licensed under the Apache License, Version 2.0.
+
+Parts of this product are ports of Sill's Swift sources to Rust, and carry its rules and
+constants: the message framing and kinds (Sources/StreamProtocol), the pairing exchange
+(Pairing.swift, RemoteIdentity.swift, RemoteTLS.swift), the pointer rules (PointerControl.swift,
+Pointer.swift), the clipboard rules (ClipboardPolicy.swift, Clipboard.swift), the host settings
+(HostSettings.swift, DeviceSettings.swift) and the trackpad gesture names (Gesture.swift).
+
+sill-linux is an independent project. It is not made, endorsed or supported by Sill's author.
+"Sill" names the app this host serves.
