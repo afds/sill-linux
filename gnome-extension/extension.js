@@ -16,6 +16,14 @@
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window, at most maxSize on its longer side,
 //                                 in $XDG_RUNTIME_DIR/sill-linux/ (0700); "" when it has none
 //   Activate(t id) -> b           unminimize, raise and focus
+//   ListApps() -> a(ss)           installed apps shown in the app grid: .desktop id, name
+//   AppIcon(s app, u size) -> s   a PNG of the app's icon, size×size, beside the thumbnails; ""
+//                                 when it has none
+//   Launch(s app) -> b            start the app (a running one is raised)
+//   Fit(t id, i w, i h) -> (iiiib)  resize the window's frame to w×h logical pixels where it is
+//                                 (unmaximized first); answers its frame before (x, y, w, h) and
+//                                 whether it was maximized; w 0: not touched (full screen, or gone)
+//   Restore(t id, i x, i y, i w, i h, b maximized) -> b   put a fitted window back
 //   Close(t id) -> b, Minimize(t id) -> b, ToggleFullscreen(t id) -> b
 //
 // Mutter's own screen-cast API already lets any unsandboxed process of this user record a window;
@@ -28,6 +36,8 @@ import Meta from 'gi://Meta';
 import Mtk from 'gi://Mtk';
 import Shell from 'gi://Shell';
 import Cairo from 'cairo';
+import GdkPixbuf from 'gi://GdkPixbuf';
+import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const BUS_NAME = 'org.sill_linux.Shell';
@@ -42,6 +52,22 @@ const XML = `
     </method>
     <method name="Geometry">
       <arg type="t" direction="in" name="id"/><arg type="(iiiiii)" direction="out" name="geometry"/>
+    </method>
+    <method name="ListApps"><arg type="a(ss)" direction="out" name="apps"/></method>
+    <method name="AppIcon">
+      <arg type="s" direction="in" name="app"/><arg type="u" direction="in" name="size"/>
+      <arg type="s" direction="out" name="path"/>
+    </method>
+    <method name="Launch"><arg type="s" direction="in" name="app"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="Fit">
+      <arg type="t" direction="in" name="id"/><arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/><arg type="(iiiib)" direction="out" name="before"/>
+    </method>
+    <method name="Restore">
+      <arg type="t" direction="in" name="id"/><arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/><arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/><arg type="b" direction="in" name="maximized"/>
+      <arg type="b" direction="out" name="ok"/>
     </method>
     <method name="Activate"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
     <method name="Close"><arg type="t" direction="in" name="id"/><arg type="b" direction="out" name="ok"/></method>
@@ -125,6 +151,67 @@ class Service {
             logError(e, 'sill-linux: thumbnail');
             return '';
         }
+    }
+
+    ListApps() {
+        return Shell.AppSystem.get_default().get_installed()
+            .filter(a => a.should_show())
+            .map(a => [a.get_id() ?? '', a.get_name() ?? ''])
+            .filter(([id, name]) => id && name)
+            .sort((a, b) => a[1].localeCompare(b[1]));
+    }
+
+    AppIcon(appId, size) {
+        try {
+            const app = Shell.AppSystem.get_default().lookup_app(appId);
+            const icon = app?.get_app_info()?.get_icon();
+            if (!icon)
+                return '';
+            const info = new St.IconTheme().lookup_by_gicon(icon, size, St.IconLookupFlags.FORCE_SIZE);
+            const file = info?.get_filename();
+            if (!file)
+                return '';
+            const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(file, size, size);
+            const path = GLib.build_filenamev([this._dir, `icon-${GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, appId, -1)}.png`]);
+            pixbuf.savev(path, 'png', [], []);
+            return path;
+        } catch (e) {
+            logError(e, 'sill-linux: app icon');
+            return '';
+        }
+    }
+
+    Launch(appId) {
+        const app = Shell.AppSystem.get_default().lookup_app(appId);
+        if (!app)
+            return false;
+        if (app.get_n_windows() > 0)
+            app.activate();
+        else
+            app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
+        return true;
+    }
+
+    Fit(id, width, height) {
+        const w = byId(id);
+        if (!w || w.is_fullscreen() || width < 1 || height < 1)
+            return [0, 0, 0, 0, false];
+        const f = w.get_frame_rect();
+        const maximized = w.is_maximized();
+        if (maximized)
+            w.unmaximize();
+        w.move_resize_frame(false, f.x, f.y, width, height);
+        return [f.x, f.y, f.width, f.height, maximized];
+    }
+
+    Restore(id, x, y, width, height, maximized) {
+        const w = byId(id);
+        if (!w || w.is_fullscreen())
+            return false;
+        w.move_resize_frame(false, x, y, width, height);
+        if (maximized)
+            w.maximize();
+        return true;
     }
 
     Activate(id) {

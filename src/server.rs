@@ -35,6 +35,20 @@ const EVICT_GRACE: Duration = Duration::from_secs(8);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Kind 4: bundleID length (u16 BE), the id, the PNG.
+fn icon_message(app: &str, png: &[u8]) -> Vec<u8> {
+    let mut p = (app.len() as u16).to_be_bytes().to_vec();
+    p.extend_from_slice(app.as_bytes());
+    p.extend_from_slice(png);
+    protocol::message(kind::APP_ICON, protocol::now(), false, &p)
+}
+
+/// Kind 5: `[AppInfo]`, `{"name", "bundleID"}`.
+fn apps_message(apps: &[(String, String)]) -> Vec<u8> {
+    let list: Vec<serde_json::Value> = apps.iter().map(|(id, name)| serde_json::json!({"name": name, "bundleID": id})).collect();
+    protocol::message(kind::APP_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
+}
+
 /// What the server asks of the capture side.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Control {
@@ -48,6 +62,11 @@ pub enum Control {
     Apply(Apply),
     /// A window's light from the device's bar: "close", "minimize" or "fullScreen".
     WindowCommand(u64, String),
+    /// Start an installed app (its .desktop id) from the device's All Apps; its window is picked.
+    Launch(String),
+    /// Aa: size the streamed window's frame to this many logical pixels (the device's panel over
+    /// its text scale).
+    Fit(u64, i32, i32),
 }
 
 /// What is streamed.
@@ -129,6 +148,11 @@ struct State {
     wire_ids: HashMap<u64, u32>,
     mutter_ids: HashMap<u32, u64>,
     next_wire_id: u32,
+    /// Installed apps (.desktop id, name) and their icons, sent to every device as it connects.
+    apps: Vec<(String, String)>,
+    icons: Vec<(String, Vec<u8>)>,
+    /// The last viewport any device sent (one stream: the last to report wins, as Sill for Mac).
+    viewport: Option<Viewport>,
 }
 
 #[derive(Clone)]
@@ -161,6 +185,9 @@ impl Server {
                 wire_ids: HashMap::new(),
                 mutter_ids: HashMap::new(),
                 next_wire_id: 1,
+                apps: Vec::new(),
+                icons: Vec::new(),
+                viewport: None,
             })),
             control,
             host_name: Arc::new(host_name),
@@ -269,6 +296,8 @@ impl Server {
         if !st.clients.is_empty() {
             println!("Quitting: told {} device{}.", st.clients.len(), if st.clients.len() == 1 { "" } else { "s" });
         }
+        // A window Aa sized goes back.
+        let _ = self.control.send(Control::Stop);
     }
 
     /// Where devices' input goes from now on.
@@ -365,6 +394,10 @@ impl Server {
             st.next_id += 1;
             let _ = tx.send(self.window_list(&st));
             let _ = tx.send(self.settings_message(&st, None));
+            for (app, png) in &st.icons {
+                let _ = tx.send(icon_message(app, png));
+            }
+            let _ = tx.send(apps_message(&st.apps));
             st.clients.insert(
                 id,
                 Client {
@@ -436,6 +469,7 @@ impl Server {
                     }
                 }
                 kind::WINDOW_COMMAND => self.window_command(id, &payload),
+                kind::LAUNCH_APP => self.launch(id, &payload),
                 kind::CHANGE_SETTINGS => match serde_json::from_slice::<HostSettingsChange>(&payload) {
                     Ok(change) => self.change_settings(id, change),
                     Err(e) => eprintln!("Bad settings change from client {id}: {e}"),
@@ -450,6 +484,10 @@ impl Server {
                         });
                         if changed == Some(true) {
                             self.reapply(&st);
+                        }
+                        st.viewport = Some(v.clone());
+                        if let Some(fit) = Self::fit_control(&st) {
+                            let _ = self.control.send(fit);
                         }
                         drop(st);
                         println!(
@@ -541,6 +579,69 @@ impl Server {
             let _ = c.tx.send(list.clone());
         }
         let _ = self.control.send(control);
+        if let Some(fit) = Self::fit_control(&st) {
+            let _ = self.control.send(fit);
+        }
+    }
+
+    /// Aa while a window streams: its frame sized to the panel over the text scale (nothing
+    /// before the device first sets Aa, as Sill for Mac).
+    fn fit_control(st: &State) -> Option<Control> {
+        let StreamSource::Window(w) = st.active else { return None };
+        let v = st.viewport.as_ref()?;
+        let scale = v.scale.filter(|s| *s > 0.0)?;
+        (v.width > 0.0 && v.height > 0.0).then_some(())?;
+        Some(Control::Fit(*st.mutter_ids.get(&w)?, (v.width / scale).round() as i32, (v.height / scale).round() as i32))
+    }
+
+    /// Picks a window for every device, as a device's pick does (an app launched from a device).
+    pub fn pick_window(&self, mutter_id: u64) {
+        let wire = self.state.lock().unwrap().wire_ids.get(&mutter_id).copied();
+        if let Some(w) = wire {
+            self.select(0, StreamSource::Window(w));
+        }
+    }
+
+    /// The installed apps, for the device's All Apps.
+    pub fn set_apps(&self, apps: Vec<(String, String)>) {
+        let mut st = self.state.lock().unwrap();
+        if st.apps == apps {
+            return;
+        }
+        st.apps = apps;
+        let msg = apps_message(&st.apps);
+        for c in st.clients.values() {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
+    /// An app's icon (PNG), kept for devices that connect later.
+    pub fn add_icon(&self, app: &str, png: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        let msg = icon_message(app, &png);
+        match st.icons.iter_mut().find(|(a, _)| a == app) {
+            Some(e) => e.1 = png,
+            None => st.icons.push((app.to_string(), png)),
+        }
+        for c in st.clients.values() {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
+    fn launch(&self, id: u64, payload: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct LaunchApp {
+            #[serde(rename = "bundleID")]
+            bundle_id: String,
+        }
+        let Ok(req) = serde_json::from_slice::<LaunchApp>(payload) else { return };
+        let st = self.state.lock().unwrap();
+        let Some((app, name)) = st.apps.iter().find(|(a, _)| *a == req.bundle_id).cloned() else {
+            println!("Client {id} asked to launch {:?}, which this host does not list.", req.bundle_id);
+            return;
+        };
+        println!("Launching {name} for client {id}");
+        let _ = self.control.send(Control::Launch(app));
     }
 
     /// The window list (from the GNOME Shell extension): sent to the devices when it changed. A
@@ -889,5 +990,29 @@ mod tests {
         assert_eq!(median_and_worst(-1, Some(-1)), "–");
         assert_eq!(median_and_worst(-1, Some(9)), "–/9 ms");
         assert_eq!(median_and_worst(7, None), "7 ms");
+    }
+
+    #[test]
+    fn apps_icons_and_aa() {
+        let icon = icon_message("org.gnome.Calculator.desktop", b"PNG");
+        assert_eq!(icon[0], kind::APP_ICON);
+        assert_eq!(&icon[14..16], &28u16.to_be_bytes());
+        assert_eq!(&icon[16..44], b"org.gnome.Calculator.desktop");
+        assert_eq!(&icon[44..], b"PNG");
+        let apps = apps_message(&[("org.gnome.Calculator.desktop".into(), "Calculator".into())]);
+        let v: serde_json::Value = serde_json::from_slice(&apps[14..]).unwrap();
+        assert_eq!(v, serde_json::json!([{"name": "Calculator", "bundleID": "org.gnome.Calculator.desktop"}]));
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let server = Server::new("test".into(), tx, Door::Plain, None);
+        let mut st = server.state.lock().unwrap();
+        st.wire_ids.insert(77, 1);
+        st.mutter_ids.insert(1, 77);
+        st.viewport = Some(Viewport { width: 1180.0, height: 760.0, scale: Some(1.5), fps: None });
+        assert_eq!(Server::fit_control(&st), None, "the Desktop is never resized");
+        st.active = StreamSource::Window(1);
+        assert_eq!(Server::fit_control(&st), Some(Control::Fit(77, 787, 507)));
+        st.viewport.as_mut().unwrap().scale = None;
+        assert_eq!(Server::fit_control(&st), None, "no Aa yet: the window is left alone");
     }
 }

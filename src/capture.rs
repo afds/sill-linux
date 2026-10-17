@@ -293,12 +293,25 @@ fn run_pipeline(
                     let _ = rec.send(RecReq::Command(id, action));
                 }
             }
+            Ok(Control::Launch(app)) => {
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Launch(app));
+                }
+            }
+            Ok(Control::Fit(id, w, h)) => {
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Fit(id, w, h));
+                }
+            }
             Ok(Control::Start(_)) => {
                 *streaming = true;
                 keyframe_pending = true;
             }
             Ok(Control::Stop) => {
                 *streaming = false;
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Release);
+                }
             }
             Ok(Control::Keyframe) => keyframe_pending = true,
             Ok(Control::Apply(a)) if a != *apply => {
@@ -721,7 +734,16 @@ type Recorder = UnboundedSender<RecReq>;
 enum RecReq {
     Record(Source, mpsc::Sender<Result<PortalCast>>),
     Command(u64, String),
+    Launch(String),
+    /// Aa: a window's frame to this size (logical pixels).
+    Fit(u64, i32, i32),
+    /// Nothing streams: every window Aa sized goes back.
+    Release,
 }
+
+/// An app launched from a device, and when: its first window listed within `LAUNCH_WAIT` is picked.
+static PENDING_LAUNCH: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+const LAUNCH_WAIT: Duration = Duration::from_secs(20);
 
 /// Asks the GNOME session for a source's PipeWire stream (from the pipeline's thread).
 fn record(rec: &Recorder, source: Source) -> Result<PortalCast> {
@@ -738,9 +760,44 @@ type Shown = Arc<std::sync::Mutex<(Arc<crate::mutter::Session>, crate::mutter::S
 /// first frame until something on it changes), the old one stopped once the new one runs.
 async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown, shell: Option<crate::shell::Client>, cursor: u32, mut rx: UnboundedReceiver<RecReq>) {
     let cast = |s: &crate::mutter::Stream| PortalCast { fd: None, node: s.node, size: s.size };
+    // Windows Aa sized, with their frames before: each goes back once it no longer streams, as
+    // Sill for Mac does (issue #57).
+    // shortcut: always the whole old frame, also after the user resized or moved it here; Sill for
+    // Mac leaves a window resized meanwhile (WindowRestore), worth it if that bites.
+    let mut fitted: HashMap<u64, crate::shell::Frame> = HashMap::new();
+    async fn restore(shell: &Option<crate::shell::Client>, fitted: &mut HashMap<u64, crate::shell::Frame>, keep: Option<u64>) {
+        let Some(s) = shell else { return };
+        let ids: Vec<u64> = fitted.keys().copied().filter(|id| Some(*id) != keep).collect();
+        for id in ids {
+            let f = fitted.remove(&id).unwrap();
+            if s.restore(id, f).await {
+                println!("Restored window {id} to {}×{} at {},{}{}.", f.width, f.height, f.x, f.y, if f.maximized { ", maximized" } else { "" });
+            }
+        }
+    }
     while let Some(req) = rx.recv().await {
         match req {
+            RecReq::Launch(app) => match &shell {
+                Some(s) if s.launch(&app).await => *PENDING_LAUNCH.lock().unwrap() = Some((app, Instant::now())),
+                _ => println!("Could not launch {app}."),
+            },
+            RecReq::Fit(id, w, h) => {
+                let Some(s) = &shell else { continue };
+                match s.fit(id, w, h).await {
+                    Some(before) => {
+                        println!("Resized window {id} to {w}×{h} for the device (Aa), from {}×{}.", before.width, before.height);
+                        fitted.entry(id).or_insert(before);
+                    }
+                    None => println!("Window {id} is full screen or gone; not resizing."),
+                }
+            }
+            RecReq::Release => restore(&shell, &mut fitted, None).await,
             RecReq::Record(source, reply) => {
+                let keep = match source {
+                    Source::Window(id) => Some(id),
+                    Source::Desktop => None,
+                };
+                restore(&shell, &mut fitted, keep).await;
                 if let (Source::Window(id), Some(s)) = (source, &shell) {
                     // Raised and focused, as Sill for Mac raises a picked window: keys go to it.
                     s.command("Activate", id).await;
@@ -809,6 +866,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
     let mut last_clients = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut failed = false;
+    let mut apps_sent = false;
     loop {
         let changed = tokio::select! {
             c = async { match changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => c.is_some(),
@@ -843,8 +901,37 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
                     *FRAME_INSETS.lock().unwrap() = Some((id, i));
                 }
             }
-            if changed {
-                continue;
+        }
+        let pending = PENDING_LAUNCH.lock().unwrap().clone();
+        if let Some((app, at)) = pending {
+            if at.elapsed() > LAUNCH_WAIT {
+                *PENDING_LAUNCH.lock().unwrap() = None;
+            } else if let Some(w) = list.iter().rev().find(|w| w.app_id == app) {
+                // The topmost of the app's windows: a running app's raised one, or its new one.
+                *PENDING_LAUNCH.lock().unwrap() = None;
+                server.pick_window(w.id);
+            }
+        }
+        if changed {
+            continue;
+        }
+        if !apps_sent {
+            // After the window list, once: the installed apps and their icons (64 px, as Sill
+            // for Mac). shortcut: apps installed later show after a restart of this host.
+            apps_sent = true;
+            match shell.apps().await {
+                Ok(apps) => {
+                    server.set_apps(apps.clone());
+                    let mut n = 0;
+                    for (app, _) in &apps {
+                        if let Some(png) = shell.app_icon(app, 64).await {
+                            server.add_icon(app, png);
+                            n += 1;
+                        }
+                    }
+                    println!("Apps: {} installed, {n} icons.", apps.len());
+                }
+                Err(e) => println!("Apps: the extension did not list them ({e:#}; an older extension: --install-extension, then log out and in)."),
             }
         }
         let clients = server.client_count();

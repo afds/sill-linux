@@ -11,6 +11,9 @@ picture's size is printed (a window streams at its own size, not the monitor's).
 the first whose app name is NAME; "desktop" taps the Desktop), and saves that window's last picture as
 /tmp/sill-linux-window-tap.png.
 --type TEXT types TEXT (as the app's keyboard does) right after that tap.
+--scale S sends the viewport with Aa at S (the host sizes each picked window to 1180×760 ÷ S).
+--launch APP asks the host to launch APP (a .desktop id) at the end and prints what streams then.
+Apps (kind 5) and icons (kind 4) are counted.
 --command close|minimize|fullScreen sends that window command (kind 15) to the last window at the
 end and prints the window list that follows.
 Exit 1 if any check fails.
@@ -56,9 +59,12 @@ def main():
     s = socket.create_connection((host, port))
     s.settimeout(0.2)
     s.sendall(msg(23, json.dumps({"appVersion": "0.5.1", "build": "4", "protocol": 1, "device": "windows.py"}).encode()))
-    s.sendall(msg(9, json.dumps({"width": 1180, "height": 760, "fps": 60}).encode()))
+    scale = float(sys.argv[sys.argv.index("--scale") + 1]) if "--scale" in sys.argv else None
+    launch = sys.argv[sys.argv.index("--launch") + 1] if "--launch" in sys.argv else None
+    s.sendall(msg(9, json.dumps({"width": 1180, "height": 760, "fps": 60, "scale": scale}).encode()))
     buf = b""
     lists, thumbs, segments = [], {}, {}
+    apps, icons = [], {}
     params, current = None, None
     errors = []
 
@@ -79,6 +85,11 @@ def main():
                 p, buf = buf[14:14 + ln], buf[14 + ln:]
                 if kind == 2:
                     lists.append(json.loads(p))
+                elif kind == 5:
+                    apps[:] = json.loads(p)
+                elif kind == 4:
+                    n = struct.unpack(">H", p[:2])[0]
+                    icons[p[2:2 + n].decode()] = png_size(p[2 + n:])
                 elif kind == 3:
                     wid = struct.unpack(">I", p[:4])[0]
                     size = png_size(p[4:])
@@ -131,6 +142,13 @@ def main():
             pump(time.time() + max(0.5, per - 1.15))
         else:
             pump(time.time() + per)
+    if launch:
+        s.sendall(msg(7, json.dumps({"bundleID": launch}).encode()))
+        pump(time.time() + 4)
+        active = lists[-1]["active"]
+        names = {w["id"]: w["appName"] for w in lists[-1]["windows"]}
+        wid = active.get("window", {}).get("_0")
+        print(f"after launching {launch}: streaming {names.get(wid, active)}")
     if command and windows:
         wid = windows[-1]["id"]
         s.sendall(msg(15, json.dumps({"id": wid, "action": command}).encode()))
@@ -158,6 +176,7 @@ def main():
         print(f"{name}: {len(seg)} frames, picture {size}" + (f", decode errors: {err[:200]}" if err else ""))
         if err:
             errors.append(f"{name}: {err[:200]}")
+    print(f"apps: {len(apps)}, icons: {len(icons)}" + (f", e.g. {apps[0]['name']} ({apps[0]['bundleID']}) icon {icons.get(apps[0]['bundleID'])}" if apps else ""))
     for wid, sizes in sorted(thumbs.items()):
         print(f"thumbnails of window {wid}: {len(sizes)}, {sizes[-1]}")
     for e in errors:

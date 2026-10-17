@@ -19,6 +19,16 @@ pub struct ShellWindow {
     pub height: i32,
 }
 
+/// A window's frame on the screen, logical pixels, and whether it was maximized.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frame {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
 /// A window's frame inside its buffer (`Geometry`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Insets {
@@ -124,6 +134,46 @@ impl Client {
         let reply = self.proxy.call_method("Geometry", &(id,)).await.ok()?;
         let ((left, top, right, bottom, width, height),): ((i32, i32, i32, i32, i32, i32),) = reply.body().deserialize().ok()?;
         (width > 0 && height > 0).then_some(Insets { left, top, right, bottom, width, height })
+    }
+
+    /// Installed apps: (.desktop id, name), by name.
+    pub async fn apps(&self) -> Result<Vec<(String, String)>> {
+        let reply = self.proxy.call_method("ListApps", &()).await.context("ListApps")?;
+        Ok(reply.body().deserialize()?)
+    }
+
+    /// A PNG of an app's icon, `size`×`size`.
+    pub async fn app_icon(&self, app: &str, size: u32) -> Option<Vec<u8>> {
+        let reply = self.proxy.call_method("AppIcon", &(app, size)).await.ok()?;
+        let path: String = reply.body().deserialize().ok()?;
+        if path.is_empty() {
+            return None;
+        }
+        let png = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        png
+    }
+
+    pub async fn launch(&self, app: &str) -> bool {
+        match self.proxy.call_method("Launch", &(app,)).await {
+            Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Resizes the window's frame to `w`×`h` logical pixels; its frame before and whether it was
+    /// maximized (None: not touched).
+    pub async fn fit(&self, id: u64, w: i32, h: i32) -> Option<Frame> {
+        let reply = self.proxy.call_method("Fit", &(id, w, h)).await.ok()?;
+        let ((x, y, width, height, maximized),): ((i32, i32, i32, i32, bool),) = reply.body().deserialize().ok()?;
+        (width > 0).then_some(Frame { x, y, width, height, maximized })
+    }
+
+    pub async fn restore(&self, id: u64, f: Frame) -> bool {
+        match self.proxy.call_method("Restore", &(id, f.x, f.y, f.width, f.height, f.maximized)).await {
+            Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     pub async fn command(&self, method: &str, id: u64) -> bool {

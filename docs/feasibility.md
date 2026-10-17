@@ -481,6 +481,26 @@ clicks (in that headless shell a click activated no GTK button even on the Deskt
 worked), so taps inside a window wait for the iPad. The user's real settings were compared before
 and after every run.
 
-Not yet: Standard for a window on a scale-2 monitor (the ratio is read from the buffers against the
-stream's size; untested at scale 2), Aa (resizing the window to the device's panel), app icons and
-All Apps (kinds 4, 5, 7), the portal (no window streams there: the Desktop alone).
+On the iPad (2026-10-17): typing into a streamed window works, and since the logical-coordinates
+fix the trackpad stays inside the window.
+
+## Phase 4c: apps and Aa (2026-10-17)
+
+- **All Apps and icons.** The extension's `ListApps` (the app grid's apps: .desktop id and name)
+  and `AppIcon` (the icon theme's file at 64 px, through GdkPixbuf, so SVG icons become PNG) give
+  kind 5 (`[{name, bundleID}]`) and kind 4 (id length, id, PNG), sent to every device as it
+  connects, as Sill for Mac does. The .desktop id is the bundleID throughout, so a window's
+  thumbnail gets its app's icon. The list is read once at start.
+- **Launch** (kind 7 `{bundleID}`, only an app the host listed): `Launch` starts the app, or raises
+  a running one; its topmost window listed within 20 s is then picked for every device.
+- **Aa** (the viewport's `scale`): while a window streams, its frame is resized to the panel over
+  the scale in logical pixels where it is (unmaximized first; never one in full screen), at a pick
+  and at each new viewport; nothing before the device first sets Aa. The crop then follows the new
+  size. A window Aa sized goes back to its whole frame before (maximized again if it was) once it
+  stops streaming: another pick, the Desktop, the last device leaving, this host quitting (issue
+  #57's rule on the Mac; here without its exceptions for a window resized or moved meanwhile).
+
+Verified in the nested shell (`tools/windows.py --scale 1 --launch org.gnome.Calculator.desktop`):
+172 apps and 172 icons of 64×64; both windows streamed at 1180×760 with Aa at 1× (from 700×520 and
+360×616) and each put back at its old frame and place when the next source took over; launching
+the running Calculator streamed its window. Not tried there: launching an app that is not running.

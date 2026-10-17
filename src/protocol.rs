@@ -20,7 +20,10 @@ pub mod kind {
     pub const FRAME: u8 = 1;
     pub const WINDOW_LIST: u8 = 2;
     pub const THUMBNAIL: u8 = 3;
+    pub const APP_ICON: u8 = 4;
+    pub const APP_LIST: u8 = 5;
     pub const SELECT_SOURCE: u8 = 6;
+    pub const LAUNCH_APP: u8 = 7;
     pub const INPUT: u8 = 8;
     pub const VIEWPORT: u8 = 9;
     pub const PING: u8 = 10;

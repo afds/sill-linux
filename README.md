@@ -46,7 +46,10 @@ runs), the primary monitor (`--monitor DP-3` for another).
 Shell extension that lists this machine's windows; log out and in once to load it. The app's bar
 then shows each window with a thumbnail, and a tap streams that window alone (raised and focused
 here, so typing goes to it), cropped to its frame. Holding a thumbnail gives its lights: close,
-minimize, full screen. Without the extension, or with `--portal`, only the Desktop streams. Elsewhere, or with `--portal`, the
+minimize, full screen. All Apps lists the installed apps with their icons and starts one (its
+window then streams), and Aa sizes the streamed window to the iPad's panel (it goes back when it
+stops streaming). After updating sill-linux, run `--install-extension` again and log out and in.
+Without the extension, or with `--portal`, only the Desktop streams. Elsewhere, or with `--portal`, the
 desktop portal asks once which monitor to share and to allow remote control; the answer is kept
 (`~/.local/state/sill-linux/remote-desktop-token`, delete it to be asked again; with
 `--view-only`, no remote control, `restore-token`). The device's Command key is Ctrl here
