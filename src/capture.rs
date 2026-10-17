@@ -54,7 +54,7 @@ fn pack_crop((x, y, w, h): (u32, u32, u32, u32)) -> u64 {
 }
 
 fn unpack_crop(v: u64) -> Option<(u32, u32, u32, u32)> {
-    (v != 0).then(|| ((v >> 48) as u32 & 0xffff, (v >> 32) as u32 & 0xffff, (v >> 16) as u32 & 0xffff, v as u32 & 0xffff))
+    (v != 0).then_some(((v >> 48) as u32 & 0xffff, (v >> 32) as u32 & 0xffff, (v >> 16) as u32 & 0xffff, v as u32 & 0xffff))
 }
 
 /// The part of the buffers the devices see (a window's crop): positions from a device are
@@ -77,7 +77,7 @@ const CROP_WAIT: Duration = Duration::from_millis(500);
 
 fn captured_size() -> Option<(f64, f64)> {
     let v = CAPTURED_SIZE.load(Ordering::Relaxed);
-    (v != 0).then(|| ((v >> 32) as f64, (v & 0xffff_ffff) as f64))
+    (v != 0).then_some(((v >> 32) as f64, (v & 0xffff_ffff) as f64))
 }
 
 /// `input`: the Command key's meaning, or None for view only (no remote control asked for).
@@ -230,11 +230,10 @@ fn run_pipeline(
                 let (x, y, w, h) = m.rect();
                 CROP.store(pack_crop((x, y, w & !1, h & !1)), Ordering::Relaxed);
             }
-            if let Some(s) = pad.current_caps().and_then(|c| c.structure(0).map(|s| s.to_owned())) {
-                if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+            if let Some(s) = pad.current_caps().and_then(|c| c.structure(0).map(|s| s.to_owned()))
+                && let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
                     CAPTURED_SIZE.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
                 }
-            }
             gst::PadProbeReturn::Ok
         });
     }
@@ -356,8 +355,7 @@ fn run_pipeline(
                 .filter(|c| c.2 >= 2 && c.3 >= 2)
                 .map(|c| insets.map(|i| i.frame_in(c)).unwrap_or(c));
             let have = shape.crop.map(|c| c.0);
-            if wanted.is_some() && wanted != have && now.duration_since(seen_crop.1) >= CROP_SETTLE {
-                let (x, y, w, h) = wanted.unwrap();
+            if let Some((x, y, w, h)) = wanted && wanted != have && now.duration_since(seen_crop.1) >= CROP_SETTLE {
                 let buffers = captured_size().map(|(bw, bh)| (bw as u32, bh as u32)).unwrap_or((x + w, y + h));
                 // Standard: the window's logical size (the buffers' pixels over the monitor's scale).
                 let ratio = match cast.size {
@@ -525,16 +523,14 @@ fn build_tail(shape: &TailShape, a: &Apply, server: &Server, counters: &(Arc<Ato
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if let Some(s) = sample.caps().and_then(|c| c.structure(0)) {
-                    if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+                if let Some(s) = sample.caps().and_then(|c| c.structure(0))
+                    && let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
                         frames_server.set_encoded_size(w as i64, h as i64);
                     }
-                }
-                if let Some(buffer) = sample.buffer() {
-                    if let Ok(map) = buffer.map_readable() {
+                if let Some(buffer) = sample.buffer()
+                    && let Ok(map) = buffer.map_readable() {
                         frames_server.broadcast_access_unit(&protocol::convert_annex_b(map.as_slice()));
                     }
-                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -638,12 +634,11 @@ fn read_token(path: &PathBuf) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-fn save_token(path: &PathBuf, token: Option<&str>) {
-    if let Some(t) = token {
-        if let Err(e) = crate::identity::write_private(path, t.as_bytes()) {
+fn save_token(path: &std::path::Path, token: Option<&str>) {
+    if let Some(t) = token
+        && let Err(e) = crate::identity::write_private(path, t.as_bytes()) {
             eprintln!("Could not save {}: {e}", path.display());
         }
-    }
 }
 
 static FORCE_PORTAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1001,10 +996,7 @@ async fn watch_cursor(server: Server, shell: crate::shell::Client) {
             tokio::time::sleep(Duration::from_millis(30)).await;
             while futures_util::FutureExt::now_or_never(changes.next()).flatten().is_some() {}
         }
-        match shell.cursor_shape().await {
-            Some(Some((geometry, png))) => server.set_cursor_shape(geometry, &png),
-            Some(None) | None => {}
-        }
+        if let Some(Some((geometry, png))) = shell.cursor_shape().await { server.set_cursor_shape(geometry, &png) }
     }
 }
 
@@ -1076,11 +1068,10 @@ async fn watch_windows(server: Server, shell: crate::shell::Client) {
                 }
                 Err(_) => {}
             }
-            if let Some(id) = server.active_window() {
-                if let Some(i) = shell.geometry(id).await {
+            if let Some(id) = server.active_window()
+                && let Some(i) = shell.geometry(id).await {
                     *FRAME_INSETS.lock().unwrap() = Some((id, i));
                 }
-            }
         }
         let pending = PENDING_LAUNCH.lock().unwrap().clone();
         if let Some((app, at)) = pending {
@@ -1373,12 +1364,11 @@ async fn run_input(
             if log {
                 println!("{:>8} ms    → portal: {action:?}", t0.elapsed().as_millis());
             }
-            if let Err(e) = perform(&sink, &action).await {
-                if !failed {
+            if let Err(e) = perform(&sink, &action).await
+                && !failed {
                     failed = true;
                     eprintln!("Input: refused {action:?}: {e:#} (further failures not shown)");
                 }
-            }
         }
     }
 }

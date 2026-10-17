@@ -89,7 +89,7 @@ fn rounded(v: f64) -> f64 {
 /// `p` in `rect` (x, y, w, h) as kind 26's fractions, and whether it is inside (far edges out).
 pub fn fraction(p: (f64, f64), rect: (f64, f64, f64, f64)) -> (f64, f64, bool) {
     let (rx, ry, w, h) = rect;
-    if !(w > 0.0 && h > 0.0) || ![rx, ry, w, h, p.0, p.1].iter().all(|v| v.is_finite()) {
+    if !(w > 0.0 && h > 0.0 && [rx, ry, w, h, p.0, p.1].iter().all(|v| v.is_finite())) {
         return (0.0, 0.0, false);
     }
     let (x, y) = ((p.0 - rx) / w, (p.1 - ry) / h);

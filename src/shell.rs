@@ -118,7 +118,7 @@ impl Client {
     pub async fn connect(conn: &zbus::Connection) -> Option<Client> {
         let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
         let name = zbus::names::BusName::try_from(NAME).ok()?;
-        if !dbus.name_has_owner(name.try_into().ok()?).await.unwrap_or(false) {
+        if !dbus.name_has_owner(name).await.unwrap_or(false) {
             return None;
         }
         let proxy = zbus::Proxy::new(conn, NAME, PATH, NAME).await.ok()?;

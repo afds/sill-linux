@@ -232,11 +232,10 @@ impl Window {
             "code" => Some(&self.code_key),
             _ => None, // an unknown method never matches: a wrong proof
         };
-        if let Some(key) = key {
-            if is_valid_device_proof(given, key, fp_device, fp_mac) {
+        if let Some(key) = key
+            && is_valid_device_proof(given, key, fp_device, fp_mac) {
                 return Verdict::Accept { proof_m: mac_proof(key, fp_mac, fp_device) };
             }
-        }
         self.failures += 1;
         if self.failures >= MAX_FAILURES {
             return Verdict::Closed("stopped");

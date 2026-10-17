@@ -30,8 +30,8 @@ pub async fn available(conn: &zbus::Connection) -> bool {
     match dbus {
         Ok(p) => {
             let name = |n: &'static str| zbus::names::BusName::try_from(n).unwrap();
-            p.name_has_owner(name(SC).try_into().unwrap()).await.unwrap_or(false)
-                && p.name_has_owner(name(RD).try_into().unwrap()).await.unwrap_or(false)
+            p.name_has_owner(name(SC)).await.unwrap_or(false)
+                && p.name_has_owner(name(RD)).await.unwrap_or(false)
         }
         Err(_) => false,
     }

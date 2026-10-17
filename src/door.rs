@@ -291,12 +291,11 @@ impl PairingDoor {
         println!("        {}", pairing::grouped(&w.code));
         println!();
         let link = self.pair_link(&w.secret);
-        if let Ok(out) = std::process::Command::new("qrencode").args(["-t", "ANSIUTF8", "-m", "1", &link]).output() {
-            if out.status.success() {
+        if let Ok(out) = std::process::Command::new("qrencode").args(["-t", "ANSIUTF8", "-m", "1", &link]).output()
+            && out.status.success() {
                 println!("or scan this with the Sill app's camera:");
                 print!("{}", String::from_utf8_lossy(&out.stdout));
             }
-        }
         if let Some(path) = &self.code_file {
             let _ = std::fs::write(path, &w.code);
         }

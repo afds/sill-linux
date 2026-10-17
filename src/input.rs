@@ -477,13 +477,12 @@ impl Translator {
         if self.pending_left.is_some_and(|at| now.duration_since(at) > TAP_WINDOW) {
             self.flush_pending(&mut out);
         }
-        if let Some(t) = self.stop_at {
-            if now >= t && self.in_gesture {
+        if let Some(t) = self.stop_at
+            && now >= t && self.in_gesture {
                 self.stop_at = None;
                 self.in_gesture = false;
                 out.push(Action::AxisStop);
             }
-        }
         out
     }
 

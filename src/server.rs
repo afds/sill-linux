@@ -317,11 +317,10 @@ impl Server {
                 describe_change(&st.settings, &next)
             );
             st.settings = next;
-            if let Some(path) = st.settings_path.clone() {
-                if let Err(e) = next.save(&path) {
+            if let Some(path) = st.settings_path.clone()
+                && let Err(e) = next.save(&path) {
                     eprintln!("Settings: could not save {}: {e}", path.display());
                 }
-            }
             self.reapply(&st);
         }
         if !refused.is_empty() {
@@ -605,8 +604,8 @@ impl Server {
                 }
                 kind::CLIENT_STATS => {
                     stats_seen += 1;
-                    if stats_seen % 2 == 0 {
-                        if let Ok(s) = serde_json::from_slice::<ClientStats>(&payload) {
+                    if stats_seen.is_multiple_of(2)
+                        && let Ok(s) = serde_json::from_slice::<ClientStats>(&payload) {
                             println!(
                                 "client {}: {} fps, frame age {}, rtt {}",
                                 crate::door::clean(&s.device, "a device"),
@@ -615,7 +614,6 @@ impl Server {
                                 median_and_worst(s.rtt_ms, s.rtt_max_ms)
                             );
                         }
-                    }
                 }
                 kind::INPUT => {
                     let input = self.input.lock().unwrap().clone();
@@ -787,13 +785,12 @@ impl Server {
             return;
         }
         st.windows = windows;
-        if let StreamSource::Window(w) = st.active {
-            if !st.windows.iter().any(|x| x.id == w) {
+        if let StreamSource::Window(w) = st.active
+            && !st.windows.iter().any(|x| x.id == w) {
                 println!("Streaming: nothing (the window closed)");
                 st.active = StreamSource::None;
                 let _ = self.control.send(Control::Stop);
             }
-        }
         let msg = self.window_list(&st);
         for c in st.clients.values() {
             let _ = c.tx.send(msg.clone());
