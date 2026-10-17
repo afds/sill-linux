@@ -3,9 +3,10 @@
 An experimental Linux (Wayland) host for the [Sill](https://getsill.app) iPhone and iPad app:
 stream a Linux desktop, and later single windows, to the existing Sill app over your network.
 
-**Status: phase 1 of [docs/feasibility.md](docs/feasibility.md).** It streams the whole desktop
-to a **Debug build** of the Sill app over your network, unencrypted. No input yet, no windows,
-and the App Store build won't connect (it needs the TLS door with pairing, phase 3).
+**Status: phases 1 and 3 of [docs/feasibility.md](docs/feasibility.md).** It streams the whole
+desktop to the **App Store build** of the Sill app over your network: TLS 1.3 with pinned keys,
+and a one-time pairing with a code this terminal shows, as Sill for Mac does. No input yet (taps
+and keys are ignored), no single windows.
 
 This is a separate project. It is not part of Sill and isn't supported by Sill's author. Sill's
 own host is the free Mac app; this one speaks the same wire protocol (pinned in
@@ -19,8 +20,16 @@ with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and 
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--bitrate 15] [--name NAME] [--no-advertise]
+cargo run --release -- [--port 47460] [--bitrate 15] [--name NAME] [--open | --plain] [--no-advertise]
 ```
+
+Run it in a terminal you can see: when a device asks to pair, the code is printed there (and a
+QR code, with `qrencode` installed). Pairing is once per device; `--forget-devices` removes them
+all. `--open` lets any device in without pairing (still TLS); `--plain` is the old unencrypted
+door, for a Debug build of the app.
+
+The host's key, recognition key and paired devices live in `~/.local/state/sill-linux/` (0600).
+Deleting `host-key.pk8` makes a new host as far as devices are concerned: each pairs again.
 
 The first run asks which monitor to share; the answer is kept
 (`~/.local/state/sill-linux/restore-token`, delete it to be asked again). With a device
@@ -30,14 +39,15 @@ own `client …` line every two seconds (frame age and round trip, median/worst)
 A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.
 
-**On the iPad or iPhone:** build Sill's iOS app (`iOSClient/Sill.xcodeproj` in
-[Sill](https://github.com/Saffsanity/sill)) in the **Debug** configuration from Xcode on a Mac,
-on the same network. This machine shows up as a row; tap it. Or add the launch argument
-`-SillConnect <this machine's IP>:47460` to the scheme, and `-SillHUD 1` for the stream's
-numbers on the device.
+**On the iPad or iPhone:** the Sill app from the App Store (0.5.1 or later), on the same network.
+This machine shows up as a row, "Not paired"; tap it, then type the code from this terminal (Enter
+Code Instead). From then on a tap connects. With `--plain`, only a Debug build of the app (Xcode)
+connects, by its row or with the launch argument `-SillConnect <IP>:47460`.
 
-**Without a device:** `tools/receive.py HOST PORT [SECONDS] [--join-late]` acts as the app,
-checks every message's layout, and decodes the stream with ffmpeg.
+**Without a device:** Sill's own `Scripts/sillclient.py` pairs and opens a session like the app
+(`--pair-ask --then-code=FILE --identity=DIR`, then `--tls --identity=DIR`; the host writes each
+code to `SILL_LINUX_TEST_CODE_FILE`). `tools/receive.py HOST PORT [SECONDS] [--join-late]`, on a
+`--plain` door, checks every message's layout and decodes the stream with ffmpeg.
 
 Testing switches: `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder; `SILL_LINUX_DMABUF=1`
 tries zero copy for NVENC (broken on NVIDIA here, see the doc).

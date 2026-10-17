@@ -3,5 +3,9 @@
 pub mod protocol;
 pub mod server;
 pub mod advertise;
+pub mod pairing;
+pub mod identity;
+pub mod tls;
+pub mod door;
 #[cfg(feature = "capture")]
 pub mod capture;

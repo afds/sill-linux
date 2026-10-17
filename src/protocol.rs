@@ -26,6 +26,9 @@ pub mod kind {
     pub const PONG: u8 = 11;
     pub const CLIENT_STATS: u8 = 12;
     pub const TICK: u8 = 13;
+    pub const PAIR_REQUEST: u8 = 19;
+    pub const PAIR_RESULT: u8 = 20;
+    pub const GOODBYE: u8 = 22;
     pub const HELLO: u8 = 23;
 }
 

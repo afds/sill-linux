@@ -163,7 +163,7 @@ Each phase is usable on its own.
    Success: frame age and fps in the app's stats comparable to the Mac host's.
 2. **Input.** RemoteDesktop and libei: tap and click, scroll with phases, HID keys, text.
 3. **TLS door, pairing and Avahi**, so an App Store build finds, pairs with and reconnects to the
-   host. Golden tests reproduce Sill's fingerprints, tags, PBKDF2 proofs and signed info.
+   host. Built, ahead of phase 2 (results below). Golden tests reproduce Sill's fingerprints, tags, PBKDF2 proofs and signed info.
 4. **Windows.** A backend trait (`list`, `thumbnail`, `capture`, `raise`): the wlroots family and
    COSMIC first (no prompts, real per-window capture), then KDE, then GNOME's extension.
 
@@ -232,3 +232,27 @@ Found on the way:
 Not measured yet: the frame rate of a busy full screen (every test window opened behind the
 terminal), the shared-memory copy's ceiling at 4K, and anything on a real device: frame age,
 rtt and the picture on the iPad, which is the next step.
+
+## Phase 3 results (2026-10-17)
+
+Brought ahead of input because the App Store build shows "Update Sill" for a door without `p`,
+and a Debug build needs Xcode. Built: rustls (ring) for TLS 1.3 with a required client
+certificate, no tickets or resumption, ALPNs `sill/1` and `sill-pair/1`; any P-256 client key
+passes the handshake and the door decides by fingerprint and ALPN. The host key (P-256, PKCS#8),
+the recognition key and the paired devices are kept in `~/.local/state/sill-linux/` (0600); the
+certificate is made fresh from the key at each launch, as Sill's. Avahi's record carries `p=1`
+(or `p=0` with `--open`) and `r`. Pairing follows Sill's host: an ask opens a 5-minute window and
+answers `shown`; five wrong codes stop it, 1, 2, 4, 8 s apart; `cancel` closes it; any `v` but 1
+is `closed`; an unpaired key on `sill/1` gets the goodbye `pairingRequired`.
+
+Verified:
+- Sill's vectors from `Tests/checks/protocol` in Rust: the PBKDF2 code key, proof_D and proof_M
+  on both paths, the Mac ID and the recognition tag (`cargo test`, 17 tests in all).
+- Sill's own `Scripts/sillclient.py` (Python and OpenSSL, independent of this code) against the
+  door: an unpaired session refused with kind 22 first; an ask answered `shown`; the code paired
+  with "proof_M checked, pin saved"; a pinned `sill/1` session with hello, the Desktop pick, pongs
+  and 34 ticks a second; a cancel answered `closed`.
+- `avahi-browse` shows the record with `p=1` and a recognition tag.
+
+Not yet tried: the App Store app itself. Not built: the QR path is printed only with `qrencode`
+installed and is untested; kind 18 (no "away from home" for this host); Remote Access.

@@ -1,9 +1,10 @@
-//! The plain TCP door: Sill's home door as the CLI host serves it without `--pairing`, which a
-//! Debug build of the Sill app still dials (phase 1; the TLS door is phase 3).
+//! The door and the sessions behind it.
 //!
-//! Threads, as Sill's host: one reader and one writer per client, a ticker, and the capture
-//! side calling `broadcast_access_unit` from its own thread. One lock guards the shared state;
-//! nothing blocks under it (writers own the sockets).
+//! The door is Sill's home door in one of three forms (`Door`): TLS with pairing required (TXT
+//! `p=1`, what the App Store build pairs with), TLS open to any device (`p=0`), or plain TCP (no
+//! `p`: a Debug build of the app only). Connections run on a tokio runtime of their own (a reader
+//! task and a writer task each); the ticker is a thread, and the capture side calls
+//! `broadcast_access_unit` from its own. One lock guards the shared state; nothing waits under it.
 //!
 //! Rules carried over from Sill's `StreamServer` (the home branch of `broadcast`):
 //! - a client that joins waits for a keyframe, and gets the parameter sets just before it;
@@ -12,20 +13,24 @@
 //! - an empty tick every 30 ms while streaming keeps the device's Wi-Fi out of power save;
 //! - a client that drains no frame for 4 s is closed (not in its first 8 s).
 
+use crate::door::{PairingDoor, Admission};
 use crate::protocol::{self, kind, ClientStats, Hello, StreamSource, Viewport, WindowList};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(30);
 const EVICT_AFTER: Duration = Duration::from_secs(4);
 const EVICT_GRACE: Duration = Duration::from_secs(8);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the server asks of the capture side.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,10 +43,19 @@ pub enum Control {
     Keyframe,
 }
 
+/// How the door speaks.
+#[derive(Clone)]
+pub enum Door {
+    /// Plain TCP, no `p` in the TXT record: only a Debug build of the app dials it.
+    Plain,
+    /// TLS 1.3 with pinned keys; pairing required or open (`PairingDoor::require_pairing`).
+    Tls(Arc<PairingDoor>),
+}
+
 struct Client {
     label: String,
-    tx: Sender<Vec<u8>>,
-    socket: TcpStream,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    close: watch::Sender<bool>,
     frames_in_flight: Arc<AtomicUsize>,
     last_drain: Arc<Mutex<Instant>>,
     connected_at: Instant,
@@ -63,34 +77,78 @@ pub struct Server {
     control: Sender<Control>,
     host_name: Arc<String>,
     launch_id: Arc<String>,
+    door: Door,
 }
 
 impl Server {
-    pub fn new(host_name: String, control: Sender<Control>) -> Server {
+    pub fn new(host_name: String, control: Sender<Control>, door: Door) -> Server {
         Server {
             state: Arc::new(Mutex::new(State { sent: 0, dropped: 0, clients: HashMap::new(), next_id: 1, active: StreamSource::None })),
             control,
             host_name: Arc::new(host_name),
             launch_id: Arc::new(uuid::Uuid::new_v4().to_string()),
+            door,
         }
     }
 
-    /// Binds and serves on its own threads; returns the bound address.
+    /// Binds and serves on threads of its own; returns the bound address.
     pub fn listen(&self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
-        let listener = TcpListener::bind(addr)?;
-        let local = listener.local_addr()?;
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        let local = std_listener.local_addr()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("net").enable_all().build()?;
         let server = self.clone();
         thread::Builder::new().name("accept".into()).spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(s) => server.accept(s),
-                    Err(e) => eprintln!("Accept failed: {e}"),
+            runtime.block_on(async move {
+                let listener = match TcpListener::from_std(std_listener) {
+                    Ok(l) => l,
+                    Err(e) => return eprintln!("Listener failed: {e}"),
+                };
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, peer)) => {
+                            let s = server.clone();
+                            tokio::spawn(async move { s.handle(stream, peer).await });
+                        }
+                        Err(e) => eprintln!("Accept failed: {e}"),
+                    }
                 }
-            }
+            })
         })?;
         let ticker = self.clone();
         thread::Builder::new().name("ticker".into()).spawn(move || ticker.tick_loop())?;
         Ok(local)
+    }
+
+    async fn handle(self, stream: TcpStream, peer: SocketAddr) {
+        let _ = stream.set_nodelay(true);
+        let peer_text = peer.to_string();
+        let door = match &self.door {
+            Door::Plain => return self.session(stream, peer_text).await,
+            Door::Tls(d) => d.clone(),
+        };
+        let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, door.acceptor().accept(stream)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return println!("TLS handshake with {peer_text} failed: {e}"),
+            Err(_) => return println!("TLS handshake with {peer_text} timed out"),
+        };
+        let (alpn, fingerprint) = {
+            let (_, conn) = tls.get_ref();
+            let fp = conn.peer_certificates().and_then(|c| c.first()).and_then(|c| crate::tls::spki_fingerprint(c));
+            (conn.alpn_protocol().map(|a| a.to_vec()), fp)
+        };
+        let Some(fingerprint) = fingerprint else { return println!("TLS from {peer_text} without a P-256 key: closed") };
+        match door.admit(alpn.as_deref(), &fingerprint) {
+            Admission::Pairing => door.serve_pairing(tls, fingerprint, peer_text).await,
+            Admission::Session(label) => self.session(tls, format!("{label} at {peer_text}")).await,
+            Admission::Refuse(goodbye) => {
+                let mut tls = tls;
+                if let Some(g) = goodbye {
+                    let _ = tls.write_all(&protocol::message(kind::GOODBYE, protocol::now(), false, g.as_bytes())).await;
+                }
+                let _ = tls.shutdown().await;
+            }
+        }
     }
 
     fn window_list(&self, active: StreamSource) -> Vec<u8> {
@@ -105,11 +163,13 @@ impl Server {
         protocol::message(kind::WINDOW_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
     }
 
-    fn accept(&self, socket: TcpStream) {
-        let peer = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
-        let _ = socket.set_nodelay(true);
-        let (Ok(read_half), Ok(write_half)) = (socket.try_clone(), socket.try_clone()) else { return };
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    /// One session, on any byte stream (plain TCP or TLS): the window list, then frames,
+    /// ticks and pongs out; the device's messages in.
+    async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(&self, stream: S, peer: String) {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (close_tx, mut close_rx) = watch::channel(false);
+        let mut close_rx_writer = close_tx.subscribe();
         let frames_in_flight = Arc::new(AtomicUsize::new(0));
         let last_drain = Arc::new(Mutex::new(Instant::now()));
 
@@ -123,7 +183,7 @@ impl Server {
                 Client {
                     label: peer.clone(),
                     tx,
-                    socket,
+                    close: close_tx,
                     frames_in_flight: frames_in_flight.clone(),
                     last_drain: last_drain.clone(),
                     connected_at: Instant::now(),
@@ -138,50 +198,38 @@ impl Server {
         println!("Client connected: {peer}");
 
         let writer = self.clone();
-        let _ = thread::Builder::new()
-            .name(format!("write-{id}"))
-            .spawn(move || writer.write_loop(id, write_half, rx, frames_in_flight, last_drain));
-        let reader = self.clone();
-        let _ = thread::Builder::new().name(format!("read-{id}")).spawn(move || reader.read_loop(id, read_half));
-    }
-
-    fn write_loop(
-        &self,
-        id: u64,
-        mut socket: TcpStream,
-        rx: Receiver<Vec<u8>>,
-        frames_in_flight: Arc<AtomicUsize>,
-        last_drain: Arc<Mutex<Instant>>,
-    ) {
-        for data in rx {
-            let is_frame = data[0] == kind::FRAME;
-            if socket.write_all(&data).is_err() {
-                break;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    m = rx.recv() => {
+                        let Some(data) = m else { break };
+                        let is_frame = data[0] == kind::FRAME;
+                        if wr.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        if is_frame {
+                            frames_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            *last_drain.lock().unwrap() = Instant::now();
+                        }
+                    }
+                    _ = close_rx_writer.changed() => break,
+                }
             }
-            if is_frame {
-                frames_in_flight.fetch_sub(1, Ordering::SeqCst);
-                *last_drain.lock().unwrap() = Instant::now();
-            }
-        }
-        self.remove(id, "write failed");
-    }
+            let _ = wr.shutdown().await;
+            writer.remove(id, "write failed");
+        });
 
-    fn read_loop(&self, id: u64, mut socket: TcpStream) {
-        let mut header = [0u8; protocol::HEADER_LEN];
         let mut stats_seen = 0u64;
         let mut input_noted = false;
         let reason = loop {
-            if socket.read_exact(&mut header).is_err() {
-                break "closed";
-            }
-            let h = protocol::Header::parse(&header);
-            if h.len > protocol::MAX_CLIENT_PAYLOAD {
-                break "message too large";
-            }
-            let mut payload = vec![0u8; h.len];
-            if socket.read_exact(&mut payload).is_err() {
-                break "closed";
-            }
+            let msg = tokio::select! {
+                m = read_message(&mut rd) => m,
+                _ = close_rx.changed() => break "closed by the host",
+            };
+            let (h, payload) = match msg {
+                Ok(m) => m,
+                Err(e) => break if e.kind() == std::io::ErrorKind::InvalidData { "message too large" } else { "closed" },
+            };
             match h.kind {
                 kind::PING => self.send_to(id, protocol::message(kind::PONG, protocol::now(), false, &payload)),
                 kind::SELECT_SOURCE => match serde_json::from_slice::<StreamSource>(&payload) {
@@ -197,9 +245,6 @@ impl Server {
                             hello.build.as_deref().unwrap_or("?"),
                             hello.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
                         );
-                        if let Some(c) = self.state.lock().unwrap().clients.get_mut(&id) {
-                            c.label = format!("{label} at {}", c.label);
-                        }
                     }
                 }
                 kind::VIEWPORT => {
@@ -273,7 +318,7 @@ impl Server {
     fn remove(&self, id: u64, reason: &str) {
         let mut st = self.state.lock().unwrap();
         let Some(c) = st.clients.remove(&id) else { return };
-        let _ = c.socket.shutdown(Shutdown::Both);
+        let _ = c.close.send(true);
         println!("Client left: {} ({reason})", c.label);
         if st.clients.is_empty() && st.active != StreamSource::None {
             st.active = StreamSource::None;
@@ -358,6 +403,19 @@ impl Server {
     }
 }
 
+/// One message: the header, then its payload (refused past Sill's cap for client messages).
+pub async fn read_message<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(protocol::Header, Vec<u8>)> {
+    let mut header = [0u8; protocol::HEADER_LEN];
+    rd.read_exact(&mut header).await?;
+    let h = protocol::Header::parse(&header);
+    if h.len > protocol::MAX_CLIENT_PAYLOAD {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large"));
+    }
+    let mut payload = vec![0u8; h.len];
+    rd.read_exact(&mut payload).await?;
+    Ok((h, payload))
+}
+
 /// Sill's client stats format: "7/80 ms", "–" for a second without a sample.
 fn median_and_worst(median: i64, worst: Option<i64>) -> String {
     match worst {
@@ -370,9 +428,11 @@ fn median_and_worst(median: i64, worst: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpStream as StdStream};
+    use std::sync::mpsc::{self as smpsc, Receiver};
 
-    fn read_message(s: &mut TcpStream) -> (protocol::Header, Vec<u8>) {
+    fn read_message(s: &mut StdStream) -> (protocol::Header, Vec<u8>) {
         let mut h = [0u8; protocol::HEADER_LEN];
         s.read_exact(&mut h).unwrap();
         let h = protocol::Header::parse(&h);
@@ -382,7 +442,7 @@ mod tests {
     }
 
     /// Reads until a message of `want` arrives, skipping ticks and others.
-    fn read_until(s: &mut TcpStream, want: u8) -> (protocol::Header, Vec<u8>) {
+    fn read_until(s: &mut StdStream, want: u8) -> (protocol::Header, Vec<u8>) {
         loop {
             let m = read_message(s);
             if m.0.kind == want {
@@ -392,13 +452,13 @@ mod tests {
     }
 
     fn start() -> (Server, Receiver<Control>, SocketAddr) {
-        let (ctx, crx) = mpsc::channel();
-        let server = Server::new("test host".into(), ctx);
+        let (ctx, crx) = smpsc::channel();
+        let server = Server::new("test host".into(), ctx, Door::Plain);
         let addr = server.listen(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
         (server, crx, addr)
     }
 
-    fn select_desktop(s: &mut TcpStream) {
+    fn select_desktop(s: &mut StdStream) {
         let m = protocol::message(kind::SELECT_SOURCE, 0.0, false, br#"{"desktop":{}}"#);
         s.write_all(&m).unwrap();
     }
@@ -414,7 +474,7 @@ mod tests {
     #[test]
     fn session_like_the_app() {
         let (server, crx, addr) = start();
-        let mut s = TcpStream::connect(addr).unwrap();
+        let mut s = StdStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
         // First message: the window list, nothing streaming.
@@ -466,12 +526,12 @@ mod tests {
     #[test]
     fn joining_client_asks_for_keyframe() {
         let (_server, crx, addr) = start();
-        let mut a = TcpStream::connect(addr).unwrap();
+        let mut a = StdStream::connect(addr).unwrap();
         a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         read_message(&mut a);
         select_desktop(&mut a);
         assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start);
-        let mut b = TcpStream::connect(addr).unwrap();
+        let mut b = StdStream::connect(addr).unwrap();
         b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (_, p) = read_message(&mut b);
         assert_eq!(serde_json::from_slice::<WindowList>(&p).unwrap().active, StreamSource::Desktop);

@@ -1,7 +1,9 @@
 //! Bonjour: `_sill._tcp` registered through Avahi's `avahi-publish` (avahi-utils), so the app's
-//! connect screen lists this machine. No TXT record yet: no `p` key says "plain door", which a
-//! Debug build of the app dials and a Release build shows as "Update Sill" (phase 3 adds TLS
-//! and `p`). The child dies with this process (PR_SET_PDEATHSIG) and on drop.
+//! connect screen lists this machine. The TXT record says how the door speaks: `p=1` (TLS,
+//! pairing required) or `p=0` (TLS, any device), with `r`, the recognition tag a paired device
+//! knows this host by; no `p` is a plain door, which only a Debug build of the app dials (a
+//! Release build shows "Update Sill"). The child dies with this process (PR_SET_PDEATHSIG) and on
+//! drop.
 
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -15,9 +17,9 @@ impl Drop for Advertisement {
     }
 }
 
-pub fn publish(name: &str, port: u16) -> Option<Advertisement> {
+pub fn publish(name: &str, port: u16, txt: &[String]) -> Option<Advertisement> {
     let mut cmd = Command::new("avahi-publish");
-    cmd.args(["-s", name, "_sill._tcp", &port.to_string()]).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(["-s", name, "_sill._tcp", &port.to_string()]).args(txt).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: prctl is async-signal-safe; nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
