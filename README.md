@@ -8,6 +8,14 @@ not support it. Please don't send Sill's support questions about it; open an iss
 Sill's own host is the free [Sill for Mac](https://getsill.app). This host speaks the same wire
 protocol (pinned in [SILL_REFERENCE.md](SILL_REFERENCE.md)), so the app needs no changes.
 
+## Screenshots
+
+The Sill app on an iPad, streaming from Ubuntu with GNOME.
+
+| [!["A single window." GNOME Mines streaming alone on an iPad held sideways, under Sill's bar of window thumbnails and buttons.](media/screenshots/window.jpg)](media/screenshots/window.jpg) | [!["The whole desktop." The GNOME desktop on an iPad held sideways, with the dock, Firefox and Mines.](media/screenshots/desktop.jpg)](media/screenshots/desktop.jpg) |
+| :---: | :---: |
+| [!["Launch any app." Sill's Apps list on an iPad held sideways, listing the apps installed on the Linux machine, over its desktop.](media/screenshots/apps.jpg)](media/screenshots/apps.jpg) | [!["Laptop mode." An iPad held upright, with Firefox on top and Sill's bar, a row of keys and a trackpad below it.](media/screenshots/laptop-mode.jpg)](media/screenshots/laptop-mode.jpg) |
+
 ## What works
 
 - **The desktop**, HEVC, at the app's chosen quality, resolution and frame rate (the gear in the
