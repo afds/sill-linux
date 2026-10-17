@@ -254,5 +254,11 @@ Verified:
   and 34 ticks a second; a cancel answered `closed`.
 - `avahi-browse` shows the record with `p=1` and a recognition tag.
 
-Not yet tried: the App Store app itself. Not built: the QR path is printed only with `qrencode`
+On a device (2026-10-17): the App Store app, Sill 0.5.1 (4) on an iPad (iPad16,1), paired by the
+typed code over IPv6 link-local and streamed the Desktop, "the picture looks smooth". Over about a
+minute of a mostly still screen: 2–5 frames a second (what changed, plus the 0.5 s keep-alive),
+nothing dropped, frame age 0–18 ms (median 0–7), rtt 3–6 ms; the app sent input (ignored).
+The app's panel is 728×535 pt, so a 3840×2160 stream is far more than it shows.
+
+Not yet tried in this phase: Not built: the QR path is printed only with `qrencode`
 installed and is untested; kind 18 (no "away from home" for this host); Remote Access.
