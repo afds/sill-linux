@@ -361,6 +361,7 @@ take the running DMA-BUF format, "not-negotiated"), so a resolution change repla
 encoder, parser and appsink, linked without the up-front caps check. Verified: four Retina/Standard
 switches on each path, a keyframe each, decoded by ffmpeg; a crop of the dock correct.
 
-To check on the iPad: a fullscreen YouTube video keeps updating with DMA-BUF (if not, the system
+On the iPad (2026-10-17): fullscreen YouTube keeps updating with DMA-BUF, "it works great".
+Kept for anyone where it does not: a fullscreen YouTube video should keep updating with DMA-BUF (if not, the system
 switch `MUTTER_DEBUG_PAINT=disable-direct-scanout` in `~/.config/environment.d/`, then a new
 login, makes GNOME always composite).
