@@ -1,0 +1,9 @@
+[package]
+name = "sill-linux"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A Linux (Wayland) host for the Sill iPhone and iPad app (unofficial, separate project)"
+publish = false
+
+[dependencies]
