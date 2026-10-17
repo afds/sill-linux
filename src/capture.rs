@@ -849,39 +849,54 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     });
     let (rec_tx, rec_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(hold_off_suspend(server.clone(), conn.clone()));
-    let shell = crate::shell::Client::connect(&conn).await;
-    match &shell {
-        Some(s) => {
-            println!("Windows: from the sill-linux GNOME Shell extension.");
-            let running = s.version().await.unwrap_or(1);
-            if running < EXTENSION_VERSION {
-                println!(
-                    "The GNOME Shell extension running is older (version {running}, this host has {EXTENSION_VERSION}): \
-                     --install-extension, then log out and in. Until then some features stay off."
-                );
-            }
-            server.set_gestures();
-            if running >= 3 && let Some(door) = server.pairing_door() {
-                tokio::spawn(pairing_window(door, s.clone()));
-            }
-            // This machine's pointer on the devices (kind 26), unless it is in the picture already.
-            if cursor == 0 {
-                let desktop = rect.map(|r| (r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64));
-                tokio::spawn(watch_pointer(server.clone(), s.clone(), desktop));
-            }
-            if SHARE_CLIPBOARD.load(Ordering::Relaxed) {
-                tokio::spawn(watch_clipboard(server.clone(), s.clone()));
-            }
-            tokio::spawn(watch_cursor(server.clone(), s.clone()));
-            tokio::spawn(watch_windows(server, s.clone(), conn.clone(), connector.clone(), running >= 4));
-        }
-        None => println!(
-            "Windows: the sill-linux GNOME Shell extension is not running, so only the Desktop streams \
-             (sill-linux --install-extension, then log out and in)."
-        ),
-    }
-    tokio::spawn(recorder(conn, connector, shown.clone(), shell, cursor, rec_rx));
+    // The extension is looked for until it runs: at login this service can start before GNOME
+    // has loaded it (it then ran without windows until restarted).
+    tokio::spawn(with_extension(server, conn.clone(), connector.clone(), cursor, rect, rec_tx.clone()));
+    tokio::spawn(recorder(conn, connector, shown.clone(), None, cursor, rec_rx));
     Ok((cast, input_tx, rec_tx, shown))
+}
+
+/// Waits for the sill-linux GNOME Shell extension (looked for every 2 s), then starts what it
+/// serves and hands it to the recorder.
+async fn with_extension(server: Server, conn: ashpd::zbus::Connection, connector: String, cursor: u32, rect: Option<(i32, i32, i32, i32)>, rec: Recorder) {
+    let mut said = false;
+    let s = loop {
+        if let Some(s) = crate::shell::Client::connect(&conn).await {
+            break s;
+        }
+        if !said {
+            println!(
+                "Windows: the sill-linux GNOME Shell extension is not running (yet), so only the Desktop streams \
+                 (sill-linux --install-extension, then log out and in)."
+            );
+            said = true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let _ = rec.send(RecReq::Shell(s.clone()));
+    let s = &s;
+    println!("Windows: from the sill-linux GNOME Shell extension.");
+    let running = s.version().await.unwrap_or(1);
+    if running < EXTENSION_VERSION {
+        println!(
+            "The GNOME Shell extension running is older (version {running}, this host has {EXTENSION_VERSION}): \
+             --install-extension, then log out and in. Until then some features stay off."
+        );
+    }
+    server.set_gestures();
+    if running >= 3 && let Some(door) = server.pairing_door() {
+        tokio::spawn(pairing_window(door, s.clone()));
+    }
+    // This machine's pointer on the devices (kind 26), unless it is in the picture already.
+    if cursor == 0 {
+        let desktop = rect.map(|r| (r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64));
+        tokio::spawn(watch_pointer(server.clone(), s.clone(), desktop));
+    }
+    if SHARE_CLIPBOARD.load(Ordering::Relaxed) {
+        tokio::spawn(watch_clipboard(server.clone(), s.clone()));
+    }
+    tokio::spawn(watch_cursor(server.clone(), s.clone()));
+    tokio::spawn(watch_windows(server, s.clone(), conn.clone(), connector.clone(), running >= 4));
 }
 
 /// A monitor other than the Desktop's goes to the devices as a "window" with an id that has this
@@ -936,6 +951,8 @@ enum RecReq {
     Alive(mpsc::Sender<bool>),
     /// Whether the screen is locked.
     Locked(mpsc::Sender<bool>),
+    /// The extension runs now.
+    Shell(crate::shell::Client),
 }
 
 /// An app launched from a device, and when: its first window listed within `LAUNCH_WAIT` is picked.
@@ -955,7 +972,7 @@ type Shown = Arc<std::sync::Mutex<Option<(Arc<crate::mutter::Session>, crate::mu
 /// Owns what is shown: a fresh session for every switch, the Desktop's too (Mutter starts no
 /// stream added to a session already running, and a new consumer of a running stream gets no
 /// first frame until something on it changes), the old one stopped once the new one runs.
-async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown, shell: Option<crate::shell::Client>, cursor: u32, mut rx: UnboundedReceiver<RecReq>) {
+async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown, mut shell: Option<crate::shell::Client>, cursor: u32, mut rx: UnboundedReceiver<RecReq>) {
     let cast = |s: &crate::mutter::Stream| PortalCast { fd: None, node: s.node, size: s.size };
     // Windows Aa sized: each goes back once it no longer streams, by Sill for Mac's rule
     // (`restore.rs`, issue #57).
@@ -1084,6 +1101,7 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     session.stop().await;
                 }
             }
+            RecReq::Shell(s) => shell = Some(s),
             RecReq::Locked(reply) => {
                 let _ = reply.send(crate::mutter::screen_locked(&conn).await);
             }
