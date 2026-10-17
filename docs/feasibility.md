@@ -682,3 +682,21 @@ Checked with Sill's own `sillclient.py` in the nested shell: kind 18 arrives thi
 key matches the pin. With `--no-remote`: `remoteAccess` 0 and no addresses. Not checked on a
 device: the Remote row, the dial through WireGuard, and the app moving a remote session home by
 itself.
+
+## The pairing window (2026-10-17)
+
+A device's ask (a tap on its "Not paired" row) opens a window in the middle of the primary
+monitor, drawn by the extension (interface version 3: `ShowPairing`, `ClosePairing`,
+`PairingCancelled`): the device's name, a QR code of the pairing link (what the app's scanner
+reads, the same link the terminal prints), the grouped code, the time left and Cancel. It sits
+above windows as top chrome and takes no keyboard. sill-linux makes the QR code (the `qrcode`
+crate, no image features) and sends its modules; the extension only draws them. It closes when the
+device pairs, the code runs out or five wrong codes stop it. Its Cancel closes the window and keeps
+the asking device's key and address from opening another for 10 minutes, as Sill for Mac's Cancel
+does. With an older extension, or none, the notification as before.
+
+Checked in the nested shell with a test-only extension that screenshots the stage and finds and
+clicks the Cancel button. Steps: an ask shows the window; pairing with the code closes it; another
+key's ask shows it; Cancel closes it, the host logs the cancel, and that key's next ask gets
+`openOnMac`. The screenshot shows the window as intended. Not checked: the app's camera on the QR
+code.

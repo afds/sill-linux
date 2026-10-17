@@ -72,6 +72,21 @@ pub enum Admission {
     Refuse(Option<String>),
 }
 
+/// What the pairing window on this screen shows (`set_pairing_ui`).
+pub enum PairingUi {
+    /// `modules`: the QR code of the pairing link, width×width, '1' dark, row by row; `note`: the
+    /// notification's words, if the window cannot be shown.
+    Show { title: String, code: String, modules: String, width: u32, seconds: u32, note: String },
+    Close,
+}
+
+/// The QR code of `link` as the pairing window draws it.
+fn qr_modules(link: &str) -> Option<(String, u32)> {
+    let code = qrcode::QrCode::new(link.as_bytes()).ok()?;
+    let modules = code.to_colors().iter().map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' }).collect();
+    Some((modules, code.width() as u32))
+}
+
 pub struct PairingDoor {
     acceptor: TlsAcceptor,
     pub identity: Identity,
@@ -84,7 +99,8 @@ pub struct PairingDoor {
     asks: Mutex<AskLimits>,
     started: Instant,
     /// The pairing code's desktop notification.
-    note: crate::notify::Note,
+    pub note: crate::notify::Note,
+    ui: Mutex<Option<tokio::sync::mpsc::UnboundedSender<PairingUi>>>,
     /// TEST ONLY: SILL_LINUX_TEST_CODE_FILE, where each window's code is written (for
     /// Sill's sillclient.py `--then-code`).
     code_file: Option<PathBuf>,
@@ -105,6 +121,7 @@ impl PairingDoor {
             asks: Mutex::new(AskLimits::default()),
             started: Instant::now(),
             note: crate::notify::Note::default(),
+            ui: Mutex::new(None),
             code_file: std::env::var_os("SILL_LINUX_TEST_CODE_FILE").map(PathBuf::from),
         }))
     }
@@ -203,7 +220,7 @@ impl PairingDoor {
         if window.as_ref().is_some_and(|w| w.expired()) {
             *window = None;
             asks.asker = None;
-            self.note.close();
+            self.close_ui();
             println!("Pairing: the code ran out.");
         }
         match req.method.as_str() {
@@ -232,7 +249,7 @@ impl PairingDoor {
                 if window.is_some() && asks.asked_by(fp_device) {
                     *window = None;
                     asks.asker = None;
-                    self.note.close();
+                    self.close_ui();
                     println!("Pairing: {name} at {peer} no longer needs its code; the window closed.");
                 }
                 PairResult::refused("closed")
@@ -244,7 +261,7 @@ impl PairingDoor {
                     Verdict::Accept { proof_m } => {
                         *window = None;
                         asks.asker = None;
-                        self.note.close();
+                        self.close_ui();
                         let device = PairedDevice {
                             fingerprint: b64url(fp_device),
                             name: name.clone(),
@@ -282,7 +299,7 @@ impl PairingDoor {
                     Verdict::Closed(reason) => {
                         *window = None;
                         asks.asker = None;
-                        self.note.close();
+                        self.close_ui();
                         if reason == "stopped" {
                             asks.stopped(fp_device, source, now);
                             println!("Pairing stopped after {} wrong codes.", pairing::MAX_FAILURES);
@@ -316,10 +333,46 @@ impl PairingDoor {
         if let Some(path) = &self.code_file {
             let _ = std::fs::write(path, &w.code);
         }
-        self.note.show(
-            &format!("{name} wants to pair with {}", self.host_name),
-            &format!("Enter this code on it: {}  ({}:{:02} left)", pairing::grouped(&w.code), left / 60, left % 60),
-        );
+        let title = format!("{name} wants to pair with {}", self.host_name);
+        let body = format!("Enter this code on it: {}  ({}:{:02} left)", pairing::grouped(&w.code), left / 60, left % 60);
+        // The pairing window on this screen when the extension draws one, else the notification.
+        let ui = self.ui.lock().unwrap().clone();
+        let shown = match (ui, qr_modules(&link)) {
+            (Some(tx), Some((modules, width))) => tx
+                .send(PairingUi::Show { title: title.clone(), code: pairing::grouped(&w.code), modules, width, seconds: left as u32, note: body.clone() })
+                .is_ok(),
+            _ => false,
+        };
+        if !shown {
+            self.note.show(&title, &body);
+        }
+    }
+
+    /// Where the pairing window goes (the GNOME extension's, from version 3).
+    pub fn set_pairing_ui(&self, tx: tokio::sync::mpsc::UnboundedSender<PairingUi>) {
+        *self.ui.lock().unwrap() = Some(tx);
+    }
+
+    /// The notification or the pairing window goes: the window closed.
+    fn close_ui(&self) {
+        self.note.close();
+        if let Some(tx) = self.ui.lock().unwrap().as_ref() {
+            let _ = tx.send(PairingUi::Close);
+        }
+    }
+
+    /// The pairing window's Cancel on this screen: the window closes, and the device that asked
+    /// opens no other for 10 minutes, as Sill for Mac's Cancel ("Didn't ask for this?").
+    pub fn cancel_on_screen(&self) {
+        let mut window = self.window.lock().unwrap();
+        let mut asks = self.asks.lock().unwrap();
+        if window.take().is_some() {
+            if let Some((key, source)) = asks.asker.take() {
+                asks.stopped(&key, &source, self.started.elapsed().as_secs_f64());
+            }
+            self.note.close();
+            println!("Pairing: cancelled on this screen; the device that asked opens no window for 10 minutes.");
+        }
     }
 
     /// `sill://pair?v=1&m=…&k=…&s=…&n=…&p=…&a=…`, as `PairLink.url`.
@@ -558,5 +611,13 @@ mod tests {
 
     fn hex_bytes(h: &str) -> Vec<u8> {
         (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn qr() {
+        let (m, w) = qr_modules("sill://pair?v=1&m=ABCDEFGHJKMNPQRS&k=x&s=y&n=plexy&p=47460").unwrap();
+        assert!(w >= 21 && (w - 17) % 4 == 0);
+        assert_eq!(m.len(), (w * w) as usize);
+        assert!(m.starts_with("1111111"), "a finder pattern in the corner");
     }
 }

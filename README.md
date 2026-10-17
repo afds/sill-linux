@@ -68,9 +68,11 @@ A firewall must let the device in: TCP on the port (47460 by default) and mDNS, 
 
 ## Pairing
 
-In the app, this machine shows up as a row, "Not paired". Tap it, then Enter Code Instead, and type
-the code. The code appears as a desktop notification from the service, or in the terminal (with a
-QR code if `qrencode` is installed). Each device pairs once; after that a tap connects.
+In the app, this machine shows up as a row, "Not paired". Tap it: on GNOME with the extension, a
+pairing window comes up in the middle of this screen with a QR code to scan with the app's camera
+and the code for Enter Code Instead. It closes by itself once the device pairs; its Cancel keeps
+that device from asking again for 10 minutes. Without the extension the code comes as a desktop
+notification, and in a terminal it is printed too (with a QR code if `qrencode` is installed). Each device pairs once; after that a tap connects.
 `--forget-devices` removes every paired device.
 
 ## Security

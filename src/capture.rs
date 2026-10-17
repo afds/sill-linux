@@ -808,6 +808,9 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
                 );
             }
             server.set_gestures();
+            if running >= 3 && let Some(door) = server.pairing_door() {
+                tokio::spawn(pairing_window(door, s.clone()));
+            }
             // This machine's pointer on the devices (kind 26), unless it is in the picture already.
             if cursor == 0 {
                 let origin = crate::mutter::monitor_origin(&conn, &connector).await.unwrap_or((0, 0));
@@ -830,7 +833,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 2;
+const EXTENSION_VERSION: u32 = 3;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -1052,6 +1055,36 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     Some(s) if s.command(method, id).await => {}
                     _ => println!("Window command {action} did not reach the window."),
                 }
+            }
+        }
+    }
+}
+
+/// The pairing code's window on this screen (the extension draws it), for as long as the extension
+/// runs; its Cancel cancels the pairing.
+async fn pairing_window(door: Arc<crate::door::PairingDoor>, shell: crate::shell::Client) {
+    use crate::door::PairingUi;
+    use futures_util::StreamExt;
+    let Ok(mut cancels) = shell.pairing_cancels().await else { return };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    door.set_pairing_ui(tx);
+    loop {
+        tokio::select! {
+            ui = rx.recv() => match ui {
+                None => return,
+                Some(PairingUi::Show { title, code, modules, width, seconds, note }) => {
+                    if !shell.show_pairing(&title, &code, &modules, width, seconds).await {
+                        door.note.show(&title, &note);
+                    }
+                }
+                Some(PairingUi::Close) => shell.close_pairing().await,
+            },
+            c = cancels.next() => {
+                if c.is_none() {
+                    return;
+                }
+                let d = door.clone();
+                let _ = tokio::task::spawn_blocking(move || d.cancel_on_screen()).await;
             }
         }
     }

@@ -1011,6 +1011,14 @@ impl Server {
         self.reapply(&st);
     }
 
+    /// The pairing door, when this host has one (TLS).
+    pub fn pairing_door(&self) -> Option<Arc<PairingDoor>> {
+        match &self.door {
+            Door::Tls(d) => Some(d.clone()),
+            Door::Plain => None,
+        }
+    }
+
     fn mac_info_message(&self, addresses: &[crate::remote::Address]) -> Option<Vec<u8>> {
         match &self.door {
             Door::Tls(d) => d.mac_info_message(addresses),

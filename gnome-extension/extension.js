@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (2)
+//   Version() -> u                this interface's version (3)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -42,6 +42,12 @@
 //                                 -1 when there is none
 //   MinimizeWorkspace() -> at     minimizes the active workspace's listed windows; their ids
 //   Unminimize(at ids) -> b
+//   ShowPairing(s title, s code, s modules, u width, u seconds) -> b   a pairing window in the
+//                                 middle of the primary monitor, above windows and without taking
+//                                 the keyboard: the title, a QR code (modules: width×width of '1'
+//                                 dark and '0' light, row by row), the code, the time left, Cancel
+//   ClosePairing()                closes it
+//   PairingCancelled              its Cancel was clicked (it closes too)
 //
 // Mutter's own screen-cast API already lets any unsandboxed process of this user record a window;
 // this adds titles and a window list, which GNOME keeps from ordinary apps. Sandboxed (Flatpak)
@@ -53,6 +59,7 @@ import Meta from 'gi://Meta';
 import Mtk from 'gi://Mtk';
 import Shell from 'gi://Shell';
 import Cairo from 'cairo';
+import Clutter from 'gi://Clutter';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -108,13 +115,16 @@ const XML = `
     <method name="SwitchWorkspace"><arg type="i" direction="in" name="delta"/><arg type="i" direction="out" name="index"/></method>
     <method name="MinimizeWorkspace"><arg type="at" direction="out" name="ids"/></method>
     <method name="Unminimize"><arg type="at" direction="in" name="ids"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="ShowPairing"><arg type="s" direction="in" name="title"/><arg type="s" direction="in" name="code"/><arg type="s" direction="in" name="modules"/><arg type="u" direction="in" name="width"/><arg type="u" direction="in" name="seconds"/><arg type="b" direction="out" name="ok"/></method>
+    <method name="ClosePairing"/>
+    <signal name="PairingCancelled"/>
     <signal name="CursorChanged"/>
     <signal name="ClipboardChanged"/>
     <signal name="WindowsChanged"/>
   </interface>
 </node>`;
 
-const VERSION = 2;
+const VERSION = 3;
 
 function listed(w) {
     return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
@@ -412,6 +422,84 @@ class Service {
         return true;
     }
 
+    ShowPairing(title, code, modules, width, seconds) {
+        this.ClosePairing();
+        if (width < 21 || modules.length !== width * width)
+            return false;
+        const box = new St.BoxLayout({
+            style_class: 'modal-dialog',
+            orientation: Clutter.Orientation.VERTICAL,
+            reactive: true,
+            style: 'padding: 24px 32px; spacing: 14px;',
+        });
+        const label = (text, style) => new St.Label({text, style, x_align: Clutter.ActorAlign.CENTER});
+        box.add_child(label(title, 'font-weight: bold; font-size: 14pt;'));
+        const qr = new St.DrawingArea({style: 'width: 264px; height: 264px;', x_align: Clutter.ActorAlign.CENTER});
+        qr.connect('repaint', area => {
+            const cr = area.get_context();
+            const [w, h] = area.get_surface_size();
+            const side = Math.min(w, h);
+            const n = width + 8; // a quiet zone of 4 modules each side
+            const m = Math.floor(side / n);
+            const off = Math.floor((side - m * n) / 2);
+            cr.setSourceRGB(1, 1, 1);
+            cr.paint();
+            cr.setSourceRGB(0, 0, 0);
+            for (let y = 0; y < width; y++) {
+                for (let x = 0; x < width; x++) {
+                    if (modules[y * width + x] === '1')
+                        cr.rectangle(off + (x + 4) * m, off + (y + 4) * m, m, m);
+                }
+            }
+            cr.fill();
+            cr.$dispose();
+        });
+        box.add_child(qr);
+        box.add_child(label('Scan this with the Sill app, or enter this code:', ''));
+        box.add_child(label(code, 'font-family: monospace; font-size: 20pt; font-weight: bold;'));
+        const left = label('', 'font-size: 9pt;');
+        box.add_child(left);
+        let remaining = seconds;
+        const tick = () => {
+            left.text = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} left`;
+        };
+        tick();
+        const cancel = new St.Button({label: 'Cancel', style_class: 'button', can_focus: true, x_align: Clutter.ActorAlign.CENTER});
+        cancel.connect('clicked', () => {
+            this.ClosePairing();
+            this._dbus?.emit_signal('PairingCancelled', null);
+        });
+        box.add_child(cancel);
+        Main.layoutManager.addTopChrome(box);
+        const center = () => {
+            const mon = Main.layoutManager.primaryMonitor;
+            if (mon)
+                box.set_position(Math.round(mon.x + (mon.width - box.width) / 2), Math.round(mon.y + (mon.height - box.height) / 2));
+        };
+        box.connect('notify::width', center);
+        box.connect('notify::height', center);
+        center();
+        this._pairing = box;
+        this._pairingTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            remaining = Math.max(0, remaining - 1);
+            tick();
+            return GLib.SOURCE_CONTINUE;
+        });
+        return true;
+    }
+
+    ClosePairing() {
+        if (this._pairingTimer) {
+            GLib.source_remove(this._pairingTimer);
+            this._pairingTimer = 0;
+        }
+        if (this._pairing) {
+            Main.layoutManager.removeChrome(this._pairing);
+            this._pairing.destroy();
+            this._pairing = null;
+        }
+    }
+
     // WindowsChanged, at most every 250 ms.
     changed() {
         if (this._pending)
@@ -467,6 +555,7 @@ class Service {
     }
 
     disable() {
+        this.ClosePairing();
         for (const id of this._signals)
             global.display.disconnect(id);
         if (this._cursorSignal) {
