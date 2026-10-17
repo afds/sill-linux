@@ -99,6 +99,16 @@ pub enum Control {
     Fit(u64, i32, i32),
 }
 
+/// Why sharing ended on this machine (`Server::sharing_ended`).
+pub enum Ended {
+    /// GNOME's sharing indicator's stop.
+    Stopped,
+    /// The screen locked (GNOME ends and refuses sessions until it is unlocked).
+    Locked,
+    /// A session could not be made.
+    Failed(String),
+}
+
 /// What is streamed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Source {
@@ -1053,16 +1063,21 @@ impl Server {
         }
     }
 
-    /// Sharing was stopped on this machine (GNOME's indicator): every device is told, in words the
-    /// app shows as they are, and does not reconnect by itself (kind 22 with a reason it does not
-    /// know, `reconnect` false); a tap on its row connects again. One that has not closed in 2 s is
-    /// closed.
-    pub fn stopped_here(&self) {
-        let goodbye = serde_json::json!({
-            "reason": "stopped",
-            "message": format!("Sharing was stopped on {}. Tap it to connect again.", self.host_name),
-            "reconnect": false,
-        });
+    /// Sharing ended on this machine: every device is told why, in words the app shows as they are,
+    /// and does not reconnect by itself (kind 22 with a reason it does not know, `reconnect` false);
+    /// a tap on its row connects again. One that has not closed in 2 s is closed.
+    pub fn sharing_ended(&self, why: Ended) {
+        let name = &self.host_name;
+        let (reason, message, line) = match why {
+            Ended::Stopped => ("stopped", format!("Sharing was stopped on {name}. Tap it to connect again."),
+                "Sharing was stopped here (GNOME's indicator): devices told; the next connection starts it again.".to_string()),
+            Ended::Locked => ("locked", format!("{name} locked its screen. Unlock it, then tap it to connect again."),
+                "The screen is locked: GNOME allows no screen sharing until it is unlocked; devices told.".to_string()),
+            Ended::Failed(e) => ("unavailable", format!("{name} could not share its screen. Tap it to try again."),
+                format!("Could not share the screen ({e}); devices told.")),
+        };
+        println!("{line}");
+        let goodbye = serde_json::json!({ "reason": reason, "message": message, "reconnect": false });
         let msg = protocol::message(kind::GOODBYE, protocol::now(), false, goodbye.to_string().as_bytes());
         let ids: Vec<u64> = {
             let st = self.state.lock().unwrap();
@@ -1075,7 +1090,7 @@ impl Server {
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(2));
             for id in ids {
-                server.remove(id, "sharing stopped here");
+                server.remove(id, "sharing ended here");
             }
         });
     }

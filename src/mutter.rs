@@ -60,20 +60,6 @@ pub async fn monitor_connector(conn: &zbus::Connection, wanted: Option<&str>) ->
         .ok_or_else(|| anyhow!("no monitor"))
 }
 
-/// Where the monitor `connector` sits in the logical layout (its top-left, logical pixels).
-pub async fn monitor_origin(conn: &zbus::Connection, connector: &str) -> Result<(i32, i32)> {
-    type Mode = (String, i32, i32, f64, f64, Vec<f64>, HashMap<String, OwnedValue>);
-    type Monitor = ((String, String, String, String), Vec<Mode>, HashMap<String, OwnedValue>);
-    type Logical = (i32, i32, f64, u32, bool, Vec<(String, String, String, String)>, HashMap<String, OwnedValue>);
-    let reply = conn
-        .call_method(Some("org.gnome.Mutter.DisplayConfig"), "/org/gnome/Mutter/DisplayConfig", Some("org.gnome.Mutter.DisplayConfig"), "GetCurrentState", &())
-        .await
-        .context("DisplayConfig.GetCurrentState")?;
-    let (_serial, _monitors, logical, _props): (u32, Vec<Monitor>, Vec<Logical>, HashMap<String, OwnedValue>) =
-        reply.body().deserialize().context("reading the monitor layout")?;
-    logical.iter().find(|l| l.5.iter().any(|m| m.0 == connector)).map(|l| (l.0, l.1)).ok_or_else(|| anyhow!("no monitor {connector}"))
-}
-
 /// A monitor in the logical layout: its connector, the name GNOME's Displays settings show, and
 /// where it sits (x, y, width, height, logical pixels).
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +101,16 @@ pub async fn monitors(conn: &zbus::Connection) -> Result<Vec<Monitor>> {
         }
     }
     Ok(out)
+}
+
+/// Whether the screen is locked (GNOME Shell's `org.gnome.ScreenSaver`). GNOME blocks every screen
+/// cast and remote-desktop session while it is: running ones end, new ones are refused ("Session
+/// creation inhibited").
+pub async fn screen_locked(conn: &zbus::Connection) -> bool {
+    match conn.call_method(Some("org.gnome.ScreenSaver"), "/org/gnome/ScreenSaver", Some("org.gnome.ScreenSaver"), "GetActive", &()).await {
+        Ok(r) => r.body().deserialize::<bool>().unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// One linked remote-desktop and screen-cast session.

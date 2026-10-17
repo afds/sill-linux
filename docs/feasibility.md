@@ -739,3 +739,29 @@ streaming, mixed scales.
   every GStreamer plugin above present). Not run on GitHub yet.
 - Found doing it: the build without the capture feature had broken (`restore.rs` uses the
   extension client's frame type); it is now built only with capture.
+
+## A locked screen (2026-10-17)
+
+GNOME Shell inhibits remote access while the lock screen shows (main.js: `inhibit_remote_access()`
+when the session mode does not allow screencasts, unless the shell is headless): Mutter ends every
+screen-cast and remote-desktop session and refuses new ones ("Session creation inhibited") until
+the screen is unlocked. The nested test shell is headless, so there remote control of the lock
+screen worked (the session stayed, typed text reached the password field); on a desktop it does not.
+
+What sill-linux does with it:
+- No session at start: the monitor's place and size come from the display configuration, so a
+  start with the screen locked works (it used to exit, and systemd restarted it every 5 s), and
+  GNOME's indicator no longer flashes at start.
+- A session GNOME ends while the screen is locked tells the devices "‹name› locked its screen.
+  Unlock it, then tap it to connect again." (reason "locked", no reconnect), not that sharing was
+  stopped; a device connecting while it is locked hears the same; any other failure to make a
+  session is told too ("unavailable"), and the host waits for the next connection instead of
+  exiting. Locked: `org.gnome.ScreenSaver.GetActive`.
+- While a device is connected, GNOME's session manager holds off suspend (inhibitor flag 4), so an
+  idle machine stays reachable; the screen still blanks and locks.
+
+Checked in the nested shell with a test-only extension that locks and inhibits remote access as
+main.js does on a desktop: the host started while locked, a device connecting while locked got
+the locked goodbye, after unlocking it streamed, and locking while it streamed gave the locked
+goodbye; the host ran throughout. The suspend inhibitor's call answered with a cookie on this
+desktop's session manager (the nested shell has none).

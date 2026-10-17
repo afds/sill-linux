@@ -11,7 +11,7 @@
 
 use crate::protocol;
 use crate::input::{Action, CommandKey, Translator};
-use crate::server::{Apply, Control, HostWindow, InputCmd, Server, Source};
+use crate::server::{Apply, Control, Ended, HostWindow, InputCmd, Server, Source};
 use ashpd::desktop::remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions, StartOptions};
 use ashpd::desktop::Session;
 use std::collections::HashMap;
@@ -89,9 +89,12 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
     if let Some(tx) = input_tx {
         server.set_input(tx);
     }
-    match cast.size {
-        Some((w, h)) => println!("Screen cast: PipeWire node {}, {w}×{h}.", cast.node),
-        None => println!("Screen cast: PipeWire node {}.", cast.node),
+    // GNOME's API has no stream yet (one opens when a device picks a source).
+    if recorder.is_none() {
+        match cast.size {
+            Some((w, h)) => println!("Screen cast: PipeWire node {}, {w}×{h}.", cast.node),
+            None => println!("Screen cast: PipeWire node {}.", cast.node),
+        }
     }
 
     gst::init().context("GStreamer init")?;
@@ -137,8 +140,9 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             Outcome::Switch(s) => s,
             outcome @ (Outcome::Idle | Outcome::StoppedHere) => {
                 if matches!(outcome, Outcome::StoppedHere) {
-                    println!("Sharing was stopped here (GNOME's indicator): devices told; the next connection starts it again.");
-                    server.stopped_here();
+                    // GNOME ends the session itself when the screen locks.
+                    let rec = recorder.as_ref().expect("only GNOME's API idles");
+                    server.sharing_ended(if screen_locked(rec) { Ended::Locked } else { Ended::Stopped });
                 }
                 let rec = recorder.as_ref().expect("only GNOME's API idles");
                 match idle(server, &control, rec, &mut apply)? {
@@ -196,15 +200,24 @@ fn idle(server: &Server, control: &Receiver<Control>, rec: &Recorder, apply: &mu
         let req = match control.recv() {
             Err(_) => return Ok(None),
             Ok(Control::Start(source)) => {
-                return match record(rec, source) {
-                    Ok(cast) => Ok(Some((cast, source))),
-                    Err(e) if source != Source::Desktop => {
-                        println!("Could not stream that window: {e:#}; the Desktop instead.");
-                        server.showing_desktop();
-                        Ok(Some((record(rec, Source::Desktop)?, Source::Desktop)))
+                let tried = record(rec, source).map(|c| (c, source)).or_else(|e| {
+                    if source == Source::Desktop {
+                        return Err(e);
                     }
-                    Err(e) => Err(e),
-                };
+                    println!("Could not stream that window: {e:#}; the Desktop instead.");
+                    server.showing_desktop();
+                    record(rec, Source::Desktop).map(|c| (c, Source::Desktop))
+                });
+                match tried {
+                    Ok(started) => return Ok(Some(started)),
+                    // The devices are told and this host waits for the next connection: GNOME
+                    // refuses sessions while the screen is locked.
+                    Err(e) => {
+                        let ended = if screen_locked(rec) { Ended::Locked } else { Ended::Failed(format!("{e:#}")) };
+                        server.sharing_ended(ended);
+                    }
+                }
+                continue;
             }
             Ok(Control::Apply(a)) => {
                 *apply = a;
@@ -218,6 +231,15 @@ fn idle(server: &Server, control: &Receiver<Control>, rec: &Recorder, apply: &mu
         };
         let _ = rec.send(req);
     }
+}
+
+/// Whether the screen is locked (asked of the GNOME session's task).
+fn screen_locked(rec: &Recorder) -> bool {
+    let (tx, rx) = mpsc::channel();
+    if rec.send(RecReq::Locked(tx)).is_err() {
+        return false;
+    }
+    rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
 }
 
 /// Whether GNOME's session still runs: a stream that failed with it gone was stopped here.
@@ -782,20 +804,23 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
     let wanted = MONITOR.lock().unwrap().clone();
     let connector = crate::mutter::monitor_connector(&conn, wanted.as_deref()).await?;
-    let session = crate::mutter::Session::new(conn.clone()).await?;
+    // No session yet: one opens when a device picks a source (a session made now would show GNOME's
+    // sharing indicator, and fails while the screen is locked). The monitor's place and size come
+    // from the display configuration.
     let cursor = if SHOW_CURSOR.load(Ordering::Relaxed) { 1 } else { 0 };
-    let stream = session.record(crate::mutter::Source::Monitor(&connector), cursor).await?;
+    let rect = crate::mutter::monitors(&conn).await?.into_iter().find(|m| m.connector == connector).map(|m| m.rect);
     println!("Capture: GNOME's own screen-cast API, monitor {connector}{}.", if input.is_some() { ", with remote control" } else { "" });
-    let cast = PortalCast { fd: None, node: stream.node, size: stream.size };
-    let shown: Shown = Arc::new(std::sync::Mutex::new(Some((Arc::new(session), stream.clone()))));
+    let cast = PortalCast { fd: None, node: 0, size: rect.map(|r| (r.2, r.3)) };
+    let shown: Shown = Arc::new(std::sync::Mutex::new(None));
     let input_tx = input.map(|command| {
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (w, h) = stream.size.map(|(w, h)| (w as f64, h as f64)).unwrap_or((1920.0, 1080.0));
+        let (w, h) = rect.map(|r| (r.2 as f64, r.3 as f64)).unwrap_or((1920.0, 1080.0));
         let sink = InputSink::Mutter { shown: shown.clone() };
         tokio::spawn(run_input(sink, w, h, command, true, input_rx));
         input_tx
     });
     let (rec_tx, rec_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(hold_off_suspend(server.clone(), conn.clone()));
     let shell = crate::shell::Client::connect(&conn).await;
     match &shell {
         Some(s) => {
@@ -813,8 +838,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
             }
             // This machine's pointer on the devices (kind 26), unless it is in the picture already.
             if cursor == 0 {
-                let origin = crate::mutter::monitor_origin(&conn, &connector).await.unwrap_or((0, 0));
-                let desktop = stream.size.map(|(w, h)| (origin.0 as f64, origin.1 as f64, w as f64, h as f64));
+                let desktop = rect.map(|r| (r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64));
                 tokio::spawn(watch_pointer(server.clone(), s.clone(), desktop));
             }
             if SHARE_CLIPBOARD.load(Ordering::Relaxed) {
@@ -882,6 +906,8 @@ enum RecReq {
     Close,
     /// Whether the session shown still runs.
     Alive(mpsc::Sender<bool>),
+    /// Whether the screen is locked.
+    Locked(mpsc::Sender<bool>),
 }
 
 /// An app launched from a device, and when: its first window listed within `LAUNCH_WAIT` is picked.
@@ -1027,6 +1053,9 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     session.stop().await;
                 }
             }
+            RecReq::Locked(reply) => {
+                let _ = reply.send(crate::mutter::screen_locked(&conn).await);
+            }
             RecReq::Alive(reply) => {
                 let current = shown.lock().unwrap().clone();
                 let alive = match current {
@@ -1094,6 +1123,41 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     _ => println!("Window command {action} did not reach the window."),
                 }
             }
+        }
+    }
+}
+
+/// While a device is connected, this machine does not suspend by itself when idle (GNOME's
+/// session manager, "suspend" inhibitor; one asleep cannot be reached), as Sill for Mac holds off
+/// idle sleep. The screen still blanks and locks as usual. Looked at every 2 s.
+// shortcut: GNOME only (org.gnome.SessionManager); the portal path on other desktops does not hold
+// it off, logind's inhibitor would if that matters.
+async fn hold_off_suspend(server: Server, conn: ashpd::zbus::Connection) {
+    const SUSPEND: u32 = 4;
+    let mut cookie: Option<u32> = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let connected = server.client_count() > 0;
+        if connected && cookie.is_none() {
+            let reply = conn
+                .call_method(Some("org.gnome.SessionManager"), "/org/gnome/SessionManager", Some("org.gnome.SessionManager"), "Inhibit",
+                    &("sill-linux", 0u32, "A device is connected to sill-linux", SUSPEND))
+                .await;
+            match reply.and_then(|r| r.body().deserialize::<u32>()) {
+                Ok(c) => {
+                    cookie = Some(c);
+                    println!("Suspend: held off while a device is connected.");
+                }
+                Err(e) => {
+                    println!("Suspend: could not hold it off ({e}); this machine may suspend while a device is connected.");
+                    return;
+                }
+            }
+        } else if !connected && let Some(c) = cookie.take() {
+            let _ = conn
+                .call_method(Some("org.gnome.SessionManager"), "/org/gnome/SessionManager", Some("org.gnome.SessionManager"), "Uninhibit", &(c,))
+                .await;
+            println!("Suspend: allowed again (no device connected).");
         }
     }
 }
