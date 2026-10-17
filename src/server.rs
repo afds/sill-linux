@@ -16,6 +16,8 @@
 use crate::door::{PairingDoor, Admission};
 use crate::input::InputEvent;
 use crate::protocol::{self, kind, ClientStats, Hello, StreamSource, Viewport, WindowList};
+use crate::settings::{self, HostSettingsChange, RunningStream, Settings};
+use std::path::PathBuf;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,6 +44,22 @@ pub enum Control {
     Stop,
     /// A client needs a keyframe (it joined, or it lost a delta).
     Keyframe,
+    /// What the encoder should run at now.
+    Apply(Apply),
+}
+
+/// The encoder's settings, from the saved settings and the devices' rates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Apply {
+    pub bitrate: i64,
+    pub fps: i64,
+    pub retina: bool,
+}
+
+impl Apply {
+    pub fn kbps(&self) -> u32 {
+        (self.bitrate / 1000) as u32
+    }
 }
 
 /// What the server hands the input side: one device's event, or that it left (its keys and
@@ -69,6 +87,8 @@ struct Client {
     last_drain: Arc<Mutex<Instant>>,
     connected_at: Instant,
     needs_keyframe: bool,
+    /// The rate its viewport asks for (nil: 60).
+    fps: Option<i64>,
 }
 
 struct State {
@@ -78,6 +98,11 @@ struct State {
     clients: HashMap<u64, Client>,
     next_id: u64,
     active: StreamSource,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    software_encoder: bool,
+    /// The encoded picture's size, for the panel's readout.
+    encoded: Option<(i64, i64)>,
 }
 
 #[derive(Clone)]
@@ -92,15 +117,111 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(host_name: String, control: Sender<Control>, door: Door) -> Server {
+    /// `settings_path`: where devices' changes are saved (None: kept until this host quits).
+    pub fn new(host_name: String, control: Sender<Control>, door: Door, settings_path: Option<PathBuf>) -> Server {
+        let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
         Server {
-            state: Arc::new(Mutex::new(State { sent: 0, dropped: 0, clients: HashMap::new(), next_id: 1, active: StreamSource::None })),
+            state: Arc::new(Mutex::new(State {
+                sent: 0,
+                dropped: 0,
+                clients: HashMap::new(),
+                next_id: 1,
+                active: StreamSource::None,
+                settings,
+                settings_path,
+                software_encoder: false,
+                encoded: None,
+            })),
             control,
             host_name: Arc::new(host_name),
             launch_id: Arc::new(uuid::Uuid::new_v4().to_string()),
             door,
             input: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// What the encoder should run at, from the settings and the connected devices.
+    pub fn current_apply(&self) -> Apply {
+        Self::apply_of(&self.state.lock().unwrap())
+    }
+
+    fn apply_of(st: &State) -> Apply {
+        let fastest = st.clients.values().filter_map(|c| c.fps).max();
+        let fps = st.settings.fps(fastest.or(if st.clients.is_empty() { None } else { Some(60) }));
+        Apply { bitrate: st.settings.bitrate_at(fps), fps, retina: st.settings.retina() }
+    }
+
+    pub fn set_software_encoder(&self, software: bool) {
+        self.state.lock().unwrap().software_encoder = software;
+    }
+
+    /// From the capture side with each frame: a new size is told to the devices (the panel's
+    /// readout).
+    pub fn set_encoded_size(&self, width: i64, height: i64) {
+        let mut st = self.state.lock().unwrap();
+        if st.encoded != Some((width, height)) {
+            st.encoded = Some((width, height));
+            self.broadcast_settings(&st, None);
+        }
+    }
+
+    fn settings_message(&self, st: &State, answering: Option<i64>) -> Vec<u8> {
+        let apply = Self::apply_of(st);
+        let stream = match (st.active, st.encoded) {
+            (StreamSource::None, _) | (_, None) => None,
+            (_, Some((w, h))) => Some(RunningStream {
+                width: w,
+                height: h,
+                fps: apply.fps,
+                mbps: (apply.bitrate as f64 / 1e6).round() as i64,
+                on_virtual_display: false,
+            }),
+        };
+        let state = settings::state(&st.settings, st.software_encoder, stream, answering);
+        protocol::message(kind::HOST_SETTINGS, protocol::now(), false, &serde_json::to_vec(&state).unwrap())
+    }
+
+    /// Kind 16 to every device; with `answering`, that device's token goes to it alone.
+    fn broadcast_settings(&self, st: &State, answering: Option<(u64, i64)>) {
+        let plain = self.settings_message(st, None);
+        for (id, c) in &st.clients {
+            match answering {
+                Some((aid, token)) if aid == *id => {
+                    let _ = c.tx.send(self.settings_message(st, Some(token)));
+                }
+                _ => {
+                    let _ = c.tx.send(plain.clone());
+                }
+            }
+        }
+    }
+
+    /// Re-derives the encoder's settings after the devices or the settings changed.
+    fn reapply(&self, st: &State) {
+        let _ = self.control.send(Control::Apply(Self::apply_of(st)));
+    }
+
+    fn change_settings(&self, id: u64, change: HostSettingsChange) {
+        let mut st = self.state.lock().unwrap();
+        let label = st.clients.get(&id).map(|c| c.label.clone()).unwrap_or_default();
+        let (next, refused) = settings::accept(st.settings, &change);
+        if next != st.settings {
+            println!(
+                "Settings from {label}: {}",
+                describe_change(&st.settings, &next)
+            );
+            st.settings = next;
+            if let Some(path) = st.settings_path.clone() {
+                if let Err(e) = next.save(&path) {
+                    eprintln!("Settings: could not save {}: {e}", path.display());
+                }
+            }
+            self.reapply(&st);
+        }
+        if !refused.is_empty() {
+            println!("Settings from {label} refused: {}", refused.join(", "));
+        }
+        self.broadcast_settings(&st, change.token.map(|t| (id, t)));
     }
 
     /// Where devices' input goes from now on.
@@ -195,6 +316,7 @@ impl Server {
             let id = st.next_id;
             st.next_id += 1;
             let _ = tx.send(self.window_list(st.active));
+            let _ = tx.send(self.settings_message(&st, None));
             st.clients.insert(
                 id,
                 Client {
@@ -205,6 +327,7 @@ impl Server {
                     last_drain: last_drain.clone(),
                     connected_at: Instant::now(),
                     needs_keyframe: true,
+                    fps: None,
                 },
             );
             if st.active != StreamSource::None {
@@ -264,8 +387,22 @@ impl Server {
                         );
                     }
                 }
+                kind::CHANGE_SETTINGS => match serde_json::from_slice::<HostSettingsChange>(&payload) {
+                    Ok(change) => self.change_settings(id, change),
+                    Err(e) => eprintln!("Bad settings change from client {id}: {e}"),
+                },
                 kind::VIEWPORT => {
                     if let Ok(v) = serde_json::from_slice::<Viewport>(&payload) {
+                        let mut st = self.state.lock().unwrap();
+                        let changed = st.clients.get_mut(&id).map(|c| {
+                            let was = c.fps;
+                            c.fps = v.fps;
+                            was != v.fps
+                        });
+                        if changed == Some(true) {
+                            self.reapply(&st);
+                        }
+                        drop(st);
                         println!(
                             "Viewport from client {id}: {}×{} pt, scale {}, {} fps",
                             v.width,
@@ -352,6 +489,7 @@ impl Server {
             println!("Streaming: nothing (no devices)");
             let _ = self.control.send(Control::Stop);
         }
+        self.reapply(&st);
     }
 
     /// Called from the capture thread with each encoded access unit.
@@ -430,6 +568,22 @@ impl Server {
     }
 }
 
+/// "bitrate 15 → 40 Mbps per 60 fps, resolution Standard → Retina".
+fn describe_change(a: &Settings, b: &Settings) -> String {
+    let mut parts = Vec::new();
+    if a.bitrate != b.bitrate {
+        parts.push(format!("bitrate {} → {} Mbps per 60 fps", a.bitrate / 1_000_000, b.bitrate / 1_000_000));
+    }
+    if a.capture_scale != b.capture_scale {
+        let name = |s: &Settings| if s.retina() { "Retina" } else { "Standard" };
+        parts.push(format!("resolution {} → {}", name(a), name(b)));
+    }
+    if a.max_fps != b.max_fps {
+        parts.push(format!("frame rate limit {} → {}", a.max_fps, b.max_fps));
+    }
+    parts.join(", ")
+}
+
 /// One message: the header, then its payload (refused past Sill's cap for client messages).
 pub async fn read_message<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(protocol::Header, Vec<u8>)> {
     let mut header = [0u8; protocol::HEADER_LEN];
@@ -480,7 +634,7 @@ mod tests {
 
     fn start() -> (Server, Receiver<Control>, SocketAddr) {
         let (ctx, crx) = smpsc::channel();
-        let server = Server::new("test host".into(), ctx, Door::Plain);
+        let server = Server::new("test host".into(), ctx, Door::Plain, None);
         let addr = server.listen(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
         (server, crx, addr)
     }

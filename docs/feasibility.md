@@ -288,3 +288,26 @@ motion in logical pixels (unaccelerated: the pointer landed within 2 px of 80 %,
 decoded stream). libei's absolute device, with the compositor's own regions, would avoid the
 two-step move. On the iPad (2026-10-17) after that fix: "the controls work fine". Not tried here, on purpose (they would act on whatever has focus): clicks,
 scrolls, keys and text; those are for the device test.
+
+## Settings and resolution (2026-10-17)
+
+The app's Settings panel works (kinds 16 and 17, Sill's `HostSettings.swift` and
+`DeviceSettings.accepted`): Quality (Sill's seven presets, per 60 fps), Resolution (Retina, the
+stream's pixels; Standard, the monitor's logical size, scaled on the GPU with
+glupload → glcolorconvert → glcolorscale into nvh265enc's GL input), Frame Rate limit (60/120,
+the stream at the lowest of it and the fastest device's viewport). Prioritize Speed is reported on
+and "off" refused (NVENC already runs at its lowest-latency preset); the virtual display is
+reported unavailable with a note; no Direct Wireless row. Changes apply live (the encoder's
+bitrate, the size filter's caps, a frame-rate limiter before the encoder), with a keyframe, and are
+saved in `settings.json`. Standard is this host's default, Sill.app's is Retina: the app's panel is
+far smaller than a 4K picture.
+
+Verified: `cargo test` 31; Sill's `sillclient.py --set=…` against the door: kind 16 after the window
+list; Retina and Pro answered with its token, saved, and the live stream went from 1920×1080 to
+3840×2160 in 0.25 s with a keyframe (both decoded by ffmpeg); 200 Mbps refused with the setting
+kept. Input still lands in the captured stream's pixels whatever the encoded size (the motion
+actions logged in Standard mode: 80 % of the width exactly).
+
+Not done: the pointer drawn on the device (kinds 14 and 26: needs PipeWire's cursor metadata,
+which pipewiresrc does not pass on, so pipewire-rs directly); a busy screen's frame rate on the
+iPad is still to be measured.

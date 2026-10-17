@@ -20,7 +20,7 @@ with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and 
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--bitrate 15] [--name NAME] [--open | --plain] [--no-advertise]
+cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
 ```
 
 Run it in a terminal you can see: when a device asks to pair, the code is printed there (and a
@@ -40,6 +40,12 @@ which opens GNOME's Activities. With a device
 streaming, it prints a `[1s]` line: frames captured, encoded, sent and dropped, then the device's
 own `client …` line every two seconds; `in N` is the device's input events (frame age and round trip, median/worst).
 
+Quality, resolution and frame rate come from the app's Settings panel (the gear), as with Sill
+for Mac, and apply at once without restarting the stream; they are kept in
+`~/.local/state/sill-linux/settings.json`. Resolution: Standard is the monitor's logical size
+(1920×1080 for a 4K monitor at 200 %), this host's default; Retina is every pixel. Prioritize Speed
+stays on (NVENC's lowest-latency preset); there is no virtual display on Linux.
+
 A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.
 
@@ -54,7 +60,8 @@ code to `SILL_LINUX_TEST_CODE_FILE`). `tools/receive.py HOST PORT [SECONDS] [--j
 `--plain` door, checks every message's layout and decodes the stream with ffmpeg.
 
 Testing switches: `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder; `SILL_LINUX_DMABUF=1`
-tries zero copy for NVENC (broken on NVIDIA here, see the doc).
+tries zero copy for NVENC (broken on NVIDIA here, see the doc); `SILL_LINUX_INPUT_LOG=1` prints
+every input action sent to the portal.
 
 ## Dependency policy
 

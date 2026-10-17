@@ -1,8 +1,8 @@
 //! The Desktop: the screen-cast portal hands over a PipeWire stream of one monitor, and a
 //! GStreamer pipeline turns it into HEVC access units for the server.
 //!
-//! pipewiresrc → valve (closed while nobody watches) → videoconvert (passthrough for the
-//! formats the encoder takes) → HEVC encoder (NVENC, else VA-API, else x265; Main profile, no
+//! pipewiresrc → valve (closed while nobody watches) → scaler and `size` filter (Retina or
+//! Standard, on the GPU for NVENC) → HEVC encoder (NVENC, else VA-API, else x265; Main profile, no
 //! B-frames, low latency) → h265parse (parameter sets before every IDR, one access unit per
 //! buffer, Annex-B) → appsink → `protocol::convert_annex_b` → `Server::broadcast_access_unit`.
 //!
@@ -11,7 +11,7 @@
 
 use crate::protocol;
 use crate::input::{Action, CommandKey, Translator};
-use crate::server::{Control, InputCmd, Server};
+use crate::server::{Apply, Control, InputCmd, Server};
 use ashpd::desktop::remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions, StartOptions};
 use ashpd::desktop::Session;
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -40,8 +41,17 @@ struct PortalCast {
     size: Option<(i32, i32)>,
 }
 
+/// The size `pipewiresrc` hands over (the stream's own pixels), width << 32 | height: what the
+/// portal's absolute motion is given in. 0 before the first frame.
+static CAPTURED_SIZE: AtomicU64 = AtomicU64::new(0);
+
+fn captured_size() -> Option<(f64, f64)> {
+    let v = CAPTURED_SIZE.load(Ordering::Relaxed);
+    (v != 0).then(|| ((v >> 32) as f64, (v & 0xffff_ffff) as f64))
+}
+
 /// `input`: the Command key's meaning, or None for view only (no remote control asked for).
-pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input: Option<CommandKey>) -> Result<()> {
+pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey>) -> Result<()> {
     let (cast, input_tx) = start_portal(input)?;
     if let Some(tx) = input_tx {
         server.set_input(tx);
@@ -52,12 +62,17 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
     }
 
     gst::init().context("GStreamer init")?;
-    let (formats, encoder, name) = encoder(bitrate_mbps * 1000)?;
+    let mut apply = server.current_apply();
+    let (formats, encoder, name) = encoder(apply.kbps())?;
+    let software = name.contains("software");
+    server.set_software_encoder(software);
+    let gl = name.starts_with("NVENC");
     // Shared memory by default. SILL_LINUX_DMABUF=1 tries zero copy for NVENC (the compositor's
     // DMA-BUF imported into GL, which nvh265enc reads), but on GNOME 50 with an RTX 3060 glupload
     // read the buffer with the wrong layout (NVIDIA's tiled modifiers) and the picture was garbage.
-    let dmabuf = name.starts_with("NVENC") && std::env::var_os("SILL_LINUX_DMABUF").is_some();
-    println!("Encoder: {name}, {bitrate_mbps} Mbit/s, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
+    let dmabuf = gl && std::env::var_os("SILL_LINUX_DMABUF").is_some();
+    println!("Encoder: {name}, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
+    let logical = cast.size.map(|(w, h)| (w, h));
     // The fd stays open in `cast` for as long as the pipeline runs (pipewiresrc does not own it).
     let description = format!(
         "pipewiresrc fd={fd} path={node} {input} \
@@ -68,13 +83,15 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
          ! appsink name=sink sync=false max-buffers=4 drop=false",
         fd = cast.fd.as_raw_fd(),
         node = cast.node,
-        input = input_chain(dmabuf, formats),
+        input = input_chain(dmabuf, gl, formats),
     );
     let pipeline = gst::parse::launch(&description)
         .context("building the pipeline")?
         .dynamic_cast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
     let gate = pipeline.by_name("gate").ok_or_else(|| anyhow!("no valve"))?;
+    let size = pipeline.by_name("size").ok_or_else(|| anyhow!("no size filter"))?;
+    let enc = pipeline.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
     let sink = pipeline
         .by_name("sink")
         .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
@@ -87,7 +104,7 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 if let Some(s) = sample.caps().and_then(|c| c.structure(0)) {
                     if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
-                        FRAME_SIZE.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+                        frames_server.set_encoded_size(w as i64, h as i64);
                     }
                 }
                 if let Some(buffer) = sample.buffer() {
@@ -100,13 +117,35 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
             .build(),
     );
 
-    // Counters for the once-a-second line: buffers out of pipewiresrc, and encoded units.
+    // Counters for the once-a-second line (buffers out of pipewiresrc, encoded units), the
+    // captured size for input, and the frame-rate limit (frames sooner than it are dropped before
+    // the encoder; the compositor sends at most its refresh rate anyway).
     let captured = Arc::new(AtomicU64::new(0));
     let encoded = Arc::new(AtomicU64::new(0));
+    let min_interval_us = Arc::new(AtomicU64::new(0));
     if let Some(pad) = gate.static_pad("sink") {
         let c = captured.clone();
-        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _| {
             c.fetch_add(1, Ordering::Relaxed);
+            if let Some(s) = pad.current_caps().and_then(|c| c.structure(0).map(|s| s.to_owned())) {
+                if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+                    CAPTURED_SIZE.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    if let Some(pad) = gate.static_pad("src") {
+        let interval = min_interval_us.clone();
+        let last = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let min = Duration::from_micros(interval.load(Ordering::Relaxed));
+            let mut last = last.lock().unwrap();
+            let now = Instant::now();
+            if last.is_some_and(|l| now.duration_since(l) < min) {
+                return gst::PadProbeReturn::Drop;
+            }
+            *last = Some(now);
             gst::PadProbeReturn::Ok
         });
     }
@@ -117,6 +156,32 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
             gst::PadProbeReturn::Ok
         });
     }
+    let configure = |a: &Apply| {
+        enc.set_property("bitrate", a.kbps());
+        // 90 % of the frame interval: a frame a little early is not dropped.
+        min_interval_us.store(900_000 / a.fps.max(1) as u64, Ordering::Relaxed);
+        let mut caps = if gl {
+            "video/x-raw(memory:GLMemory),format=RGBA".to_string()
+        } else {
+            format!("video/x-raw,format={}", formats.split(',').next().unwrap_or("I420"))
+        };
+        if !a.retina {
+            if let Some((w, h)) = logical {
+                caps += &format!(",width={w},height={h}");
+            }
+        }
+        match gst::Caps::from_str(&caps) {
+            Ok(c) => size.set_property("caps", c),
+            Err(e) => eprintln!("Stream settings: bad caps {caps}: {e}"),
+        }
+        let res = match (a.retina, logical) {
+            (false, Some((w, h))) => format!("Standard ({w}×{h})"),
+            (false, None) => "Standard".to_string(),
+            (true, _) => "Retina (the stream's own size)".to_string(),
+        };
+        println!("Stream settings: {res}, up to {} fps, {} Mbit/s.", a.fps, a.kbps() / 1000);
+    };
+    configure(&apply);
     let mut streaming = false;
     let mut last_stats = Instant::now();
 
@@ -139,6 +204,13 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
                 gate.set_property("drop", true);
             }
             Ok(Control::Keyframe) => keyframe_pending = true,
+            Ok(Control::Apply(a)) => {
+                if a != apply {
+                    apply = a;
+                    configure(&apply);
+                    keyframe_pending = true;
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
@@ -177,21 +249,18 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32, input
 }
 
 /// What goes between pipewiresrc's own settings and the encoder: the memory it hands over, the
-/// valve (closed while nobody watches; it passes caps on, so opening it renegotiates nothing),
-/// and the conversion to what the encoder takes.
-fn input_chain(dmabuf: bool, formats: &str) -> String {
+/// valve (closed while nobody watches; it passes caps on, so opening it renegotiates nothing), the
+/// scaler and the `size` filter (Retina or Standard, set live), on the GPU for NVENC.
+fn input_chain(dmabuf: bool, gl: bool, formats: &str) -> String {
     let valve = "valve name=gate drop=true drop-mode=forward-sticky-events";
-    if dmabuf {
-        format!(
-            "keepalive-time=500 ! video/x-raw(memory:DMABuf) ! {valve} \
-             ! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA"
-        )
+    let memory = if dmabuf { "keepalive-time=500 ! video/x-raw(memory:DMABuf)" } else { "always-copy=true keepalive-time=500 ! video/x-raw" };
+    let scale = if gl {
+        "glupload ! glcolorconvert ! glcolorscale ! capsfilter name=size caps=video/x-raw(memory:GLMemory),format=RGBA".to_string()
     } else {
-        format!(
-            "always-copy=true keepalive-time=500 ! video/x-raw ! {valve} \
-             ! videoconvert ! video/x-raw,format={{{formats}}}"
-        )
-    }
+        let first = formats.split(',').next().unwrap_or("I420");
+        format!("videoconvertscale ! capsfilter name=size caps=video/x-raw,format={first}")
+    };
+    format!("{memory} ! {valve} ! {scale}")
 }
 
 fn break_err(pipeline: &gst::Pipeline) {
@@ -217,7 +286,7 @@ fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
         return Ok((
             "BGRx,BGRA,RGBx,RGBA,NV12",
             format!(
-                "nvh265enc preset=p1 tune=ultra-low-latency zerolatency=true bframes=0 gop-size={gop} \
+                "nvh265enc name=enc preset=p1 tune=ultra-low-latency zerolatency=true bframes=0 gop-size={gop} \
                  rc-mode=cbr bitrate={kbps} repeat-sequence-header=true"
             ),
             "NVENC (nvh265enc)",
@@ -226,14 +295,14 @@ fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
     if have("vah265enc") {
         return Ok((
             "NV12",
-            format!("vah265enc b-frames=0 key-int-max={gop} rate-control=cbr bitrate={kbps} target-usage=7"),
+            format!("vah265enc name=enc b-frames=0 key-int-max={gop} rate-control=cbr bitrate={kbps} target-usage=7"),
             "VA-API (vah265enc)",
         ));
     }
     if have("x265enc") {
         return Ok((
             "I420",
-            format!("x265enc speed-preset=ultrafast tune=zerolatency key-int-max={gop} bitrate={kbps}"),
+            format!("x265enc name=enc speed-preset=ultrafast tune=zerolatency key-int-max={gop} bitrate={kbps}"),
             "software x265 (x265enc)",
         ));
     }
@@ -404,14 +473,7 @@ async fn remote_session(command: CommandKey) -> Result<(PortalCast, UnboundedSen
 
 /// Input events counted for the stats line.
 static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
-/// The encoded picture's size, width << 32 | height (0 before the first frame): the space the
-/// portal takes absolute motion in.
-static FRAME_SIZE: AtomicU64 = AtomicU64::new(0);
 
-fn frame_size() -> Option<(f64, f64)> {
-    let v = FRAME_SIZE.load(Ordering::Relaxed);
-    (v != 0).then(|| ((v >> 32) as f64, (v & 0xffff_ffff) as f64))
-}
 
 /// Each device's events through its own `Translator`, executed in order on the portal.
 async fn run_input(
@@ -426,6 +488,8 @@ async fn run_input(
     let mut translators: HashMap<u64, Translator> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut failed = false;
+    // TEST: SILL_LINUX_INPUT_LOG=1 prints every action sent to the portal.
+    let log = std::env::var_os("SILL_LINUX_INPUT_LOG").is_some();
     loop {
         let actions: Vec<Action> = tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -433,7 +497,7 @@ async fn run_input(
                 Some(InputCmd::Event(id, event)) => {
                     INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
                     let t = translators.entry(id).or_insert_with(|| Translator::new(width, height, command));
-                    if let Some((w, h)) = frame_size() {
+                    if let Some((w, h)) = captured_size() {
                         t.set_size(w, h);
                     }
                     t.handle(event, Instant::now())
@@ -446,6 +510,9 @@ async fn run_input(
             }
         };
         for action in actions {
+            if log {
+                println!("Test input: {action:?}");
+            }
             if let Err(e) = perform(&rd, &session, stream, &action).await {
                 if !failed {
                     failed = true;
