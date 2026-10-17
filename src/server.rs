@@ -49,6 +49,9 @@ struct Client {
 }
 
 struct State {
+    /// Frames sent and withheld since the last stats line, summed over clients.
+    sent: u64,
+    dropped: u64,
     clients: HashMap<u64, Client>,
     next_id: u64,
     active: StreamSource,
@@ -65,7 +68,7 @@ pub struct Server {
 impl Server {
     pub fn new(host_name: String, control: Sender<Control>) -> Server {
         Server {
-            state: Arc::new(Mutex::new(State { clients: HashMap::new(), next_id: 1, active: StreamSource::None })),
+            state: Arc::new(Mutex::new(State { sent: 0, dropped: 0, clients: HashMap::new(), next_id: 1, active: StreamSource::None })),
             control,
             host_name: Arc::new(host_name),
             launch_id: Arc::new(uuid::Uuid::new_v4().to_string()),
@@ -290,6 +293,7 @@ impl Server {
             protocol::message(kind::PARAMETER_SETS, ts, true, &protocol::encode_parameter_sets(&au.parameter_sets))
         });
         let mut want_keyframe = false;
+        let (mut sent, mut dropped) = (0u64, 0u64);
         let mut st = self.state.lock().unwrap();
         if st.active == StreamSource::None {
             return;
@@ -300,6 +304,7 @@ impl Server {
                 let _ = c.tx.send(params.clone());
                 c.needs_keyframe = false;
             } else if !au.keyframe && c.frames_in_flight.load(Ordering::SeqCst) > MAX_FRAMES_IN_FLIGHT {
+                dropped += 1;
                 c.needs_keyframe = true;
                 want_keyframe = true;
                 continue;
@@ -308,10 +313,22 @@ impl Server {
             }
             c.frames_in_flight.fetch_add(1, Ordering::SeqCst);
             let _ = c.tx.send(frame.clone());
+            sent += 1;
         }
+        st.sent += sent;
+        st.dropped += dropped;
         if want_keyframe {
             let _ = self.control.send(Control::Keyframe);
         }
+    }
+
+    /// "net.sent N net.dropped M" since the last call, for the capture side's stats line.
+    pub fn take_stats(&self) -> String {
+        let mut st = self.state.lock().unwrap();
+        let s = format!("net.sent {} net.dropped {}", st.sent, st.dropped);
+        st.sent = 0;
+        st.dropped = 0;
+        s
     }
 
     fn tick_loop(&self) {

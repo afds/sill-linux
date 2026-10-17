@@ -153,7 +153,7 @@ Each phase is usable on its own.
 
 0. **This repo and this doc.** Done: the crate, the license, the dependency policy (README), the
    pinned Sill commit (SILL_REFERENCE.md).
-1. **The Desktop to the app, on GNOME.** Portal ScreenCast (monitor, cursor as metadata) →
+1. **The Desktop to the app, on GNOME.** Built; results in "Phase 1 results" below. Portal ScreenCast (monitor, cursor as metadata) →
    PipeWire shared-memory frames → libavcodec `hevc_nvenc` (zero latency, no B-frames, IDR on
    demand) → Annex-B rewritten as length prefixes, kind 0 split out → a plain TCP door. Sends a
    window list with no windows and `active` desktop, pongs and ticks. Tested first with
@@ -197,3 +197,38 @@ For this project:
   [Portal RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
 - [Mutter ScreenCast D-Bus API (RecordWindow)](https://github.com/jadahl/gnome-remote-desktop/blob/master/src/org.gnome.Mutter.ScreenCast.xml)
 - [KDE screencast protocol](https://wayland.app/protocols/kde-zkde-screencast-unstable-v1)
+
+## Phase 1 results (2026-10-17)
+
+Built as planned, on this machine (GNOME 50.1, RTX 3060, a 3840×2160 monitor at scale 2):
+portal → pipewiresrc (shared memory) → nvh265enc → h265parse → appsink → the plain door, with
+Avahi's `avahi-publish` for `_sill._tcp`.
+
+Verified without a device:
+- `cargo test`: 10 tests (header, parameter sets, Annex-B conversion, Swift's JSON shapes, a
+  session as the app runs it, a joining client's keyframe request).
+- Sill's own `Scripts/sillclient.py` against the door: window list, the Desktop pick, pongs,
+  34 ticks a second (Sill's rate).
+- `tools/receive.py` on loopback and over the LAN address: 3840×2160 HEVC Main, 4:2:0, no
+  B-frames, decoded by ffmpeg with no error; the first keyframe 0.04–0.2 s after the pick; a
+  device joining mid-stream got its keyframe in 0.02–0.46 s; nothing dropped; frame age under
+  1 ms on loopback. A decoded frame showed the desktop as it was.
+- CPU about 4–15 % of one core while streaming; the restore token skips the dialog.
+
+Found on the way:
+- **pipewiresrc's clock.** Its keep-alive resend waits on the pipeline clock, which was
+  PipeWire's own; with the screen still it never fired and the stream stalled for seconds (the
+  streaming thread sat in `gst_clock_id_wait`). The pipeline now runs on the system clock.
+- **The valve and renegotiation.** A valve in its default mode drops caps too, so opening it
+  made the encoder renegotiate and pipewiresrc reconnect its PipeWire stream; with
+  `drop-mode=forward-sticky-events` opening it changes nothing upstream.
+- **DMA-BUF on NVIDIA.** The zero-copy path (DMA-BUF → glupload → nvh265enc) negotiated and
+  encoded, but the picture was garbage (NVIDIA's tiled layouts read as linear). Shared memory is
+  the default; `SILL_LINUX_DMABUF=1` keeps the experiment. Next to try: `cudaupload`/CUDA import
+  with explicit modifiers, or asking the portal for linear buffers.
+- GNOME sends a frame only when something on the screen changes, so a still screen streams the
+  0.5 s keep-alive and nothing else, as the Mac host's still windows do.
+
+Not measured yet: the frame rate of a busy full screen (every test window opened behind the
+terminal), the shared-memory copy's ceiling at 4K, and anything on a real device: frame age,
+rtt and the picture on the iPad, which is the next step.

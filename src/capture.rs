@@ -14,19 +14,22 @@ use crate::server::{Control, Server};
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions};
 use ashpd::desktop::{CreateSessionOptions, PersistMode};
+use ashpd::enumflags2::BitFlags;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A keyframe asked for less than this after the last one is folded into it.
 const KEYFRAME_SPACING: Duration = Duration::from_millis(250);
 
-struct Cast {
+struct PortalCast {
     fd: OwnedFd,
     node: u32,
     size: Option<(i32, i32)>,
@@ -40,14 +43,15 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
     }
 
     gst::init().context("GStreamer init")?;
-    let (encoder, name) = encoder(bitrate_mbps * 1000)?;
-    println!("Encoder: {name}, {bitrate_mbps} Mbit/s.");
+    let (formats, encoder, name) = encoder(bitrate_mbps * 1000)?;
+    // Shared memory by default. SILL_LINUX_DMABUF=1 tries zero copy for NVENC (the compositor's
+    // DMA-BUF imported into GL, which nvh265enc reads), but on GNOME 50 with an RTX 3060 glupload
+    // read the buffer with the wrong layout (NVIDIA's tiled modifiers) and the picture was garbage.
+    let dmabuf = name.starts_with("NVENC") && std::env::var_os("SILL_LINUX_DMABUF").is_some();
+    println!("Encoder: {name}, {bitrate_mbps} Mbit/s, {}.", if dmabuf { "DMA-BUF through GL" } else { "shared memory" });
     // The fd stays open in `cast` for as long as the pipeline runs (pipewiresrc does not own it).
     let description = format!(
-        "pipewiresrc fd={fd} path={node} always-copy=true do-timestamp=true keepalive-time=500 \
-         ! video/x-raw \
-         ! valve name=gate drop=true \
-         ! videoconvert ! video/x-raw,format={{BGRx,BGRA,RGBx,RGBA,NV12}} \
+        "pipewiresrc fd={fd} path={node} {input} \
          ! {encoder} \
          ! video/x-h265,profile=main \
          ! h265parse config-interval=-1 \
@@ -55,15 +59,16 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
          ! appsink name=sink sync=false max-buffers=4 drop=false",
         fd = cast.fd.as_raw_fd(),
         node = cast.node,
+        input = input_chain(dmabuf, formats),
     );
     let pipeline = gst::parse::launch(&description)
         .context("building the pipeline")?
-        .downcast::<gst::Pipeline>()
+        .dynamic_cast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
     let gate = pipeline.by_name("gate").ok_or_else(|| anyhow!("no valve"))?;
     let sink = pipeline
         .by_name("sink")
-        .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+        .and_then(|e| e.dynamic_cast::<gst_app::AppSink>().ok())
         .ok_or_else(|| anyhow!("no appsink"))?;
 
     let frames_server = server.clone();
@@ -81,6 +86,29 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
             .build(),
     );
 
+    // Counters for the once-a-second line: buffers out of pipewiresrc, and encoded units.
+    let captured = Arc::new(AtomicU64::new(0));
+    let encoded = Arc::new(AtomicU64::new(0));
+    if let Some(pad) = gate.static_pad("sink") {
+        let c = captured.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    if let Some(pad) = sink.static_pad("sink") {
+        let c = encoded.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    }
+    let mut streaming = false;
+    let mut last_stats = Instant::now();
+
+    // The system clock, not the one pipewiresrc offers: PipeWire's stops while the compositor sends
+    // nothing (a still screen), and pipewiresrc's keep-alive resend waits on the pipeline clock.
+    pipeline.use_clock(Some(&gst::SystemClock::obtain()));
     pipeline.set_state(gst::State::Playing).context("starting the pipeline")?;
     let bus = pipeline.bus().ok_or_else(|| anyhow!("no bus"))?;
     let mut last_keyframe = Instant::now() - KEYFRAME_SPACING;
@@ -88,13 +116,24 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
     let result = loop {
         match control.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Start) => {
+                streaming = true;
                 gate.set_property("drop", false);
                 keyframe_pending = true;
             }
-            Ok(Control::Stop) => gate.set_property("drop", true),
+            Ok(Control::Stop) => {
+                streaming = false;
+                gate.set_property("drop", true);
+            }
             Ok(Control::Keyframe) => keyframe_pending = true,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
+        }
+        if last_stats.elapsed() >= Duration::from_secs(1) {
+            last_stats = Instant::now();
+            let (cap, enc) = (captured.swap(0, Ordering::Relaxed), encoded.swap(0, Ordering::Relaxed));
+            if streaming {
+                println!("[1s] cap {cap} enc {enc} {}", server.take_stats());
+            }
         }
         if keyframe_pending && last_keyframe.elapsed() >= KEYFRAME_SPACING {
             keyframe_pending = false;
@@ -122,16 +161,46 @@ pub fn run(server: &Server, control: Receiver<Control>, bitrate_mbps: u32) -> Re
     result
 }
 
+/// What goes between pipewiresrc's own settings and the encoder: the memory it hands over, the
+/// valve (closed while nobody watches; it passes caps on, so opening it renegotiates nothing),
+/// and the conversion to what the encoder takes.
+fn input_chain(dmabuf: bool, formats: &str) -> String {
+    let valve = "valve name=gate drop=true drop-mode=forward-sticky-events";
+    if dmabuf {
+        format!(
+            "keepalive-time=500 ! video/x-raw(memory:DMABuf) ! {valve} \
+             ! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA"
+        )
+    } else {
+        format!(
+            "always-copy=true keepalive-time=500 ! video/x-raw ! {valve} \
+             ! videoconvert ! video/x-raw,format={{{formats}}}"
+        )
+    }
+}
+
 fn break_err(pipeline: &gst::Pipeline) {
     let _ = pipeline.set_state(gst::State::Null);
 }
 
-/// The first HEVC encoder this machine has, as a pipeline fragment, and its name.
-fn encoder(kbps: u32) -> Result<(String, &'static str)> {
-    let have = |name: &str| gst::ElementFactory::find(name).is_some();
+/// The first HEVC encoder this machine has: the input formats it takes, the element with its
+/// settings, and a name for the log.
+fn encoder(kbps: u32) -> Result<(&'static str, String, &'static str)> {
+    // SILL_LINUX_ENCODER=nv|va|x265 picks one (testing); otherwise the first this machine has.
+    let only = std::env::var("SILL_LINUX_ENCODER").ok();
+    let have = |name: &str| {
+        let wanted = match only.as_deref() {
+            Some("nv") => name == "nvh265enc",
+            Some("va") => name == "vah265enc",
+            Some("x265") => name == "x265enc",
+            _ => true,
+        };
+        wanted && gst::ElementFactory::find(name).is_some()
+    };
     let gop = 240; // Sill: a keyframe at least every fps × 4 frames
     if have("nvh265enc") {
         return Ok((
+            "BGRx,BGRA,RGBx,RGBA,NV12",
             format!(
                 "nvh265enc preset=p1 tune=ultra-low-latency zerolatency=true bframes=0 gop-size={gop} \
                  rc-mode=cbr bitrate={kbps} repeat-sequence-header=true"
@@ -141,12 +210,14 @@ fn encoder(kbps: u32) -> Result<(String, &'static str)> {
     }
     if have("vah265enc") {
         return Ok((
+            "NV12",
             format!("vah265enc b-frames=0 key-int-max={gop} rate-control=cbr bitrate={kbps} target-usage=7"),
             "VA-API (vah265enc)",
         ));
     }
     if have("x265enc") {
         return Ok((
+            "I420",
             format!("x265enc speed-preset=ultrafast tune=zerolatency key-int-max={gop} bitrate={kbps}"),
             "software x265 (x265enc)",
         ));
@@ -164,8 +235,8 @@ fn token_path() -> PathBuf {
 
 /// Runs the portal on a thread of its own, which then keeps the session (and its D-Bus
 /// connection) alive for as long as this process runs.
-fn start_portal() -> Result<Cast> {
-    let (tx, rx) = mpsc::channel::<Result<Cast>>();
+fn start_portal() -> Result<PortalCast> {
+    let (tx, rx) = mpsc::channel::<Result<PortalCast>>();
     std::thread::Builder::new().name("portal".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -190,7 +261,7 @@ fn start_portal() -> Result<Cast> {
     rx.recv().context("the portal thread ended")?
 }
 
-async fn portal_session() -> Result<(Cast, impl Send)> {
+async fn portal_session() -> Result<(PortalCast, impl Send)> {
     let proxy = Screencast::new().await.context("the screen-cast portal is not available")?;
     let session = proxy.create_session(CreateSessionOptions::default()).await.context("CreateSession")?;
     let cursor = match proxy.available_cursor_modes().await {
@@ -207,7 +278,7 @@ async fn portal_session() -> Result<(Cast, impl Send)> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(cursor)
-                .set_sources(SourceType::Monitor.into())
+                .set_sources(BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
                 .set_restore_token(token.as_deref()),
@@ -234,5 +305,5 @@ async fn portal_session() -> Result<(Cast, impl Send)> {
         .open_pipe_wire_remote(&session, Default::default())
         .await
         .context("OpenPipeWireRemote")?;
-    Ok((Cast { fd, node, size }, (proxy, session)))
+    Ok((PortalCast { fd, node, size }, (proxy, session)))
 }
