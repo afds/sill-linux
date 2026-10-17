@@ -465,7 +465,11 @@ Mac. Three parts:
     maximize) rebuilds the tail once it has held for 200 ms.
   - Input in a window: a device's position is a fraction of the cropped picture, mapped into the
     window's region of the buffer, then given to `NotifyPointerMotionAbsolute` on the window's
-    stream (Mutter maps it onto the window).
+    stream (Mutter maps it onto the window). A window stream takes positions in the window's
+    logical buffer coordinates, unlike a monitor stream (its own pixels): at scale 2, positions in
+    the crop's pixels put the pointer about the shadow's width inside the frame at the top and
+    left, and past the frame at the right and bottom (the iPad, 2026-10-17). So input gets the
+    frame from `Geometry` in logical pixels, and Standard is the frame's logical size.
 
 Verified in the nested shell (Text Editor and Calculator), `tools/windows.py` on a `--plain`
 door: the list with both windows; Desktop → each window → Desktop, a keyframe each time; pictures

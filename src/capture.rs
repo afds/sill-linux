@@ -348,8 +348,11 @@ fn run_pipeline(
                 };
                 let even = |v: f64| ((v.round() as i32) & !1).max(2);
                 shape.crop = Some(((x, y, w, h), buffers));
-                *INPUT_REGION.lock().unwrap() = Some((x as f64, y as f64, w as f64, h as f64));
-                shape.logical = Some((even(w as f64 / ratio), even(h as f64 / ratio)));
+                // A window stream takes positions in the window's logical buffer coordinates (a
+                // monitor stream in its own pixels): at scale 2 the frame is half the crop.
+                let region = insets.map(|i| i.frame_logical()).unwrap_or((0.0, 0.0, w as f64 / ratio, h as f64 / ratio));
+                *INPUT_REGION.lock().unwrap() = Some(region);
+                shape.logical = Some((even(region.2), even(region.3)));
                 gate_open = false;
                 match replace_tail(&pipeline, &gate, &head, tail, shape, apply, server, &counters) {
                     Ok(t) => tail = t,

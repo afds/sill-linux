@@ -31,6 +31,15 @@ pub struct Insets {
 }
 
 impl Insets {
+    /// The frame in the buffer's logical coordinates (what a window stream's absolute motion
+    /// takes): x, y, width, height.
+    pub fn frame_logical(&self) -> (f64, f64, f64, f64) {
+        let (l, t) = (self.left.max(0) as f64, self.top.max(0) as f64);
+        let w = (self.width - self.left.max(0) - self.right.max(0)).max(1) as f64;
+        let h = (self.height - self.top.max(0) - self.bottom.max(0)).max(1) as f64;
+        (l, t, w, h)
+    }
+
     /// The frame's part of a crop of the buffer (`crop` in stream pixels), sizes even.
     pub fn frame_in(&self, (x, y, w, h): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
         let kx = w as f64 / self.width as f64;
@@ -60,6 +69,10 @@ mod tests {
         // No shadow (maximized).
         let m = Insets { left: 0, top: 0, right: 0, bottom: 0, width: 1600, height: 1000 };
         assert_eq!(m.frame_in((0, 0, 1600, 1000)), (0, 0, 1600, 1000));
+        // Input: logical frame whatever the crop's scale; fraction 0 and 1 hit its corners.
+        let (x, y, w, h) = i.frame_logical();
+        assert_eq!((x, y, w, h), (25.0, 25.0, 360.0, 616.0));
+        assert_eq!((x + 1.0 * w, y + 1.0 * h), (385.0, 641.0));
         // Insets bigger than the crop: the crop as it is.
         let odd = Insets { left: 300, top: 0, right: 300, bottom: 0, width: 410, height: 666 };
         assert_eq!(odd.frame_in((0, 0, 411, 666)), (0, 0, 410, 666));
