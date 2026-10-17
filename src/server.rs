@@ -1080,7 +1080,8 @@ impl Server {
         let goodbye = serde_json::json!({ "reason": reason, "message": message, "reconnect": false });
         let msg = protocol::message(kind::GOODBYE, protocol::now(), false, goodbye.to_string().as_bytes());
         let ids: Vec<u64> = {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
+            st.active = StreamSource::None;
             for c in st.clients.values() {
                 let _ = c.tx.send(msg.clone());
             }

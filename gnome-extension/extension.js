@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (4)
+//   Version() -> u                this interface's version (5)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -127,7 +127,7 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 4;
+const VERSION = 5;
 
 function listed(w) {
     return w.get_window_type() === Meta.WindowType.NORMAL && !w.is_skip_taskbar();
@@ -241,30 +241,52 @@ class Service {
         const reply = path => invocation.return_value(new GLib.Variant('(s)', [path]));
         const index = global.backend.get_monitor_manager().get_monitor_for_connector(connector);
         const m = index >= 0 ? Main.layoutManager.monitors[index] : null;
-        if (!m)
+        if (!m || maxSize < 1)
             return reply('');
-        const full = GLib.build_filenamev([this._dir, `monitor-${index}-full.png`]);
+        // Never larger than the monitor, nor than a thumbnail needs.
+        const box = Math.min(maxSize, 1024, Math.max(m.width, m.height));
+        const full = Gio.File.new_for_path(GLib.build_filenamev([this._dir, `monitor-${index}-full.png`]));
         const path = GLib.build_filenamev([this._dir, `monitor-${index}.png`]);
+        const fail = e => {
+            logError(e, 'sill-linux: monitor thumbnail');
+            try {
+                full.delete(null);
+            } catch (_) {}
+            reply('');
+        };
         let stream;
         try {
-            stream = Gio.File.new_for_path(full).replace(null, false, Gio.FileCreateFlags.PRIVATE, null);
+            stream = full.replace(null, false, Gio.FileCreateFlags.PRIVATE, null);
+            new Shell.Screenshot().screenshot_area(m.x, m.y, m.width, m.height, stream, (shot, res) => {
+                let input;
+                try {
+                    try {
+                        shot.screenshot_area_finish(res);
+                    } finally {
+                        stream.close(null);
+                    }
+                    // Decoded off the main thread; the screenshot itself still costs it ~120 ms at 4K.
+                    input = full.read(null);
+                    GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(input, box, box, true, null, (_, res2) => {
+                        try {
+                            GdkPixbuf.Pixbuf.new_from_stream_finish(res2).savev(path, 'png', [], []);
+                            input.close(null);
+                            full.delete(null);
+                            reply(path);
+                        } catch (e) {
+                            input.close(null);
+                            fail(e);
+                        }
+                    });
+                } catch (e) {
+                    input?.close(null);
+                    fail(e);
+                }
+            });
         } catch (e) {
-            return reply('');
+            stream?.close(null);
+            fail(e);
         }
-        new Shell.Screenshot().screenshot_area(m.x, m.y, m.width, m.height, stream, (shot, res) => {
-            let out = '';
-            try {
-                shot.screenshot_area_finish(res);
-                stream.close(null);
-                const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(full, maxSize, maxSize, true);
-                pixbuf.savev(path, 'png', [], []);
-                out = path;
-            } catch (e) {
-                logError(e, 'sill-linux: monitor thumbnail');
-            }
-            GLib.unlink(full);
-            reply(out);
-        });
     }
 
     ListApps() {
@@ -457,7 +479,8 @@ class Service {
 
     ShowPairing(title, code, modules, width, seconds) {
         this.ClosePairing();
-        if (width < 21 || modules.length !== width * width)
+        // A QR code is 21 to 177 modules wide.
+        if (width < 21 || width > 177 || modules.length !== width * width || title.length > 200 || code.length > 64)
             return false;
         const box = new St.BoxLayout({
             style_class: 'modal-dialog',
@@ -516,7 +539,12 @@ class Service {
         this._pairingTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
             remaining = Math.max(0, remaining - 1);
             tick();
-            return GLib.SOURCE_CONTINUE;
+            if (remaining > 0)
+                return GLib.SOURCE_CONTINUE;
+            // The code has expired (and nobody may be left to close it: sill-linux restarted).
+            this._pairingTimer = 0;
+            this.ClosePairing();
+            return GLib.SOURCE_REMOVE;
         });
         return true;
     }

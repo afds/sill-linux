@@ -168,9 +168,21 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             Err(e) => {
                 println!("Could not stream that window: {e:#}; back to the Desktop.");
                 // The old stream still runs when the new one failed; a fresh one either way.
-                cast = record(rec, Source::Desktop)?;
-                source = Source::Desktop;
-                server.showing_desktop();
+                match record(rec, Source::Desktop) {
+                    Ok(c) => {
+                        cast = c;
+                        source = Source::Desktop;
+                        server.showing_desktop();
+                    }
+                    // The screen locked meanwhile, say: the devices are told, as in `idle`.
+                    Err(e) => {
+                        server.sharing_ended(if screen_locked(rec) { Ended::Locked } else { Ended::Failed(format!("{e:#}")) });
+                        match idle(server, &control, rec, &mut apply)? {
+                            Some((c, s)) => (cast, source, streaming) = (c, s, true),
+                            None => break,
+                        }
+                    }
+                }
             }
         }
     }
@@ -227,7 +239,8 @@ fn idle(server: &Server, control: &Receiver<Control>, rec: &Recorder, apply: &mu
             Ok(Control::WindowCommand(id, action)) => RecReq::Command(id, action),
             Ok(Control::Launch(app)) => RecReq::Launch(app),
             Ok(Control::Gesture(name)) => RecReq::Gesture(name),
-            Ok(Control::Fit(id, w, h)) => RecReq::Fit(id, w, h),
+            // Its Start failed: nothing streams to fit to.
+            Ok(Control::Fit(..)) => continue,
         };
         let _ = rec.send(req);
     }
@@ -372,6 +385,7 @@ fn run_pipeline(
     let mut gate_open = false;
     let mut stopped_at = (!*streaming).then(Instant::now);
     let mut last_alive_look = Instant::now();
+    let mut alive_ask: Option<mpsc::Receiver<bool>> = None;
     let result = loop {
         match control.recv_timeout(Duration::from_millis(50)) {
             Ok(Control::Start(s)) if s != source => {
@@ -504,11 +518,25 @@ fn run_pipeline(
         }
         // Once a second too: a stopped session's stream may just go quiet (pipewiresrc keeps
         // resending its last frame).
-        let look = failure.is_some() || last_alive_look.elapsed() >= Duration::from_secs(1);
-        if look && let Some(r) = recorder {
-            last_alive_look = Instant::now();
-            if !session_alive(r) {
-                break Ok(Outcome::StoppedHere);
+        // Once a second it is asked and its answer read on a later pass, so a busy GNOME task
+        // (an Aa fit) never holds up this loop; a failure waits for the answer.
+        if let Some(r) = recorder {
+            if failure.is_some() {
+                if !session_alive(r) {
+                    break Ok(Outcome::StoppedHere);
+                }
+            } else if let Some(rx) = &alive_ask {
+                match rx.try_recv() {
+                    Ok(false) => break Ok(Outcome::StoppedHere),
+                    Ok(true) | Err(mpsc::TryRecvError::Disconnected) => alive_ask = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            } else if last_alive_look.elapsed() >= Duration::from_secs(1) {
+                last_alive_look = Instant::now();
+                let (tx, rx) = mpsc::channel();
+                if r.send(RecReq::Alive(tx)).is_ok() {
+                    alive_ask = Some(rx);
+                }
             }
         }
         if recorder.is_some() && !*streaming && stopped_at.is_some_and(|t| t.elapsed() >= IDLE_GRACE) {
@@ -798,8 +826,8 @@ fn start_capture(server: Server, input: Option<CommandKey>) -> Result<(PortalCas
 }
 
 /// GNOME's own API: a remote-desktop session with the monitor's screen cast linked to it. No
-/// dialog. The session made here only checks the monitor and is closed at once: GNOME's sharing
-/// indicator then shows only while a device streams (`idle`).
+/// dialog. No session is made until a device picks a source: GNOME's sharing indicator shows only
+/// while a device streams (`idle`).
 async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Recorder, impl Send)> {
     let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
     let wanted = MONITOR.lock().unwrap().clone();
@@ -888,7 +916,7 @@ fn is_display(source: Source) -> bool {
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 4;
+const EXTENSION_VERSION: u32 = 5;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -946,7 +974,10 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     println!("Left window {id} as it is: {why}.");
                     continue;
                 }
-                Decision::Settle(f) => (f, true),
+                Decision::Settle(f) => {
+                    s.move_resize(id, f.x, f.y, f.width, f.height).await;
+                    continue;
+                }
                 Decision::Restore(f, whole) => (f, whole),
             };
             let restored = s.move_resize(id, f.x, f.y, f.width, f.height).await && (!f.maximized || s.set_maximized(id, true).await);
@@ -1097,7 +1128,11 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                 .await;
                 match recorded {
                     Ok((session, stream)) => {
-                        let _ = reply.send(Ok(cast(&stream)));
+                        // Too late (`record` gave up): kept, it would hold GNOME's indicator up.
+                        if reply.send(Ok(cast(&stream))).is_err() {
+                            session.stop().await;
+                            continue;
+                        }
                         let old = shown.lock().unwrap().replace((Arc::new(session), stream));
                         if let Some((session, _)) = old {
                             session.stop().await;
@@ -1135,6 +1170,7 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
 async fn hold_off_suspend(server: Server, conn: ashpd::zbus::Connection) {
     const SUSPEND: u32 = 4;
     let mut cookie: Option<u32> = None;
+    let mut warned = false;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let connected = server.client_count() > 0;
@@ -1149,8 +1185,10 @@ async fn hold_off_suspend(server: Server, conn: ashpd::zbus::Connection) {
                     println!("Suspend: held off while a device is connected.");
                 }
                 Err(e) => {
-                    println!("Suspend: could not hold it off ({e}); this machine may suspend while a device is connected.");
-                    return;
+                    if !warned {
+                        println!("Suspend: could not hold it off ({e}); this machine may suspend while a device is connected.");
+                        warned = true;
+                    }
                 }
             }
         } else if !connected && let Some(c) = cookie.take() {
@@ -1448,7 +1486,8 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
         }
         if monitor_thumbs {
             for (id, m) in &displays {
-                let due = display_stamps.get(id).is_none_or(|at| active == Some(*id) || now.duration_since(*at) >= Duration::from_secs(6));
+                // A whole-monitor screenshot stalls GNOME's main thread (~120 ms at 4K), so seldom.
+                let due = display_stamps.get(id).is_none_or(|at| now.duration_since(*at) >= Duration::from_secs(30));
                 if !due {
                     continue;
                 }

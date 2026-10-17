@@ -296,7 +296,6 @@ impl Client {
         }
     }
 
-    /// Fires on every `WindowsChanged` (coalesced by the extension to one per 250 ms).
     /// The pairing window (extension version 3): `modules` is the QR code's width×width modules,
     /// '1' dark, row by row.
     pub async fn show_pairing(&self, title: &str, code: &str, modules: &str, width: u32, seconds: u32) -> bool {
@@ -309,6 +308,7 @@ impl Client {
         Ok(self.proxy.receive_signal("PairingCancelled").await?)
     }
 
+    /// Fires on every `WindowsChanged` (coalesced by the extension to one per 250 ms).
     pub async fn changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
         Ok(self.proxy.receive_signal("WindowsChanged").await?)
     }
