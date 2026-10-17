@@ -1,8 +1,13 @@
 {
   "uuid": "sill-linux@sill-linux",
-  "name": "Sill for Linux",
-  "description": "Lets Sill for Linux list your windows and stream one of them to the Sill app on an iPhone or iPad: the window list, small thumbnails, and raising, closing, minimizing or fullscreening a window on the device's request. Only for the local sill-linux host; it adds no network access.",
-  "shell-version": ["48", "49", "50", "51"],
-  "url": "https://github.com/",
+  "name": "sill-linux",
+  "description": "Lets the local sill-linux host stream your windows to the Sill app on an iPhone or iPad: it lists windows and apps, reads thumbnails, the pointer, its shape and the clipboard, and raises, moves, closes, minimizes or fullscreens a window on the device's request. It adds no network access.",
+  "shell-version": [
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/afds/sill-linux",
   "version": 1
 }

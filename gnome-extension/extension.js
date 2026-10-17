@@ -1,4 +1,4 @@
-// Sill for Linux: the window list for the sill-linux host, on the session bus.
+// The window list for the sill-linux host, on the session bus.
 //
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so

@@ -1,112 +1,117 @@
 # sill-linux
 
-An experimental Linux (Wayland) host for the [Sill](https://getsill.app) iPhone and iPad app:
-stream a Linux desktop, and later single windows, to the existing Sill app over your network.
+A Linux host for the [Sill](https://getsill.app) iPhone and iPad app: stream your Linux desktop, or
+a single window, to the Sill app from the App Store, and control it from the device.
 
-**Status: phases 1 and 3 of [docs/feasibility.md](docs/feasibility.md).** It streams the whole
-desktop to the **App Store build** of the Sill app over your network (TLS 1.3 with pinned keys,
-and a one-time pairing with a code this terminal shows, as Sill for Mac does), and takes the
-app's input: taps and clicks, scrolling, hardware keys and typed text. No single windows yet.
+**This is an unofficial, independent project.** Sill's author did not make or endorse it and does
+not support it. Please don't send Sill's support questions about it; open an issue here instead.
+Sill's own host is the free [Sill for Mac](https://getsill.app). This host speaks the same wire
+protocol (pinned in [SILL_REFERENCE.md](SILL_REFERENCE.md)), so the app needs no changes.
 
-This is a separate project. It is not part of Sill and isn't supported by Sill's author. Sill's
-own host is the free Mac app; this one speaks the same wire protocol (pinned in
-[SILL_REFERENCE.md](SILL_REFERENCE.md)), so the Sill app needs no changes.
+## What works
 
-## Running it
+- **The desktop**, HEVC, at the app's chosen quality, resolution and frame rate (the gear in the
+  app sets them; kept in `~/.local/state/sill-linux/settings.json`).
+- **Input:** taps and clicks, scrolling, the trackpad, hardware keys, and typed text. The device's
+  Command key is Ctrl here, so ⌘C copies (`--command-key super` changes that). The app's Spotlight
+  key opens GNOME's Activities.
+- **Single windows (GNOME, with the extension):**
+  - each window in the app's bar with a thumbnail; a tap streams it alone, raised and focused;
+  - close, minimize and full screen from a held thumbnail;
+  - All Apps, with icons, to start an app;
+  - Aa sizes the window to the device's panel, and it goes back when it stops streaming.
+- **This machine's pointer** shown on the device while the local mouse moves it, in its current
+  shape.
+- **Three-finger gestures** on the app's trackpad work as GNOME's own: swipe up for Activities and
+  the app grid, left and right for workspaces, pinch for the app grid, spread for the desktop.
+- **The clipboard both ways**, text only. It skips copies a password manager marks; turn it off
+  with `--no-clipboard`. The app's 0.5.1 lacks this; it needs a later app version.
 
-Needs a Wayland desktop with the screen-cast portal (tested on GNOME 50), PipeWire, GStreamer
-with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and Avahi's
-`avahi-publish` for discovery. To build:
+Not supported: audio, a virtual display, and Sill's remote access (away from home) door.
+
+## Requirements
+
+- **GNOME 48 to 51 on Wayland** for everything above. On other Wayland desktops only the whole
+  desktop streams, through the screen-cast and remote-desktop portals.
+- PipeWire.
+- GStreamer with an HEVC encoder: NVENC (`nvh265enc`), VA-API (`vah265enc`), or `x265enc`.
+- Avahi's `avahi-publish`, for discovery.
+- The Sill app 0.5.1 or later, on the same network.
+
+## Build and install
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor] [--keep-all-taps] [--choose-screen] [--no-notifications]
+cargo build --release
+./target/release/sill-linux --install-extension   # GNOME: windows, pointer, gestures, clipboard
+./target/release/sill-linux --install-service     # starts with your session
 ```
 
-**In the background:** `./target/release/sill-linux --install-service [options]` installs a systemd
-user service that starts with your session and restarts on a crash (output:
-`journalctl --user -u sill-linux -f`; remove with `--uninstall-service`). The first start asks for
-the screen and remote control once more (a service is a new app to the portal). A pairing code
-then appears as a desktop notification, closed once the device pairs.
+After `--install-extension`, log out and in once: GNOME loads an extension's code only at login.
+The extension is a thin layer that reports GNOME's state and carries out plain actions; the
+decisions live in sill-linux. So after updating sill-linux, `systemctl --user restart sill-linux`
+is enough. Log out again only when sill-linux says the running extension is older.
 
-Or run it in a terminal: when a device asks to pair, the code is printed there too (and a QR code,
-with `qrencode` installed). Ctrl-C (or stopping the service) tells connected devices "quit", so
-the app says the host quit and reconnects by itself once it is back. With several monitors,
-`--choose-screen` asks which to share again and keeps the answer. Pairing is once per device; `--forget-devices` removes them
-all. `--open` lets any device in without pairing (still TLS); `--plain` is the old unencrypted
-door, for a Debug build of the app.
+The service's output: `journalctl --user -u sill-linux -f`. Remove it with
+`--uninstall-service`. To run in a terminal instead: `./target/release/sill-linux`. Ctrl-C tells
+devices the host quit, and they reconnect by themselves when it is back.
 
-The host's key, recognition key and paired devices live in `~/.local/state/sill-linux/` (0600).
-Deleting `host-key.pk8` makes a new host as far as devices are concerned: each pairs again.
-
-On GNOME it uses GNOME's own screen-cast API: no dialog (GNOME's sharing indicator shows while it
-runs), the primary monitor (`--monitor DP-3` for another).
-
-**Single windows (GNOME):** `./target/release/sill-linux --install-extension` installs a small GNOME
-Shell extension that lists this machine's windows; log out and in once to load it. The app's bar
-then shows each window with a thumbnail, and a tap streams that window alone (raised and focused
-here, so typing goes to it), cropped to its frame. Holding a thumbnail gives its lights: close,
-minimize, full screen. All Apps lists the installed apps with their icons and starts one (its
-window then streams), and Aa sizes the streamed window to the iPad's panel (it goes back when it
-stops streaming). After updating sill-linux, restart it (`systemctl --user restart
-sill-linux`); only when it says the running extension is older, run `--install-extension` and log
-out and in.
-Without the extension, or with `--portal`, only the Desktop streams. Three-finger gestures on the app's trackpad work as GNOME's own:
-swipe up for Activities and the app grid, left and right for workspaces, pinch for the app grid,
-spread for the desktop. The clipboard is shared both ways too
-(text; never a password manager's copies; `--no-clipboard` turns it off), with a Sill app version
-that has it (after 0.5.1). Elsewhere, or with `--portal`, the
-desktop portal asks once which monitor to share and to allow remote control; the answer is kept
-(`~/.local/state/sill-linux/remote-desktop-token`, delete it to be asked again; with
-`--view-only`, no remote control, `restore-token`). The device's Command key is Ctrl here
-(`--command-key super` to change it), so ⌘C copies; the app's Spotlight key (⌘Space) taps Super,
-which opens GNOME's Activities. With a device
-streaming, it prints a `[1s]` line: frames captured, encoded, sent and dropped, then the device's
-own `client …` line every two seconds; `in N` is the device's input events (frame age and round trip, median/worst).
-
-Quality, resolution and frame rate come from the app's Settings panel (the gear), as with Sill
-for Mac, and apply at once without restarting the stream; they are kept in
-`~/.local/state/sill-linux/settings.json`. Resolution: Standard is the monitor's logical size
-(1920×1080 for a 4K monitor at 200 %), this host's default; Retina is every pixel. Prioritize Speed
-stays on (NVENC's lowest-latency preset); there is no virtual display on Linux.
-
-This machine's pointer is left out of the picture, as Sill for Mac does: the app draws its own
-where it needs one (the trackpad held upright, Pencil hover). While this machine's mouse moves the pointer, the app
-shows it where it is, in its current shape (on GNOME, with the extension). `--show-cursor` draws it into the
-picture instead (then moves of the local mouse show too, at the cost of a frame per move).
-
-The app's trackpad can count a slow, small pointer nudge followed by a lift as a tap; such a tap
-is not clicked here (`--keep-all-taps` clicks every tap). `cargo run --example replay-input -- LOG`
-replays an input log (`SILL_LINUX_INPUT_LOG=1`) and shows which clicks would go out.
-
-A firewall must let the device in: TCP on the door's port and mDNS (UDP 5353), e.g.
+A firewall must let the device in: TCP on the port (47460 by default) and mDNS, e.g.
 `sudo ufw allow 47460/tcp` and `sudo ufw allow 5353/udp`.
 
-**On the iPad or iPhone:** the Sill app from the App Store (0.5.1 or later), on the same network.
-This machine shows up as a row, "Not paired"; tap it, then type the code from this terminal (Enter
-Code Instead). From then on a tap connects. With `--plain`, only a Debug build of the app (Xcode)
-connects, by its row or with the launch argument `-SillConnect <IP>:47460`.
+## Pairing
 
-**Without a device:** Sill's own `Scripts/sillclient.py` pairs and opens a session like the app
-(`--pair-ask --then-code=FILE --identity=DIR`, then `--tls --identity=DIR`; the host writes each
-code to `SILL_LINUX_TEST_CODE_FILE`). `tools/receive.py HOST PORT [SECONDS] [--join-late]`, on a
-`--plain` door, checks every message's layout and decodes the stream with ffmpeg;
-`tools/windows.py HOST PORT` picks every listed window in turn and checks and decodes each.
+In the app, this machine shows up as a row, "Not paired". Tap it, then Enter Code Instead, and type
+the code. The code appears as a desktop notification from the service, or in the terminal (with a
+QR code if `qrencode` is installed). Each device pairs once; after that a tap connects.
+`--forget-devices` removes every paired device.
 
-With NVENC the screen comes over DMA-BUF straight into the GPU (no copy, and a fullscreen video
-keeps updating, which shared memory does not on NVIDIA); shared memory is the fallback.
+## Security
 
-Testing switches: `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder; `SILL_LINUX_SHM=1` forces
-shared memory; `SILL_LINUX_INPUT_LOG=1` prints
-every input action sent to the portal.
+- Every connection is TLS 1.3, and both ends' keys are pinned, as with Sill for Mac.
+- A device must pair with a one-time code shown on this machine.
+- `--open` lets any device in without pairing (still TLS). `--plain` is unencrypted, only for a
+  Debug build of the app.
+- The host's keys and paired devices are in `~/.local/state/sill-linux/` (0600). Delete
+  `host-key.pk8` and every device must pair again.
+- No servers, no telemetry, and no network use beyond the devices you pair. Report a vulnerability
+  privately through GitHub's security advisories, not in a public issue.
 
-## Dependency policy
+## Options
 
-Unlike Sill (Swift, Apple frameworks only), a Linux host can't avoid outside libraries. The rule
-here: system libraries every desktop distribution ships (PipeWire, libei, D-Bus, Avahi, FFmpeg's
-libavcodec) and well-maintained Rust crates for them (zbus/ashpd, pipewire-rs, reis, rustls,
-ffmpeg-next). No services, no telemetry, no network access beyond the devices you pair.
+```
+sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
+           [--show-cursor] [--keep-all-taps] [--choose-screen] [--portal] [--monitor CONNECTOR]
+           [--no-notifications] [--no-clipboard] [--command-key ctrl|super] [--forget-devices]
+```
+
+- `--monitor DP-3` picks another monitor on GNOME (the primary by default).
+- `--portal` uses the desktop portal even on GNOME (the desktop only).
+- `--show-cursor` draws the pointer into the picture.
+- `--keep-all-taps` clicks every tap. By default, a slow nudge followed by a lift is not clicked,
+  since the app's trackpad can report it as a tap.
+- `--view-only` takes no input.
+
+With a device streaming, the host prints a `[1s]` line: frames captured, encoded, sent and
+dropped, and the device's own frame age and round trip.
+
+## For developers
+
+[docs/feasibility.md](docs/feasibility.md) has the design and each phase's findings.
+
+- `tools/receive.py` checks a `--plain` door's messages and decodes the stream with ffmpeg.
+- `tools/windows.py` walks every window.
+- Sill's own `Scripts/sillclient.py` pairs and opens a session like the app.
+
+Test switches:
+
+- `SILL_LINUX_ENCODER=nv|va|x265` picks the encoder.
+- `SILL_LINUX_SHM=1` forces shared memory instead of DMA-BUF.
+- `SILL_LINUX_INPUT_LOG=1` prints every input action.
+
+Dependencies are system libraries every distribution ships (PipeWire, GStreamer, D-Bus, Avahi) and
+well-maintained Rust crates for them.
 
 ## License
 
-Apache-2.0, as Sill.
+Apache-2.0, as Sill. See [NOTICE](NOTICE) for what comes from Sill.

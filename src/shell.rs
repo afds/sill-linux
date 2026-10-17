@@ -1,4 +1,4 @@
-//! The window list from the Sill for Linux GNOME Shell extension (`gnome-extension/`), on the
+//! The window list from the sill-linux GNOME Shell extension (`gnome-extension/`), on the
 //! session bus as `org.sill_linux.Shell`: windows with Mutter's window ids (what `RecordWindow`
 //! takes), thumbnails, and raise, close, minimize or fullscreen on a device's request.
 

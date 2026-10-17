@@ -721,7 +721,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     let shell = crate::shell::Client::connect(&conn).await;
     match &shell {
         Some(s) => {
-            println!("Windows: from the Sill for Linux GNOME Shell extension.");
+            println!("Windows: from the sill-linux GNOME Shell extension.");
             let running = s.version().await.unwrap_or(1);
             if running < EXTENSION_VERSION {
                 println!(
@@ -743,7 +743,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
             tokio::spawn(watch_windows(server, s.clone()));
         }
         None => println!(
-            "Windows: the Sill for Linux GNOME Shell extension is not running, so only the Desktop streams \
+            "Windows: the sill-linux GNOME Shell extension is not running, so only the Desktop streams \
              (sill-linux --install-extension, then log out and in)."
         ),
     }

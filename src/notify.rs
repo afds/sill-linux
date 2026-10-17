@@ -42,7 +42,7 @@ impl Note {
                 "--dest", "org.freedesktop.Notifications",
                 "--object-path", "/org/freedesktop/Notifications",
                 "--method", "org.freedesktop.Notifications.Notify",
-                "Sill for Linux", &replaces.to_string(), "video-display",
+                "sill-linux", &replaces.to_string(), "video-display",
                 &quote(summary), &quote(body), "[]", "{'urgency': <byte 2>}", "0",
             ])
             .output();

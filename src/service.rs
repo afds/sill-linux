@@ -31,7 +31,7 @@ pub fn unit_text(exe: &str, args: &[String]) -> String {
     cmd.extend(args.iter().map(|a| word(a)));
     format!(
         "[Unit]\n\
-         Description=Sill for Linux (streams this desktop to the Sill app)\n\
+         Description=sill-linux (streams this desktop to the Sill app)\n\
          After=graphical-session.target\n\
          PartOf=graphical-session.target\n\
          \n\
@@ -63,7 +63,7 @@ pub fn install(args: &[String]) -> Result<()> {
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", UNIT])?;
     println!(
-        "Sill for Linux now runs in the background and starts with your session.\n\
+        "sill-linux now runs in the background and starts with your session.\n\
          Its output: journalctl --user -u sill-linux -f\n\
          Pairing codes appear as notifications. It runs {} (rebuilding replaces it; restart with\n\
          systemctl --user restart sill-linux).",
