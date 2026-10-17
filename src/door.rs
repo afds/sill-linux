@@ -79,6 +79,8 @@ pub struct PairingDoor {
     port: u16,
     paired: Mutex<Vec<PairedDevice>>,
     window: Mutex<Option<Window>>,
+    /// The pairing code's desktop notification.
+    note: crate::notify::Note,
     /// TEST ONLY: SILL_LINUX_TEST_CODE_FILE, where each window's code is written (for
     /// Sill's sillclient.py `--then-code`).
     code_file: Option<PathBuf>,
@@ -96,6 +98,7 @@ impl PairingDoor {
             host_name,
             port,
             window: Mutex::new(None),
+            note: crate::notify::Note::default(),
             code_file: std::env::var_os("SILL_LINUX_TEST_CODE_FILE").map(PathBuf::from),
         }))
     }
@@ -161,6 +164,7 @@ impl PairingDoor {
         let mut window = self.window.lock().unwrap();
         if window.as_ref().is_some_and(|w| w.expired()) {
             *window = None;
+            self.note.close();
             println!("Pairing: the code ran out.");
         }
         match req.method.as_str() {
@@ -177,6 +181,7 @@ impl PairingDoor {
             }
             "cancel" => {
                 if window.take().is_some() {
+                    self.note.close();
                     println!("Pairing: {name} at {peer} no longer needs its code; the window closed.");
                 }
                 PairResult::refused("closed")
@@ -187,6 +192,7 @@ impl PairingDoor {
                 match w.try_proof(method, &given, fp_device, &fp_mac) {
                     Verdict::Accept { proof_m } => {
                         *window = None;
+                        self.note.close();
                         let device = PairedDevice {
                             fingerprint: b64url(fp_device),
                             name: name.clone(),
@@ -223,6 +229,7 @@ impl PairingDoor {
                     }
                     Verdict::Closed(reason) => {
                         *window = None;
+                        self.note.close();
                         if reason == "stopped" {
                             println!("Pairing stopped after {} wrong codes.", pairing::MAX_FAILURES);
                         }
@@ -256,6 +263,10 @@ impl PairingDoor {
         if let Some(path) = &self.code_file {
             let _ = std::fs::write(path, &w.code);
         }
+        self.note.show(
+            &format!("{name} wants to pair with {}", self.host_name),
+            &format!("Enter this code on it: {}  ({}:{:02} left)", pairing::grouped(&w.code), left / 60, left % 60),
+        );
     }
 
     /// `sill://pair?v=1&m=…&k=…&s=…&n=…&p=…&a=…`, as `PairLink.url`.

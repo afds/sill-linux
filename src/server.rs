@@ -224,6 +224,23 @@ impl Server {
         self.broadcast_settings(&st, change.token.map(|t| (id, t)));
     }
 
+    /// This host is quitting: every device is told (kind 22 "quit": the app says "‹name› quit
+    /// Sill." and reconnects once this host is back) and its held keys and buttons go up.
+    pub fn quit(&self) {
+        let goodbye = protocol::message(kind::GOODBYE, protocol::now(), false, br#"{"reason":"quit"}"#);
+        let st = self.state.lock().unwrap();
+        let input = self.input.lock().unwrap().clone();
+        for (id, c) in &st.clients {
+            let _ = c.tx.send(goodbye.clone());
+            if let Some(tx) = &input {
+                let _ = tx.send(InputCmd::Left(*id));
+            }
+        }
+        if !st.clients.is_empty() {
+            println!("Quitting: told {} device{}.", st.clients.len(), if st.clients.len() == 1 { "" } else { "s" });
+        }
+    }
+
     /// Where devices' input goes from now on.
     pub fn set_input(&self, tx: mpsc::UnboundedSender<InputCmd>) {
         *self.input.lock().unwrap() = Some(tx);

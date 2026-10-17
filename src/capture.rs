@@ -429,6 +429,9 @@ fn state_file(name: &str) -> PathBuf {
 }
 
 fn read_token(path: &PathBuf) -> Option<String> {
+    if CHOOSE_SCREEN.load(Ordering::Relaxed) {
+        return None;
+    }
     std::fs::read_to_string(path).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
@@ -496,6 +499,14 @@ pub fn set_keep_all_taps(keep: bool) {
 
 fn keep_all_taps() -> bool {
     KEEP_ALL_TAPS.load(Ordering::Relaxed)
+}
+
+static CHOOSE_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--choose-screen`: the saved screen choice is not used; the portal asks again (and the new
+/// choice is saved).
+pub fn set_choose_screen(choose: bool) {
+    CHOOSE_SCREEN.store(choose, Ordering::Relaxed);
 }
 
 pub fn set_show_cursor(show: bool) {

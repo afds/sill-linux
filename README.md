@@ -20,11 +20,19 @@ with an HEVC encoder (NVENC `nvh265enc`, VA-API `vah265enc`, or `x265enc`), and 
 
 ```
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # Debian, Ubuntu
-cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor] [--keep-all-taps]
+cargo run --release -- [--port 47460] [--name NAME] [--open | --plain] [--no-advertise] [--view-only] [--show-cursor] [--keep-all-taps] [--choose-screen] [--no-notifications]
 ```
 
-Run it in a terminal you can see: when a device asks to pair, the code is printed there (and a
-QR code, with `qrencode` installed). Pairing is once per device; `--forget-devices` removes them
+**In the background:** `./target/release/sill-linux --install-service [options]` installs a systemd
+user service that starts with your session and restarts on a crash (output:
+`journalctl --user -u sill-linux -f`; remove with `--uninstall-service`). The first start asks for
+the screen and remote control once more (a service is a new app to the portal). A pairing code
+then appears as a desktop notification, closed once the device pairs.
+
+Or run it in a terminal: when a device asks to pair, the code is printed there too (and a QR code,
+with `qrencode` installed). Ctrl-C (or stopping the service) tells connected devices "quit", so
+the app says the host quit and reconnects by itself once it is back. With several monitors,
+`--choose-screen` asks which to share again and keeps the answer. Pairing is once per device; `--forget-devices` removes them
 all. `--open` lets any device in without pairing (still TLS); `--plain` is the old unencrypted
 door, for a Debug build of the app.
 

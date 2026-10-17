@@ -384,3 +384,20 @@ and frame kind 43 as above. To settle first: the `cookie` the device's AudioTool
 accepts (an AudioSpecificConfig, or an ESDS as Apple's encoder gives it); the PR's
 `AudioDecoder` and `docs/audio-plan.md` say. Decided (2026-10-17): wait until #94 ships rather than
 test against a Debug build of its branch.
+
+## Everyday use (2026-10-17)
+
+- `--install-service`: a systemd user unit (`~/.config/systemd/user/sill-linux.service`,
+  `WantedBy=graphical-session.target`, `Restart=on-failure`), with the options given beside it;
+  `--uninstall-service`. The session's user environment has `WAYLAND_DISPLAY` and the session bus,
+  so the portal works from the service.
+- The pairing code as a desktop notification (`org.freedesktop.Notifications` through `gdbus`,
+  critical urgency so it stays), closed when the device pairs, cancels, the code runs out or five
+  wrong codes stop it; `--no-notifications`.
+- Quitting (SIGINT, SIGTERM, SIGHUP): kind 22 `{"reason":"quit"}` to every device and their held
+  keys and buttons released, then `_exit` after 0.3 s (plain `exit` hung in the libraries' exit
+  handlers with their threads running). Verified with Sill's test client: the goodbye at once, exit
+  status 0, no process left.
+- `--choose-screen`: the saved portal choice is ignored once; the new one is saved.
+- Seen once on the DMA-BUF path, mid-stream, nothing broken: GStreamer-Video-CRITICAL
+  `gst_video_frame_map_id: assertion 'info->finfo->format == meta->format' failed`. To watch.

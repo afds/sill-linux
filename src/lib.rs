@@ -9,5 +9,7 @@ pub mod tls;
 pub mod door;
 pub mod input;
 pub mod settings;
+pub mod notify;
+pub mod service;
 #[cfg(feature = "capture")]
 pub mod capture;
