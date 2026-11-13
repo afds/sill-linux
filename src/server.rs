@@ -181,6 +181,10 @@ struct Client {
     clip_subscribed: bool,
     clip_arrivals: Vec<f64>,
     gesture_arrivals: Vec<f64>,
+    /// Its hello lists AAC-ELD: this machine's sound goes to it (kind 43), with the format of the
+    /// epoch it was last sent.
+    audio: bool,
+    audio_epoch: Option<u16>,
 }
 
 struct State {
@@ -549,6 +553,8 @@ impl Server {
                     clip_subscribed: false,
                     clip_arrivals: Vec::new(),
                     gesture_arrivals: Vec::new(),
+                    audio: false,
+                    audio_epoch: None,
                 },
             );
             if st.active != StreamSource::None {
@@ -611,12 +617,17 @@ impl Server {
                 },
                 kind::HELLO => {
                     if let Ok(hello) = serde_json::from_slice::<Hello>(&payload) {
+                        let plays = hello.audio.as_ref().is_some_and(|a| a.iter().any(|c| c == "aac-eld"));
+                        if let Some(c) = self.state.lock().unwrap().clients.get_mut(&id) {
+                            c.audio = plays;
+                        }
                         let label = crate::door::clean(hello.device.as_deref().unwrap_or(""), "a device");
                         println!(
-                            "Client hello: {label}, Sill {} ({}), protocol {}",
+                            "Client hello: {label}, Sill {} ({}), protocol {}{}",
                             crate::door::clean(hello.app_version.as_deref().unwrap_or(""), "?"),
                             crate::door::clean(hello.build.as_deref().unwrap_or(""), "?"),
-                            hello.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                            hello.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                            if plays { ", plays this machine's sound" } else { "" }
                         );
                     }
                 }
@@ -673,8 +684,12 @@ impl Server {
                     stats_seen += 1;
                     if stats_seen.is_multiple_of(2)
                         && let Ok(s) = serde_json::from_slice::<ClientStats>(&payload) {
+                            let sound = match (s.audio_behind_ms, s.audio_late) {
+                                (Some(b), late) => format!(", sound {b} ms behind, {} late", late.unwrap_or(0)),
+                                (None, _) => String::new(),
+                            };
                             println!(
-                                "client {}: {} fps, frame age {}, rtt {}",
+                                "client {}: {} fps, frame age {}, rtt {}{sound}",
                                 crate::door::clean(&s.device, "a device"),
                                 s.fps,
                                 median_and_worst(s.frame_age_ms, s.frame_age_max_ms),
@@ -1070,6 +1085,26 @@ impl Server {
     /// Whether a source streams (the pointer is watched only then).
     pub fn streaming(&self) -> bool {
         self.state.lock().unwrap().active != StreamSource::None
+    }
+
+    /// Something streams to a device that plays this machine's sound.
+    pub fn wants_audio(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.active != StreamSource::None && st.clients.values().any(|c| c.audio)
+    }
+
+    /// One packet of sound (kind 43) to every device that plays it, the epoch's format first to
+    /// one that has not had it. `at`: the wall clock of its first sample.
+    pub fn broadcast_audio(&self, epoch: u16, format: &[u8], packets: &[u8], at: f64) {
+        let mut st = self.state.lock().unwrap();
+        let msg = protocol::message(kind::AUDIO, at, false, packets);
+        for c in st.clients.values_mut().filter(|c| c.audio) {
+            if c.audio_epoch != Some(epoch) {
+                c.audio_epoch = Some(epoch);
+                let _ = c.tx.send(protocol::message(kind::AUDIO, at, false, format));
+            }
+            let _ = c.tx.send(msg.clone());
+        }
     }
 
     /// The streamed window's Mutter id, if a window streams, or the display's the Desktop shows on

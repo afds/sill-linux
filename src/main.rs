@@ -287,6 +287,8 @@ fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<
     sill_linux::capture::set_show_cursor(show_cursor);
     sill_linux::capture::set_choose_screen(CHOOSE_SCREEN.load(std::sync::atomic::Ordering::Relaxed));
     sill_linux::capture::set_keep_all_taps(keep_all_taps);
+    let sound = server.clone();
+    std::thread::Builder::new().name("audio".into()).spawn(move || sill_linux::audio::run(sound)).expect("a thread");
     if let Err(e) = sill_linux::capture::run(server, control, input) {
         eprintln!("Capture failed: {e:#}");
         std::process::exit(1);

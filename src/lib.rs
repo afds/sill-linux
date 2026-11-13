@@ -19,6 +19,8 @@ pub mod settings;
 pub mod notify;
 pub mod service;
 #[cfg(feature = "capture")]
+pub mod audio;
+#[cfg(feature = "capture")]
 pub mod capture;
 #[cfg(feature = "capture")]
 pub mod mutter;

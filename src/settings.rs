@@ -78,6 +78,9 @@ pub struct StreamSettings {
     pub prioritize_speed: bool,
     #[serde(rename = "virtualDisplay")]
     pub virtual_display: bool,
+    /// Send Audio: on (the spike sends the sound to every device that plays it; audio.rs).
+    #[serde(rename = "sendAudio")]
+    pub send_audio: bool,
 }
 
 /// `RunningStream`.
@@ -159,6 +162,7 @@ pub fn state(s: &Settings, software: bool, stream: Option<RunningStream>, answer
             capture_scale: s.capture_scale,
             prioritize_speed: true,
             virtual_display: false,
+            send_audio: cfg!(feature = "capture"),
         },
         persistent: true,
         virtual_display_available: false,
@@ -181,7 +185,7 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "settings": {"maxFPS": 120, "bitrate": 15000000, "captureScale": 1.0, "prioritizeSpeed": true, "virtualDisplay": false},
+                "settings": {"maxFPS": 120, "bitrate": 15000000, "captureScale": 1.0, "prioritizeSpeed": true, "virtualDisplay": false, "sendAudio": true},
                 "persistent": true,
                 "virtualDisplayAvailable": false,
                 "virtualDisplayNote": "Linux has no virtual display for Sill; windows stream from the screen.",

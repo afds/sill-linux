@@ -903,3 +903,15 @@ is not known.
   still read the host's key in `~/.local/state/sill-linux`: this narrows, it does not close.
 - `settings.json` is written through a temporary file, as `paired.json` is.
 - A copy is read with one call (its text) instead of two.
+
+## The machine's sound (2026-11-13, the spike)
+
+Sill 0.6.2's kind 43: the default output's monitor (pulsesrc, through pipewire-pulse) → 48 kHz
+stereo → AAC-ELD from libfdk-aac, opened with dlopen (libfdk-aac2, Ubuntu's universe: Fedora's
+stripped build, which keeps AAC-ELD and which PipeWire's Bluetooth AAC installs anyway) → 480-frame
+packets at 128 kbps, about 160 bytes, one a message. FFmpeg decodes the encoder's output as ELD
+(a 440 Hz tone back at 440 Hz). The device played nothing until its cookie was an ESDS: Sill's
+notes call the cookie "its AudioSpecificConfig", but AudioToolbox makes and takes an MPEG-4 ES
+descriptor around it, and refused the bare four bytes without a word (only a Debug build says
+"its cookie was refused"). With the ESDS: the iPad's own reports said 18 to 42 ms behind the
+picture and nothing late.

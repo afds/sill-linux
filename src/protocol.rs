@@ -44,6 +44,7 @@ pub mod kind {
     pub const CLIPBOARD: u8 = 32;
     pub const KEYFRAME_REQUEST: u8 = 44;
     pub const NEXT_DISPLAY: u8 = 47;
+    pub const AUDIO: u8 = 43;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -269,6 +270,10 @@ pub struct ClientStats {
     pub device: String,
     pub frame_age_max_ms: Option<i64>,
     pub rtt_max_ms: Option<i64>,
+    /// This machine's sound: how far it trailed the picture (ms, -1: none played that second), and
+    /// its packets that came too late to play.
+    pub audio_behind_ms: Option<i64>,
+    pub audio_late: Option<i64>,
 }
 
 /// `Hello` (kind 23): every field optional.
@@ -279,6 +284,8 @@ pub struct Hello {
     pub build: Option<String>,
     pub protocol: Option<i64>,
     pub device: Option<String>,
+    /// The codecs of this machine's sound the device plays, best first (["aac-eld"]).
+    pub audio: Option<Vec<String>>,
 }
 
 #[cfg(test)]
