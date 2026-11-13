@@ -37,7 +37,7 @@ two virtual monitors in the nested shell.
 
 ## Step 3: Send Audio (kind 43), a spike first (done 2026-11-13)
 
-- Capture: PipeWire, the default sink's monitor for the Desktop, the app's own stream (by PID)
+- Capture: PipeWire, the default sink's monitor for the Desktop, the app's own stream (by PID, or a Flatpak's app id)
   for a window.
 - Codec: a device's hello lists only `aac-eld`. GStreamer's `fdkaacenc` has lc, he-aac-v1/v2 and
   ld, not ELD, so libfdk-aac itself (Ubuntu's multiverse: a packaging and licence question).

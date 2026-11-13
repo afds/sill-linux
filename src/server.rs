@@ -1114,16 +1114,15 @@ impl Server {
     pub fn sound_of(&self) -> SoundOf {
         let st = self.state.lock().unwrap();
         let window = match st.active {
-            StreamSource::Window(w) => st.mutter_ids.get(&w).copied().filter(|m| m & (1 << 63) == 0),
+            StreamSource::Window(w) => st.mutter_ids.get(&w).copied().filter(|m| m & (1 << 63) == 0).map(|m| (w, m)),
             _ => None,
         };
         match (window, st.sound_pid) {
             (None, _) => SoundOf::Everything,
-            (Some(w), Some((id, Some(pid)))) if id == w => {
-                let StreamSource::Window(wire) = st.active else { unreachable!() };
+            (Some((wire, w)), Some((id, Some(pid)))) if id == w => {
                 SoundOf::Process(pid, st.windows.iter().find(|x| x.id == wire).map(|x| x.bundle_id.clone()).unwrap_or_default())
             }
-            (Some(w), Some((id, None))) if id == w => SoundOf::Everything,
+            (Some((_, w)), Some((id, None))) if id == w => SoundOf::Everything,
             _ => SoundOf::Unknown,
         }
     }
