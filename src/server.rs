@@ -97,6 +97,8 @@ pub enum Control {
     /// Aa: size the streamed window's frame to this many logical pixels (the device's panel over
     /// its text scale).
     Fit(u64, i32, i32),
+    /// Aa's Off: the window Aa sized goes back.
+    Unfit,
 }
 
 /// Why sharing ended on this machine (`Server::sharing_ended`).
@@ -469,6 +471,7 @@ impl Server {
             protocol: Some(protocol::PROTOCOL),
             gestures: self.gestures.load(Ordering::Relaxed).then_some(1),
             clipboard: self.clipboard.lock().unwrap().is_some().then_some(crate::clipboard::GENERATION),
+            key_repeat: Some(1),
         };
         protocol::message(kind::WINDOW_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
     }
@@ -557,6 +560,7 @@ impl Server {
 
         let mut stats_seen = 0u64;
         let mut input_noted = false;
+        let mut last_keyframe_ask: Option<Instant> = None;
         let reason = loop {
             let msg = tokio::select! {
                 m = read_message(&mut rd) => m,
@@ -588,6 +592,13 @@ impl Server {
                         );
                     }
                 }
+                // A device's picture was interrupted (PiP, the app away): a still window sends no keyframe by itself.
+                kind::KEYFRAME_REQUEST if last_keyframe_ask.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) => {
+                    last_keyframe_ask = Some(Instant::now());
+                    if self.state.lock().unwrap().active != StreamSource::None {
+                        let _ = self.control.send(Control::Keyframe);
+                    }
+                }
                 kind::WINDOW_COMMAND => self.window_command(id, &payload),
                 kind::LAUNCH_APP => self.launch(id, &payload),
                 kind::CLIPBOARD => self.clipboard_from(id, &payload),
@@ -598,6 +609,10 @@ impl Server {
                 },
                 kind::VIEWPORT => {
                     if let Ok(v) = serde_json::from_slice::<Viewport>(&payload) {
+                        if let Some(why) = v.refusal() {
+                            println!("Refused a viewport from client {id}: {why}; it keeps the one before.");
+                            continue;
+                        }
                         let mut st = self.state.lock().unwrap();
                         let changed = st.clients.get_mut(&id).map(|c| {
                             let was = c.fps;
@@ -607,9 +622,13 @@ impl Server {
                         if changed == Some(true) {
                             self.reapply(&st);
                         }
+                        // Aa set to Off (a scale, then none): the window goes back, as when it stops streaming.
+                        let off = st.viewport.as_ref().is_some_and(|was| was.scale.is_some()) && v.scale.is_none();
                         st.viewport = Some(v.clone());
                         if let Some(fit) = Self::fit_control(&st) {
                             let _ = self.control.send(fit);
+                        } else if off && matches!(st.active, StreamSource::Window(_)) {
+                            let _ = self.control.send(Control::Unfit);
                         }
                         drop(st);
                         println!(

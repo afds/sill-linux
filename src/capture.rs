@@ -240,7 +240,7 @@ fn idle(server: &Server, control: &Receiver<Control>, rec: &Recorder, apply: &mu
             Ok(Control::Launch(app)) => RecReq::Launch(app),
             Ok(Control::Gesture(name)) => RecReq::Gesture(name),
             // Its Start failed: nothing streams to fit to.
-            Ok(Control::Fit(..)) => continue,
+            Ok(Control::Fit(..) | Control::Unfit) => continue,
         };
         let _ = rec.send(req);
     }
@@ -410,6 +410,11 @@ fn run_pipeline(
             Ok(Control::Fit(id, w, h)) => {
                 if let Some(rec) = recorder {
                     let _ = rec.send(RecReq::Fit(id, w, h));
+                }
+            }
+            Ok(Control::Unfit) => {
+                if let Some(rec) = recorder {
+                    let _ = rec.send(RecReq::Release);
                 }
             }
             Ok(Control::Start(_)) => {

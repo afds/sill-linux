@@ -180,6 +180,11 @@ fn main() {
             Ok(()) => println!("Forgot every paired device ({}).", state.join("paired.json").display()),
             Err(_) => println!("No paired devices."),
         }
+        // A running host keeps its list, and its sessions, until it starts again (Sill's finding 10).
+        match sill_linux::service::restart_if_running() {
+            Ok(()) => println!("The service, if it was running, started again without them."),
+            Err(e) => println!("Could not restart the service ({e:#}); a sill-linux started by hand keeps them until it starts again."),
+        }
         return;
     }
 

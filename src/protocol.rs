@@ -42,6 +42,7 @@ pub mod kind {
     pub const MAC_POINTER: u8 = 26;
     pub const GESTURE: u8 = 28;
     pub const CLIPBOARD: u8 = 32;
+    pub const KEYFRAME_REQUEST: u8 = 44;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -219,6 +220,10 @@ pub struct WindowList {
     /// What of the clipboard this host shares (1: text); None: nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<i64>,
+    /// 1: a held key repeats here, so a device sends a hardware keyboard's characters as keys
+    /// (GNOME's clients repeat a held key themselves).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_repeat: Option<i64>,
 }
 
 /// `Viewport` (kind 9).
@@ -229,6 +234,20 @@ pub struct Viewport {
     pub height: f64,
     pub scale: Option<f64>,
     pub fps: Option<i64>,
+}
+
+impl Viewport {
+    /// Why a host refuses it whole (Sill's `ViewportBounds`): each side 1 to 16384 points, a scale
+    /// 0.25 to 4 or none. NaN is in no range. None: taken.
+    pub fn refusal(&self) -> Option<String> {
+        // 1e300 as "1e300", not 301 digits.
+        let n = |x: f64| if x == 0.0 || (1e-6..1e9).contains(&x.abs()) { x.to_string() } else { format!("{x:e}") };
+        let mut why = Vec::new();
+        if !(1.0..=16384.0).contains(&self.width) { why.push(format!("width {} (1 to 16384 points)", n(self.width))); }
+        if !(1.0..=16384.0).contains(&self.height) { why.push(format!("height {} (1 to 16384 points)", n(self.height))); }
+        if let Some(s) = self.scale.filter(|s| !(0.25..=4.0).contains(s)) { why.push(format!("scale {} (0.25 to 4)", n(s))); }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
 }
 
 /// `ClientStats` (kind 12).
@@ -255,6 +274,17 @@ pub struct Hello {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn viewport_bounds() {
+        let v = |width, height, scale| super::Viewport { width, height, scale, fps: None };
+        assert_eq!(v(1376.0, 1032.0, Some(1.5)).refusal(), None);
+        assert_eq!(v(1.0, 16384.0, None).refusal(), None);
+        let r = v(1e300, 900.0, Some(1e-300)).refusal().unwrap();
+        assert_eq!(r, "width 1e300 (1 to 16384 points), scale 1e-300 (0.25 to 4)");
+        assert!(v(f64::NAN, 900.0, None).refusal().is_some());
+        assert!(v(900.0, 0.5, Some(0.25)).refusal().unwrap().starts_with("height"));
+    }
+
     use super::*;
 
     #[test]
@@ -322,11 +352,13 @@ mod tests {
             protocol: Some(1),
             gestures: None,
             clipboard: None,
+            key_repeat: None,
         };
         let v: serde_json::Value = serde_json::to_value(&l).unwrap();
         assert_eq!(v, serde_json::json!({"macName":"linux","windows":[],"active":{"desktop":{}},"launchID":"L","protocol":1}));
-        let v = serde_json::to_value(WindowList { clipboard: Some(1), ..l }).unwrap();
+        let v = serde_json::to_value(WindowList { clipboard: Some(1), ..l.clone() }).unwrap();
         assert_eq!(v["clipboard"], 1);
+        assert_eq!(serde_json::to_value(WindowList { key_repeat: Some(1), ..l.clone() }).unwrap()["keyRepeat"], 1);
         let w = WindowInfo { id: 3, title: "t".into(), app_name: "a".into(), bundle_id: "b".into(), width: 1, height: 2 };
         assert_eq!(
             serde_json::to_value(&w).unwrap(),

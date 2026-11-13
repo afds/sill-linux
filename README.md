@@ -20,14 +20,15 @@ The Sill app on an iPad, streaming from Ubuntu with GNOME.
 
 - **The desktop**, HEVC, at the app's chosen quality, resolution and frame rate (the gear in the
   app sets them; kept in `~/.local/state/sill-linux/settings.json`).
-- **Input:** taps and clicks, scrolling, the trackpad, hardware keys, and typed text. The device's
+- **Input:** taps and clicks, scrolling, the trackpad, hardware keys (a held key repeats), and typed text. The device's
   Command key is Ctrl here, so ⌘C copies (`--command-key super` changes that). The app's Spotlight
   key opens GNOME's Activities.
 - **Single windows (GNOME, with the extension):**
   - each window in the app's bar with a thumbnail; a tap streams it alone, raised and focused;
   - close, minimize and full screen from a held thumbnail;
   - All Apps, with icons, to start an app;
-  - Aa sizes the window to the device's panel, and it goes back when it stops streaming.
+  - Aa sizes the window to the device's panel, and it goes back when it stops streaming or Aa is
+    set to Off.
 - **More than one monitor:** each monitor but the main one is an entry with the windows, named after
   the monitor ("Dell 27″ (DP-2)", with a monitor icon and a thumbnail); a tap streams that monitor, and input goes there. Desktop is the
   main monitor (`--monitor` picks another).
@@ -99,7 +100,7 @@ pairing window comes up in the middle of this screen with a QR code to scan with
 and the code for Enter Code Instead. It closes by itself once the device pairs; its Cancel keeps
 that device from asking again for 10 minutes. Without the extension the code comes as a desktop
 notification, and in a terminal it is printed too (with a QR code if `qrencode` is installed). Each device pairs once; after that a tap connects.
-`--forget-devices` removes every paired device.
+`--forget-devices` removes every paired device and restarts the service if it runs.
 
 ## Security
 

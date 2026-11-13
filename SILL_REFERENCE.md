@@ -5,8 +5,10 @@ sources are the specification, and its test client and checks are the oracle. Th
 compares against one pinned Sill commit and moves the pin on purpose.
 
 - Repository: https://github.com/Saffsanity/sill
-- Commit: `5c323e6965b5011809548e5067f9e8e6fa6adf54` (main, 2026-10-17, after PR #98)
-- Protocol: `SillProtocol.current` 1, ALPNs `sill/1` and `sill-pair/1`, kinds 0–28 and 32
+- Commit: `bf69067fe60348bfcf3d617086a8589fbdf8dbb6` (main, 2026-11-12, Sill 0.6.2, PR #364);
+  moved from `5c323e6` (2026-10-17): docs/upstream-0.6.2-plan.md
+- Protocol: `SillProtocol.current` 1, ALPNs `sill/1` and `sill-pair/1`, kinds 0–28, 32, 43
+  (sound), 44 (keyframe request) and 47 (the Desktop's next display); this host serves 44
 
 ## What to read there
 

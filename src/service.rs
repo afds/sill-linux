@@ -54,6 +54,11 @@ fn systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Restarts the service if it runs, so it reads its state again (and every session ends).
+pub fn restart_if_running() -> Result<()> {
+    systemctl(&["try-restart", UNIT])
+}
+
 pub fn install(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe().context("finding this program")?;
     let path = unit_path()?;

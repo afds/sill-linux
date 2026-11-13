@@ -830,3 +830,24 @@ texture (`allTextured`); otherwise it answers none, and the device keeps the las
 the nested shell with mpv (`--vo=dmabuf-wayland`) and a thumbnail asked every 50 ms: version 5
 crashed the shell in the first round every time, version 6 ran six rounds; an ordinary window's
 thumbnail as before.
+
+## Sill 0.6.2's small things (2026-11-13)
+
+The pin moved to Sill 0.6.2 (docs/upstream-0.6.2-plan.md, step 1):
+
+- Kind 44: a device whose picture was interrupted (Picture in Picture, the app away) asks for a
+  keyframe; every device gets one, at most one a second per connection.
+- A viewport outside Sill's `ViewportBounds` (a side outside 1 to 16384 points, a scale outside
+  0.25 to 4) is refused whole and the one before kept. Rust's `as i32` saturates, so this host
+  never trapped as Sill for Mac did, but a 1e300 viewport asked Mutter for a window of i32::MAX.
+  Aa's Off (a scale, then none) puts the window back.
+- `keyRepeat` 1 in the window list: the device then sends a hardware keyboard's Latin characters
+  as keys. GNOME repeats a held key sent through RemoteDesktop itself (34 `a`s from 1.5 s held in
+  a zenity entry, headless shell), so nothing repeats here.
+- `--forget-devices` restarts a running service (`systemctl --user try-restart`): it kept its list
+  of paired keys, and their sessions, until it started again (Sill's security finding 10). Finding
+  9 (the waiting connections) was already met; 3 and 8 are the device's and Direct Wireless's.
+
+Checked with Sill's `sillclient.py` against a `--plain` door in a headless shell: the refusal and
+the next viewport taken; keyframes at 4.03 s and 6.37 s for requests at 4.0, 4.3 and 6.0 s. Not
+checked live: Aa's Off (the restore is the one a stop uses), key repeat from the app.
