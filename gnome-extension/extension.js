@@ -3,7 +3,9 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (7)
+// Only the owner of org.sill_linux.Host (the sill-linux host) is answered: GNOME lets few programs
+// take screenshots or read the clipboard, and this would let any of the user's programs do both.
+//   Version() -> u                this interface's version (8)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -128,7 +130,8 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 7;
+const VERSION = 8;
+const HOST_NAME = 'org.sill_linux.Host';
 
 // Whether every surface of a window actor has a texture. Mutter 50's get_image crashes GNOME Shell
 // on a surface without one (a window still being made, or the single-pixel buffer a video player
@@ -616,8 +619,53 @@ class Service {
         }
     }
 
+    // The host's unique name, asked again when another caller comes (the host restarted, say).
+    _fromHost(sender) {
+        if (sender && sender === this._host)
+            return true;
+        try {
+            const [owner] = Gio.DBus.session.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', 'GetNameOwner', new GLib.Variant('(s)', [HOST_NAME]),
+                new GLib.VariantType('(s)'), Gio.DBusCallFlags.NONE, 500, null).deep_unpack();
+            this._host = owner;
+        } catch (_e) {
+            this._host = null; // no host has the name
+        }
+        return sender === this._host;
+    }
+
+    // This object as GJS's D-Bus dispatch sees it: every method only by its Async name, which looks
+    // at the caller first. (GDBus's g-authorize-method is emitted off the main thread, where no
+    // JavaScript runs.) A sync method's reply is packed as GJS packs it.
+    _guarded() {
+        return new Proxy(this, {
+            get: (target, prop, receiver) => {
+                if (typeof prop !== 'string' || !/^[A-Z]/.test(prop))
+                    return Reflect.get(target, prop, receiver);
+                if (!prop.endsWith('Async'))
+                    return undefined; // then GJS asks for `${prop}Async`
+                const async = target[prop], sync = target[prop.slice(0, -'Async'.length)];
+                if (!async && !sync)
+                    return undefined;
+                return (params, invocation) => {
+                    if (!this._fromHost(invocation.get_sender())) {
+                        invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied', `only ${HOST_NAME} is answered`);
+                        return undefined;
+                    }
+                    if (async)
+                        return async.call(target, params, invocation);
+                    const ret = sync.apply(target, params);
+                    const out = invocation.get_method_info().out_args;
+                    const signature = `(${out.map(a => a.signature).join('')})`;
+                    invocation.return_value(new GLib.Variant(signature, out.length === 1 ? [ret] : ret ?? []));
+                    return undefined;
+                };
+            },
+        });
+    }
+
     enable() {
-        this._dbus = Gio.DBusExportedObject.wrapJSObject(XML, this);
+        this._dbus = Gio.DBusExportedObject.wrapJSObject(XML, this._guarded());
         this._dbus.export(Gio.DBus.session, PATH);
         this._name = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
         for (const w of global.display.list_all_windows())

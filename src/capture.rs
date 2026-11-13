@@ -848,6 +848,15 @@ fn start_capture(server: Server, input: Option<CommandKey>) -> Result<(PortalCas
 /// while a device streams (`idle`).
 async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(PortalCast, Option<UnboundedSender<InputCmd>>, Recorder, impl Send)> {
     let conn = ashpd::zbus::Connection::session().await.context("the session bus")?;
+    // The extension (from version 8) answers only this name's owner. DO_NOT_QUEUE (4); 1: ours.
+    let named = conn
+        .call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", Some("org.freedesktop.DBus"), "RequestName", &(HOST_NAME, 4u32))
+        .await
+        .ok()
+        .and_then(|r| r.body().deserialize::<u32>().ok());
+    if named != Some(1) {
+        println!("Windows: another sill-linux has {HOST_NAME}; the GNOME Shell extension answers only that one.");
+    }
     let wanted = MONITOR.lock().unwrap().clone();
     let connector = crate::mutter::monitor_connector(&conn, wanted.as_deref()).await?;
     // No session yet: one opens when a device picks a source (a session made now would show GNOME's
@@ -949,7 +958,9 @@ fn is_display(source: Source) -> bool {
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 7;
+const EXTENSION_VERSION: u32 = 8;
+/// The bus name the extension answers (its `HOST_NAME`).
+const HOST_NAME: &str = "org.sill_linux.Host";
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -1296,11 +1307,8 @@ async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
                     own = None;
                     continue;
                 }
-                let Some(types) = shell.clipboard_types().await else { continue };
-                if types.is_empty() {
-                    continue;
-                }
-                let Some(text) = shell.clipboard_text().await else { continue };
+                // "" for none, or for a copy without text (an image): nothing to send.
+                let Some(text) = shell.clipboard_text().await.filter(|t| !t.is_empty()) else { continue };
                 if own.take().is_some_and(|o| o == text) {
                     continue;
                 }

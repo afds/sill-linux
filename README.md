@@ -107,6 +107,8 @@ notification, and in a terminal it is printed too (with a QR code if `qrencode` 
 
 - Every connection is TLS 1.3, and both ends' keys are pinned, as with Sill for Mac.
 - A device must pair with a one-time code shown on this machine.
+- The GNOME Shell extension answers only the running host (`org.sill_linux.Host`), not the
+  other programs on the session bus, which GNOME keeps from screenshots and the clipboard.
 - `--open` lets any device in without pairing (still TLS). `--plain` is unencrypted, only for a
   Debug build of the app.
 - The host's keys and paired devices are in `~/.local/state/sill-linux/` (0600). Delete

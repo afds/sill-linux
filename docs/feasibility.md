@@ -887,3 +887,19 @@ is not known.
   shell (a new screen cast per step, the list 1, 2, 1). Not done: Sill's 30 s grace for the
   choice (the stream's own `--keep-streaming` covers a return) and moving the pointer to the new
   monitor's centre.
+
+## The audit (2026-11-13)
+
+- A device that vanished without closing (out of Wi-Fi range) stayed connected until TCP gave
+  up, a quarter of an hour: suspend held off, the stream on, `--keep-streaming` never started. A
+  session now ends after 10 s without a message (a device pings several times a second; Sill for
+  Mac 4 to 8 s). Checked with sillclient.py `--stop-ping@8`: gone at 18 s, "silent for 10 s".
+- The extension answered anyone on the session bus, so any of the user's programs could take a
+  window's or a monitor's picture and read the clipboard, which GNOME keeps from them. It
+  (version 8) now answers only the owner of `org.sill_linux.Host`, which the host takes at start;
+  everyone else gets AccessDenied. GDBus's `g-authorize-method` is emitted off the main thread,
+  where GJS runs nothing (every call timed out), so the object GJS dispatches to is a Proxy that
+  offers each method only as `…Async` and looks at the caller first. A program of the user's can
+  still read the host's key in `~/.local/state/sill-linux`: this narrows, it does not close.
+- `settings.json` is written through a temporary file, as `paired.json` is.
+- A copy is read with one call (its text) instead of two.

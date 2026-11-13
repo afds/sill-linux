@@ -46,8 +46,9 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, serde_json::to_vec_pretty(self).unwrap())
+    /// Through a temporary file, so a crash mid-write leaves the old settings, not a broken file.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::identity::write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
     /// The stream's rate: the limit, the fastest device (60 when none says), never above 120.
@@ -223,12 +224,13 @@ mod tests {
 
     #[test]
     fn saved_and_loaded() {
-        let p = std::env::temp_dir().join(format!("sill-settings-{}.json", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("sill-settings-{}", uuid::Uuid::new_v4()));
+        let p = dir.join("settings.json");
         let s = Settings { max_fps: 60, bitrate: 40_000_000, capture_scale: 2.0 };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
         std::fs::write(&p, br#"{"maxFPS":99,"bitrate":1,"captureScale":3}"#).unwrap();
         assert_eq!(Settings::load(&p), Settings::default(), "out-of-range values fall back");
-        std::fs::remove_file(p).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

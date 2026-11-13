@@ -31,6 +31,9 @@ use tokio::sync::{mpsc, watch};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(30);
 const EVICT_AFTER: Duration = Duration::from_secs(4);
+/// A device pings several times a second; one heard from for this long is gone (out of Wi-Fi
+/// range, say, with no close the host would see for a quarter of an hour). Sill for Mac: 4 to 8 s.
+const SILENCE: Duration = Duration::from_secs(10);
 const EVICT_GRACE: Duration = Duration::from_secs(8);
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -585,7 +588,10 @@ impl Server {
         let mut last_keyframe_ask: Option<Instant> = None;
         let reason = loop {
             let msg = tokio::select! {
-                m = read_message(&mut rd) => m,
+                m = tokio::time::timeout(SILENCE, read_message(&mut rd)) => match m {
+                    Ok(m) => m,
+                    Err(_) => break "silent for 10 s",
+                },
                 _ = close_rx.changed() => break "closed by the host",
             };
             let (h, payload) = match msg {
