@@ -105,10 +105,11 @@ pub enum Control {
 }
 
 /// `Server::sound_of`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SoundOf {
     Everything,
-    Process(u32),
+    /// The window's process and its app id (a Flatpak's is its sandbox's).
+    Process(u32, String),
     Unknown,
 }
 
@@ -1118,7 +1119,10 @@ impl Server {
         };
         match (window, st.sound_pid) {
             (None, _) => SoundOf::Everything,
-            (Some(w), Some((id, Some(pid)))) if id == w => SoundOf::Process(pid),
+            (Some(w), Some((id, Some(pid)))) if id == w => {
+                let StreamSource::Window(wire) = st.active else { unreachable!() };
+                SoundOf::Process(pid, st.windows.iter().find(|x| x.id == wire).map(|x| x.bundle_id.clone()).unwrap_or_default())
+            }
             (Some(w), Some((id, None))) if id == w => SoundOf::Everything,
             _ => SoundOf::Unknown,
         }

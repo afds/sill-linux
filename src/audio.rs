@@ -239,9 +239,9 @@ fn target(server: &Server) -> Target {
     match server.sound_of() {
         SoundOf::Everything => Target::Everything,
         SoundOf::Unknown => Target::Nothing,
-        SoundOf::Process(pid) => {
+        SoundOf::Process(pid, app) => {
             let dump = std::process::Command::new("pw-dump").output().ok().and_then(|o| serde_json::from_slice(&o.stdout).ok());
-            dump.and_then(|d| app_stream(&d, pid, parent)).map_or(Target::Nothing, |(serial, app)| Target::App(serial, app))
+            dump.and_then(|d| app_stream(&d, pid, &app, parent)).map_or(Target::Nothing, |(serial, app)| Target::App(serial, app))
         }
     }
 }
@@ -252,15 +252,15 @@ fn parent(pid: u32) -> Option<u32> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// In a `pw-dump`, the playback stream of process `pid` or of one under it (`parent` walks up):
-/// its node's serial and its app's name; a running one first.
-pub fn app_stream(dump: &serde_json::Value, pid: u32, parent: impl Fn(u32) -> Option<u32>) -> Option<(u64, String)> {
+/// In a `pw-dump`, the playback stream of the window's app (`app`: its .desktop id): of process
+/// `pid` or of one under it (`parent` walks up), or, for a Flatpak, of its sandbox's app id (a
+/// Flatpak's process ids are its sandbox's own, Firefox's 2: never this machine's). Its node's
+/// serial and its app's name; a running one first.
+pub fn app_stream(dump: &serde_json::Value, pid: u32, app: &str, parent: impl Fn(u32) -> Option<u32>) -> Option<(u64, String)> {
     let objects = dump.as_array()?;
     let props = |o: &serde_json::Value| o.pointer("/info/props").cloned().unwrap_or_default();
     let number = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
-    let client_pid = |client: u64| {
-        objects.iter().find(|o| o["id"].as_u64() == Some(client)).and_then(|o| number(&props(o)["application.process.id"]))
-    };
+    let flatpak = app.strip_suffix(".desktop").unwrap_or(app);
     let under = |mut p: u32| {
         for _ in 0..32 {
             if p == pid {
@@ -278,8 +278,13 @@ pub fn app_stream(dump: &serde_json::Value, pid: u32, parent: impl Fn(u32) -> Op
         .filter(|o| props(o)["media.class"] == "Stream/Output/Audio")
         .filter_map(|o| {
             let p = props(o);
-            let owner = client_pid(number(&p["client.id"])?)?;
-            under(u32::try_from(owner).ok()?).then(|| {
+            let client = number(&p["client.id"])?;
+            let c = props(objects.iter().find(|o| o["id"].as_u64() == Some(client))?);
+            let ours = match c["pipewire.access.portal.app_id"].as_str() {
+                Some(sandbox) => !flatpak.is_empty() && sandbox == flatpak,
+                None => number(&c["application.process.id"]).and_then(|owner| u32::try_from(owner).ok()).is_some_and(under),
+            };
+            ours.then(|| {
                 let name = p["application.name"].as_str().or(p["node.name"].as_str()).unwrap_or("an app");
                 (o.pointer("/info/state") == Some(&"running".into()), number(&p["object.serial"]).unwrap_or(0), crate::door::clean(name, "an app"))
             })
@@ -442,9 +447,25 @@ mod tests {
                 {"media.class": "Stream/Input/Audio", "client.id": 30, "object.serial": 10, "application.name": "Firefox"}}},
         ]);
         let parent = |p: u32| match p { 101 => Some(100), 100 | 200 => Some(1), _ => None };
-        assert_eq!(app_stream(&dump, 100, parent), Some((9, "Firefox".into())), "its running playback, not its capture");
-        assert_eq!(app_stream(&dump, 200, parent), Some((7, "Music".into())));
-        assert_eq!(app_stream(&dump, 300, parent), None, "an app that plays nothing");
+        assert_eq!(app_stream(&dump, 100, "firefox.desktop", parent), Some((9, "Firefox".into())), "its running playback, not its capture");
+        assert_eq!(app_stream(&dump, 200, "music.desktop", parent), Some((7, "Music".into())));
+        assert_eq!(app_stream(&dump, 300, "", parent), None, "an app that plays nothing");
+        // Flatpaks, as on 2026-11-13: process ids from inside the sandbox (Plex's 5 is a kernel
+        // thread here), matched by the sandbox's app id against the window's .desktop id.
+        let flatpaks = serde_json::json!([
+            {"id": 92, "type": "PipeWire:Interface:Client", "info": {"props":
+                {"application.process.id": 5, "pipewire.access.portal.app_id": "tv.plex.PlexDesktop"}}},
+            {"id": 84, "type": "PipeWire:Interface:Client", "info": {"props":
+                {"application.process.id": 2, "pipewire.access.portal.app_id": "org.mozilla.firefox"}}},
+            {"id": 145, "type": "PipeWire:Interface:Node", "info": {"state": "running", "props":
+                {"media.class": "Stream/Output/Audio", "client.id": 92, "object.serial": 145, "application.name": "Plex"}}},
+            {"id": 177, "type": "PipeWire:Interface:Node", "info": {"state": "idle", "props":
+                {"media.class": "Stream/Output/Audio", "client.id": 84, "object.serial": 177, "application.name": "Firefox"}}},
+        ]);
+        let any_parent = |_: u32| Some(5); // a sandbox's 5 is never taken for the window's process
+        assert_eq!(app_stream(&flatpaks, 5, "tv.plex.PlexDesktop.desktop", any_parent), Some((145, "Plex".into())));
+        assert_eq!(app_stream(&flatpaks, 5, "org.mozilla.firefox.desktop", any_parent), Some((177, "Firefox".into())));
+        assert_eq!(app_stream(&flatpaks, 5, "org.gnome.Ptyxis.desktop", any_parent), None, "another app: no sandbox's stream by pid");
         assert_eq!(super::parent(std::process::id()), Some(std::os::unix::process::parent_id()), "/proc's parent");
     }
 
