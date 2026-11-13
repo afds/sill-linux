@@ -915,3 +915,25 @@ notes call the cookie "its AudioSpecificConfig", but AudioToolbox makes and take
 descriptor around it, and refused the bare four bytes without a word (only a Debug build says
 "its cookie was refused"). With the ESDS: the iPad's own reports said 18 to 42 ms behind the
 picture and nothing late.
+
+## The sound, finished (2026-11-13)
+
+- Send Audio is a saved setting (`settings.json`'s `sendAudio`, on when missing), set for every
+  device by any device's switch; kind 16 says nil (the switch disabled) from a host without
+  sound: `--no-audio`, or no libfdk-aac.
+- What it is of, as Sill for Mac: while a window streams, its app alone. The extension (version 9)
+  says the window's process (`WindowPid`); the host finds that process's playback stream in
+  `pw-dump`, or one of a child's (a browser plays from one: the client's process walked up its
+  parents), and records it with `pipewiresrc target-object=<serial>`. Everything playing (the
+  default output's monitor) for the Desktop and a monitor, and for a window whose process is not
+  known (an older extension). Nothing while a window just picked is asked about, so another
+  app's sound never goes meanwhile. Looked at again every 2 s; a change is a new epoch.
+- `node.dont-reconnect` and `node.dont-fallback` on that capture: in an isolated PipeWire with a
+  fake microphone, a capture of an app that quit stayed silent with them, and without them a
+  target that was not there was linked elsewhere. Without them it could have sent a microphone.
+- Packet stamps: the segment's first frame's wall-clock time plus the frames since, moved to the
+  wall clock when each second's earliest reading is more than 20 ms off (a late buffer only makes
+  a reading late).
+- Checked end to end with a headless shell on its own PipeWire, WirePlumber and pipewire-pulse
+  (nothing of the real session's sound): the Desktop sent everything (format `desktop`), picking
+  a window that plays a tone started a new epoch of that app alone (format `app`, "ToneApp").

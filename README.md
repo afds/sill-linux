@@ -44,7 +44,12 @@ The Sill app on an iPad, streaming from Ubuntu with GNOME.
   once at home, and the app keeps this machine as a "Remote" row it dials from anywhere the VPN
   reaches, on the same port and with the same encryption. `--no-remote` turns it off.
 
-Not supported: audio and a virtual display.
+- **Sound** (the app's 0.6 and later), while the app's Send Audio is on: what the streamed window's
+  app plays, or everything playing while the Desktop or a monitor streams, as AAC-ELD at 128 kbps.
+  It needs `libfdk-aac2` (Ubuntu's universe; PipeWire's Bluetooth support installs it on most
+  desktops); without it there is no sound. `--no-audio` sends none.
+
+Not supported: a virtual display.
 
 ## Requirements
 
@@ -122,7 +127,7 @@ notification, and in a terminal it is printed too (with a QR code if `qrencode` 
 sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
            [--show-cursor] [--keep-all-taps] [--choose-screen] [--portal] [--monitor CONNECTOR]
            [--no-notifications] [--no-clipboard] [--no-remote] [--command-key ctrl|super]
-           [--keep-streaming SECONDS] [--forget-devices]
+           [--keep-streaming SECONDS] [--no-audio] [--forget-devices]
 ```
 
 - `--keep-streaming 60` (the default): the stream goes on that long after the last device

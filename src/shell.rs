@@ -266,6 +266,12 @@ impl Client {
         }
     }
 
+    /// The window's process (extension version 9); None when unknown.
+    pub async fn window_pid(&self, id: u64) -> Option<u32> {
+        let reply = self.proxy.call_method("WindowPid", &(id,)).await.ok()?;
+        reply.body().deserialize::<u32>().ok().filter(|p| *p > 0)
+    }
+
     /// Fires on every `ClipboardChanged`.
     pub async fn clipboard_changes(&self) -> Result<Arrivals> {
         self.arrivals("ClipboardChanged").await

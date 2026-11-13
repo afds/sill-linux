@@ -10,7 +10,7 @@ use std::sync::mpsc;
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
                   [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
                   [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR] [--no-clipboard]
-                  [--no-remote] [--keep-streaming SECONDS]
+                  [--no-remote] [--keep-streaming SECONDS] [--no-audio]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
        sill-linux --install-extension                 GNOME: list single windows in the app's bar
@@ -31,6 +31,7 @@ const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plai
                     screen-cast API, which needs no dialog and streams single windows)
   --monitor C       with GNOME's API, the monitor to stream as the Desktop (a connector, e.g. DP-3)
   --no-clipboard    share nothing of the clipboard with devices (GNOME, with the extension: on)
+  --no-audio        send this machine's sound to no device (on: while the app's Send Audio is on)
   --keep-streaming S  keep streaming S seconds after the last device leaves (default 60; 0: stop
                     at once), so the app back from the background is on the same window again
   --forget-devices  remove every paired device, then exit
@@ -63,12 +64,13 @@ struct Args {
     extension: bool,
     clipboard: bool,
     keep_streaming: u64,
+    audio: bool,
     /// The arguments to keep in the service's command line.
     pass: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, keep_streaming: 60, pass: Vec::new() };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, keep_streaming: 60, audio: true, pass: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut taken = None;
@@ -99,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
             "--monitor" => a.monitor = Some(value("--monitor")?),
             "--no-notifications" => a.notifications = false,
             "--no-clipboard" => a.clipboard = false,
+            "--no-audio" => a.audio = false,
             "--keep-streaming" => {
                 a.keep_streaming = value("--keep-streaming")?.parse().map_err(|_| "--keep-streaming is a number of seconds")?;
                 if a.keep_streaming > 3600 {
@@ -250,7 +253,7 @@ fn main() {
         sill_linux::capture::set_monitor(args.monitor.clone());
         sill_linux::capture::set_share_clipboard(args.clipboard);
     }
-    run_capture(&server, control_rx, args.input, args.show_cursor, args.keep_all_taps);
+    run_capture(&server, control_rx, args.input, args.show_cursor, args.keep_all_taps, args.audio);
 }
 
 /// Ctrl-C, a service stop (SIGTERM) or a hangup: devices get the goodbye and their held keys go
@@ -283,12 +286,14 @@ fn quit_on_signal(server: Server) {
 }
 
 #[cfg(feature = "capture")]
-fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<CommandKey>, show_cursor: bool, keep_all_taps: bool) {
+fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<CommandKey>, show_cursor: bool, keep_all_taps: bool, audio: bool) {
     sill_linux::capture::set_show_cursor(show_cursor);
     sill_linux::capture::set_choose_screen(CHOOSE_SCREEN.load(std::sync::atomic::Ordering::Relaxed));
     sill_linux::capture::set_keep_all_taps(keep_all_taps);
-    let sound = server.clone();
-    std::thread::Builder::new().name("audio".into()).spawn(move || sill_linux::audio::run(sound)).expect("a thread");
+    if audio {
+        let sound = server.clone();
+        std::thread::Builder::new().name("audio".into()).spawn(move || sill_linux::audio::run(sound)).expect("a thread");
+    }
     if let Err(e) = sill_linux::capture::run(server, control, input) {
         eprintln!("Capture failed: {e:#}");
         std::process::exit(1);
@@ -296,7 +301,7 @@ fn run_capture(server: &Server, control: mpsc::Receiver<Control>, input: Option<
 }
 
 #[cfg(not(feature = "capture"))]
-fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _input: Option<CommandKey>, _show_cursor: bool, _keep_all_taps: bool) {
+fn run_capture(_server: &Server, control: mpsc::Receiver<Control>, _input: Option<CommandKey>, _show_cursor: bool, _keep_all_taps: bool, _audio: bool) {
     eprintln!("Built without the capture feature: serving the door with no picture.");
     for c in control {
         println!("Control: {c:?}");

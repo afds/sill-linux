@@ -35,7 +35,7 @@ Desktop button steps to the next display): the main monitor first, then left to 
 A fresh RecordMonitor per step, as a switch already is; input and the pointer follow. Tested with
 two virtual monitors in the nested shell.
 
-## Step 3: Send Audio (kind 43), a spike first
+## Step 3: Send Audio (kind 43), a spike first (done 2026-11-13)
 
 - Capture: PipeWire, the default sink's monitor for the Desktop, the app's own stream (by PID)
   for a window.

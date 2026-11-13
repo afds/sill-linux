@@ -958,7 +958,7 @@ fn is_display(source: Source) -> bool {
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 8;
+const EXTENSION_VERSION: u32 = 9;
 /// The bus name the extension answers (its `HOST_NAME`).
 const HOST_NAME: &str = "org.sill_linux.Host";
 
@@ -1403,6 +1403,7 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
     let mut apps_sent = false;
     let mut displays: Vec<(u64, crate::mutter::Monitor)> = Vec::new();
     let mut display_stamps: HashMap<u64, Instant> = HashMap::new();
+    let mut sound_of: Option<(u64, Option<u32>)> = None;
     loop {
         let changed = tokio::select! {
             c = async { match changes.as_mut() { Some(s) => s.changed().await, None => std::future::pending().await } } => {
@@ -1429,6 +1430,16 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
                 && let Some(i) = shell.geometry(id).await {
                     *FRAME_INSETS.lock().unwrap() = Some((id, i));
                 }
+        }
+        // The streamed window's process, whose sound goes with it (audio.rs); asked once a window.
+        let streamed = server.active_window().filter(|id| id & DISPLAY_ID == 0);
+        if streamed != sound_of.map(|(id, _)| id) {
+            let pid = match streamed {
+                Some(id) => shell.window_pid(id).await,
+                None => None,
+            };
+            sound_of = streamed.map(|id| (id, pid));
+            server.set_sound_pid(streamed, pid);
         }
         // The monitors, looked at on every change and every 2 s (one could be plugged in).
         let monitors = crate::mutter::monitors(&conn).await.unwrap_or_default();

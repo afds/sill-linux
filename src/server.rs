@@ -104,6 +104,14 @@ pub enum Control {
     Unfit,
 }
 
+/// `Server::sound_of`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SoundOf {
+    Everything,
+    Process(u32),
+    Unknown,
+}
+
 /// Why sharing ended on this machine (`Server::sharing_ended`).
 pub enum Ended {
     /// GNOME's sharing indicator's stop.
@@ -197,6 +205,10 @@ struct State {
     settings: Settings,
     settings_path: Option<PathBuf>,
     software_encoder: bool,
+    /// This host sends sound (`Server::set_sound`).
+    sound: bool,
+    /// A window's process (its sound alone streams with it), when the extension says: (Mutter id, pid).
+    sound_pid: Option<(u64, Option<u32>)>,
     /// The encoded picture's size, for the panel's readout.
     encoded: Option<(i64, i64)>,
     /// The windows the device's bar lists, with the 32-bit ids the app uses for them.
@@ -252,6 +264,8 @@ impl Server {
                 settings,
                 settings_path,
                 software_encoder: false,
+                sound: false,
+                sound_pid: None,
                 encoded: None,
                 windows: Vec::new(),
                 wire_ids: HashMap::new(),
@@ -321,7 +335,7 @@ impl Server {
                 on_virtual_display: false,
             }),
         };
-        let state = settings::state(&st.settings, st.software_encoder, stream, answering);
+        let state = settings::state(&st.settings, st.software_encoder, st.sound, stream, answering);
         protocol::message(kind::HOST_SETTINGS, protocol::now(), false, &serde_json::to_vec(&state).unwrap())
     }
 
@@ -1090,7 +1104,35 @@ impl Server {
     /// Something streams to a device that plays this machine's sound.
     pub fn wants_audio(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.active != StreamSource::None && st.clients.values().any(|c| c.audio)
+        st.sound && st.settings.send_audio && st.active != StreamSource::None && st.clients.values().any(|c| c.audio)
+    }
+
+    /// What the sound is of: the streamed window's process, or this machine's whole sound (the
+    /// Desktop, a monitor, a window whose process the extension does not say), or nothing yet (a
+    /// window just picked, whose process is still being asked: never another app's meanwhile).
+    pub fn sound_of(&self) -> SoundOf {
+        let st = self.state.lock().unwrap();
+        let window = match st.active {
+            StreamSource::Window(w) => st.mutter_ids.get(&w).copied().filter(|m| m & (1 << 63) == 0),
+            _ => None,
+        };
+        match (window, st.sound_pid) {
+            (None, _) => SoundOf::Everything,
+            (Some(w), Some((id, Some(pid)))) if id == w => SoundOf::Process(pid),
+            (Some(w), Some((id, None))) if id == w => SoundOf::Everything,
+            _ => SoundOf::Unknown,
+        }
+    }
+
+    pub fn set_sound_pid(&self, window: Option<u64>, pid: Option<u32>) {
+        self.state.lock().unwrap().sound_pid = window.map(|w| (w, pid));
+    }
+
+    /// This host sends sound from now on (its encoder opened): the devices' Send Audio switch shows.
+    pub fn set_sound(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.sound = true;
+        self.broadcast_settings(&st, None);
     }
 
     /// One packet of sound (kind 43) to every device that plays it, the epoch's format first to
@@ -1336,6 +1378,9 @@ fn describe_change(a: &Settings, b: &Settings) -> String {
     }
     if a.max_fps != b.max_fps {
         parts.push(format!("frame rate limit {} → {}", a.max_fps, b.max_fps));
+    }
+    if a.send_audio != b.send_audio {
+        parts.push(format!("Send Audio {}", if b.send_audio { "on" } else { "off" }));
     }
     parts.join(", ")
 }

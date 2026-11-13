@@ -13,6 +13,9 @@
 //! - Prioritize Speed: this host always runs NVENC at its lowest-latency preset, so it says on and
 //!   refuses off (the panel shows "kept its setting").
 //! - Virtual Display: not on Linux (unavailable, with a note). Direct Wireless: no row (nil).
+//! - Send Audio (`sendAudio`): this machine's sound to the devices that play it, on unless turned
+//!   off, for every device (any device's switch sets it); nil from a host without sound
+//!   (`--no-audio`, or no libfdk-aac), which the app shows disabled.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -29,11 +32,18 @@ pub struct Settings {
     pub bitrate: i64,
     #[serde(rename = "captureScale")]
     pub capture_scale: f64,
+    /// Saved before there was sound: on.
+    #[serde(rename = "sendAudio", default = "on")]
+    pub send_audio: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { max_fps: 120, bitrate: 15_000_000, capture_scale: 1.0 }
+        Settings { max_fps: 120, bitrate: 15_000_000, capture_scale: 1.0, send_audio: true }
     }
 }
 
@@ -78,9 +88,9 @@ pub struct StreamSettings {
     pub prioritize_speed: bool,
     #[serde(rename = "virtualDisplay")]
     pub virtual_display: bool,
-    /// Send Audio: on (the spike sends the sound to every device that plays it; audio.rs).
-    #[serde(rename = "sendAudio")]
-    pub send_audio: bool,
+    /// Send Audio; nil from a host without sound.
+    #[serde(rename = "sendAudio", skip_serializing_if = "Option::is_none")]
+    pub send_audio: Option<bool>,
 }
 
 /// `RunningStream`.
@@ -125,6 +135,8 @@ pub struct HostSettingsChange {
     pub virtual_display: Option<bool>,
     #[serde(rename = "directWireless")]
     pub direct_wireless: Option<bool>,
+    #[serde(rename = "sendAudio")]
+    pub send_audio: Option<bool>,
 }
 
 /// Applies what a device may set; returns the new settings and what was refused, in words for
@@ -147,6 +159,9 @@ pub fn accept(current: Settings, c: &HostSettingsChange) -> (Settings, Vec<Strin
     if c.virtual_display == Some(true) {
         refused.push("virtual display (not on Linux)".into());
     }
+    if let Some(v) = c.send_audio {
+        s.send_audio = v;
+    }
     if c.direct_wireless.is_some() {
         refused.push("direct wireless (not on this host)".into());
     }
@@ -154,7 +169,8 @@ pub fn accept(current: Settings, c: &HostSettingsChange) -> (Settings, Vec<Strin
 }
 
 /// The state a device is sent.
-pub fn state(s: &Settings, software: bool, stream: Option<RunningStream>, answering: Option<i64>) -> HostSettingsState {
+/// `sound`: this host sends sound (audio.rs found its encoder).
+pub fn state(s: &Settings, software: bool, sound: bool, stream: Option<RunningStream>, answering: Option<i64>) -> HostSettingsState {
     HostSettingsState {
         settings: StreamSettings {
             max_fps: s.max_fps,
@@ -162,7 +178,7 @@ pub fn state(s: &Settings, software: bool, stream: Option<RunningStream>, answer
             capture_scale: s.capture_scale,
             prioritize_speed: true,
             virtual_display: false,
-            send_audio: cfg!(feature = "capture"),
+            send_audio: sound.then_some(s.send_audio),
         },
         persistent: true,
         virtual_display_available: false,
@@ -180,7 +196,7 @@ mod tests {
     #[test]
     fn state_json_is_sills() {
         let s = Settings::default();
-        let st = state(&s, false, Some(RunningStream { width: 1920, height: 1080, fps: 60, mbps: 15, on_virtual_display: false }), Some(3));
+        let st = state(&s, false, true, Some(RunningStream { width: 1920, height: 1080, fps: 60, mbps: 15, on_virtual_display: false }), Some(3));
         let v = serde_json::to_value(&st).unwrap();
         assert_eq!(
             v,
@@ -194,8 +210,9 @@ mod tests {
                 "answering": 3
             })
         );
-        let bare = serde_json::to_value(state(&s, true, None, None)).unwrap();
+        let bare = serde_json::to_value(state(&s, true, false, None, None)).unwrap();
         assert!(bare.get("stream").is_none() && bare.get("answering").is_none());
+        assert!(bare["settings"].get("sendAudio").is_none(), "a host without sound says nil");
     }
 
     #[test]
@@ -214,6 +231,8 @@ mod tests {
         assert_eq!(accept(Settings::default(), &c).1.len(), 3);
         let c: HostSettingsChange = serde_json::from_str(r#"{"token":10,"prioritizeSpeed":true,"virtualDisplay":false}"#).unwrap();
         assert!(accept(Settings::default(), &c).1.is_empty());
+        let c: HostSettingsChange = serde_json::from_str(r#"{"token":11,"sendAudio":false}"#).unwrap();
+        assert_eq!(accept(Settings::default(), &c), (Settings { send_audio: false, ..Settings::default() }, vec![]));
     }
 
     #[test]
@@ -230,9 +249,11 @@ mod tests {
     fn saved_and_loaded() {
         let dir = std::env::temp_dir().join(format!("sill-settings-{}", uuid::Uuid::new_v4()));
         let p = dir.join("settings.json");
-        let s = Settings { max_fps: 60, bitrate: 40_000_000, capture_scale: 2.0 };
+        let s = Settings { max_fps: 60, bitrate: 40_000_000, capture_scale: 2.0, send_audio: false };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
+        std::fs::write(&p, br#"{"maxFPS":60,"bitrate":40000000,"captureScale":2}"#).unwrap();
+        assert!(Settings::load(&p).send_audio, "settings saved before sound: on");
         std::fs::write(&p, br#"{"maxFPS":99,"bitrate":1,"captureScale":3}"#).unwrap();
         assert_eq!(Settings::load(&p), Settings::default(), "out-of-range values fall back");
         std::fs::remove_dir_all(dir).unwrap();

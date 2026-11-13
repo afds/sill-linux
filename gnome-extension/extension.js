@@ -5,7 +5,7 @@
 // a change here costs a log-out, while sill-linux restarts in a second).
 // Only the owner of org.sill_linux.Host (the sill-linux host) is answered: GNOME lets few programs
 // take screenshots or read the clipboard, and this would let any of the user's programs do both.
-//   Version() -> u                this interface's version (8)
+//   Version() -> u                this interface's version (9)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -19,6 +19,7 @@
 //                                 all 0 for no such window
 //   FrameState(t id) -> (iiiibbb) the frame (x, y, w, h), maximized, full screen, and whether the
 //                                 window exists
+//   WindowPid(t id) -> u          the window's process (0: none known), whose sound streams with it
 //   MoveResize(t id, i x, i y, i w, i h) -> b   kept inside the work area of the window's monitor
 //   SetMaximized(t id, b on) -> b
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window's frame, at most maxSize on its longer
@@ -84,6 +85,9 @@ const XML = `
     <method name="Geometry">
       <arg type="t" direction="in" name="id"/><arg type="(iiiiii)" direction="out" name="geometry"/>
     </method>
+    <method name="WindowPid">
+      <arg type="t" direction="in" name="id"/><arg type="u" direction="out" name="pid"/>
+    </method>
     <method name="FrameState">
       <arg type="t" direction="in" name="id"/><arg type="(iiiibbb)" direction="out" name="frame"/>
     </method>
@@ -130,7 +134,7 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 8;
+const VERSION = 9;
 const HOST_NAME = 'org.sill_linux.Host';
 
 // Whether every surface of a window actor has a texture. Mutter 50's get_image crashes GNOME Shell
@@ -184,6 +188,10 @@ class Service {
                 listed(w),
             ];
         });
+    }
+
+    WindowPid(id) {
+        return Math.max(0, byId(id)?.get_pid() ?? 0);
     }
 
     FrameState(id) {

@@ -45,8 +45,11 @@ license-file = ["LICENSE", "0"]
 section = "video"
 priority = "optional"
 depends = "$auto, gstreamer1.0-pipewire, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-gl, avahi-utils"
+# Sound: libfdk-aac (opened at run time; none without it), pw-dump to find a window's stream,
+# pipewire-pulse for everything playing.
+recommends = "libfdk-aac2, pipewire-bin, pipewire-pulse"
 suggests = "qrencode"
-extended-description = "Streams this Linux desktop, or a single window or monitor, to the Sill app on an iPhone or iPad, which takes the input back: taps, the trackpad, keys and the clipboard. Pairing by code, TLS 1.3 with pinned keys. GNOME on Wayland gets the most (single windows need the extension it installs); other Wayland desktops stream the whole desktop through the portal. Unofficial: not made or supported by Sill's author."
+extended-description = "Streams this Linux desktop, or a single window or monitor, to the Sill app on an iPhone or iPad, which takes the input back: taps, the trackpad, keys and the clipboard. With its sound. Pairing by code, TLS 1.3 with pinned keys. GNOME on Wayland gets the most (single windows need the extension it installs); other Wayland desktops stream the whole desktop through the portal. Unofficial: not made or supported by Sill's author."
 assets = [
     ["target/release/sill-linux", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/sill-linux/README.md", "644"],
