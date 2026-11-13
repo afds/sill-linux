@@ -135,7 +135,8 @@ dropped, and the device's own frame age and round trip.
 
 ## For developers
 
-[docs/feasibility.md](docs/feasibility.md) has the design and each phase's findings.
+[docs/feasibility.md](docs/feasibility.md) has the design and each phase's findings;
+[docs/lock-screen.md](docs/lock-screen.md) the options for streaming while the screen is locked.
 
 - `tools/receive.py` checks a `--plain` door's messages and decodes the stream with ffmpeg.
 - `tools/windows.py` walks every window.
