@@ -875,3 +875,6 @@ is not known.
 - `--keep-streaming` (60 s): the app closes its connection in the background and, back on a
   list that says nothing streams, starts the Desktop; the stream now outlives the last device
   that long, so the app comes back to the window it showed. Sill for Mac stops at once.
+- A password manager's copies go to the devices like any other since 2026-11-13, as Sill for
+  Mac's do since 2026-10-29 (Noah: "I think its fine to copy password apps"); the markers above
+  are no longer looked at.

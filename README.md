@@ -36,8 +36,8 @@ The Sill app on an iPad, streaming from Ubuntu with GNOME.
   shape.
 - **Three-finger gestures** on the app's trackpad work as GNOME's own: swipe up for Activities and
   the app grid, left and right for workspaces, pinch for the app grid, spread for the desktop.
-- **The clipboard both ways**, text only. It skips copies a password manager marks; turn it off
-  with `--no-clipboard`. The app's 0.5.1 lacks this; it needs a later app version.
+- **The clipboard both ways**, text only, a password manager's copies too (as Sill for Mac); turn
+  it off with `--no-clipboard`. The app's 0.5.1 lacks this; it needs a later app version.
 
 - **Away from home** through your own VPN (WireGuard into your home network, Tailscale): connect
   once at home, and the app keeps this machine as a "Remote" row it dials from anywhere the VPN

@@ -1273,8 +1273,8 @@ pub fn set_share_clipboard(on: bool) {
 }
 
 /// The clipboard both ways, through the extension: each new copy here goes to the devices that
-/// share it (not one a password manager marks, whose text is never read, and not this host's own
-/// write of a device's text); a device's text becomes the clipboard here. Only copies made while a
+/// share it (a password manager's too, but not this host's own write of a device's text); a
+/// device's text becomes the clipboard here. Only copies made while a
 /// device shares it are sent, so what was on the clipboard before is not.
 async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
     if shell.clipboard_types().await.is_none() {
@@ -1297,7 +1297,7 @@ async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
                     continue;
                 }
                 let Some(types) = shell.clipboard_types().await else { continue };
-                if types.is_empty() || crate::clipboard::marked(&types) {
+                if types.is_empty() {
                     continue;
                 }
                 let Some(text) = shell.clipboard_text().await else { continue };
