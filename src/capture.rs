@@ -949,7 +949,7 @@ fn is_display(source: Source) -> bool {
 }
 
 /// The extension's interface version this host is built with (gnome-extension/extension.js).
-const EXTENSION_VERSION: u32 = 6;
+const EXTENSION_VERSION: u32 = 7;
 
 /// Requests to the GNOME session's task: record a source, or a window's light from a device.
 type Recorder = UnboundedSender<RecReq>;
@@ -1240,7 +1240,6 @@ async fn hold_off_suspend(server: Server, conn: ashpd::zbus::Connection) {
 /// runs; its Cancel cancels the pairing.
 async fn pairing_window(door: Arc<crate::door::PairingDoor>, shell: crate::shell::Client) {
     use crate::door::PairingUi;
-    use futures_util::StreamExt;
     let Ok(mut cancels) = shell.pairing_cancels().await else { return };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     door.set_pairing_ui(tx);
@@ -1255,8 +1254,8 @@ async fn pairing_window(door: Arc<crate::door::PairingDoor>, shell: crate::shell
                 }
                 Some(PairingUi::Close) => shell.close_pairing().await,
             },
-            c = cancels.next() => {
-                if c.is_none() {
+            c = cancels.changed() => {
+                if c.is_err() {
                     return;
                 }
                 let d = door.clone();
@@ -1278,7 +1277,6 @@ pub fn set_share_clipboard(on: bool) {
 /// write of a device's text); a device's text becomes the clipboard here. Only copies made while a
 /// device shares it are sent, so what was on the clipboard before is not.
 async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
-    use futures_util::StreamExt;
     if shell.clipboard_types().await.is_none() {
         return; // an older extension (said at start)
     }
@@ -1290,8 +1288,8 @@ async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
     let mut own: Option<String> = None;
     loop {
         tokio::select! {
-            change = changes.next() => {
-                if change.is_none() {
+            change = changes.changed() => {
+                if change.is_err() {
                     return;
                 }
                 if server.clipboard_subscribers() == 0 {
@@ -1322,14 +1320,13 @@ async fn watch_clipboard(server: Server, shell: crate::shell::Client) {
 /// change (the last of a burst, 30 ms on) while a device is connected, and once when the first
 /// connects.
 async fn watch_cursor(server: Server, shell: crate::shell::Client) {
-    use futures_util::StreamExt;
     let Ok(mut changes) = shell.cursor_changes().await else { return };
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut had_clients = false;
     loop {
         let changed = tokio::select! {
-            c = changes.next() => {
-                if c.is_none() {
+            c = changes.changed() => {
+                if c.is_err() {
                     return;
                 }
                 true
@@ -1345,7 +1342,7 @@ async fn watch_cursor(server: Server, shell: crate::shell::Client) {
         if changed {
             // A move across a window's edge changes it several times in a row: only the last counts.
             tokio::time::sleep(Duration::from_millis(30)).await;
-            while futures_util::FutureExt::now_or_never(changes.next()).flatten().is_some() {}
+            changes.borrow_and_update();
         }
         if let Some(Some((geometry, png))) = shell.cursor_shape().await { server.set_cursor_shape(geometry, &png) }
     }
@@ -1382,7 +1379,6 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
 /// Monitors other than the Desktop's are listed too (`DISPLAY_ID`), first, with thumbnails of the
 /// whole monitor when the extension takes them (`monitor_thumbs`, version 4).
 async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd::zbus::Connection, desktop: String, monitor_thumbs: bool) {
-    use futures_util::StreamExt;
     const BOX: u32 = 208;
     let mut changes = match shell.changes().await {
         Ok(c) => Some(c),
@@ -1401,7 +1397,12 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
     let mut display_stamps: HashMap<u64, Instant> = HashMap::new();
     loop {
         let changed = tokio::select! {
-            c = async { match changes.as_mut() { Some(s) => s.next().await, None => std::future::pending().await } } => c.is_some(),
+            c = async { match changes.as_mut() { Some(s) => s.changed().await, None => std::future::pending().await } } => {
+                if c.is_err() {
+                    changes = None; // the 2 s look from now on
+                }
+                c.is_ok()
+            }
             _ = tick.tick() => changes.is_none(),
         };
         if changed || list.is_empty() {
@@ -1486,6 +1487,8 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
                             server.add_icon(app, png);
                             n += 1;
                         }
+                        // Each icon is made on GNOME Shell's main thread: frames drawn in between.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     println!("Apps: {} installed, {n} icons.", apps.len());
                 }

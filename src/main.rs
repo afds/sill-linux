@@ -10,7 +10,7 @@ use std::sync::mpsc;
 const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise]
                   [--view-only | --command-key ctrl|super] [--show-cursor] [--keep-all-taps]
                   [--choose-screen] [--no-notifications] [--portal] [--monitor CONNECTOR] [--no-clipboard]
-                  [--no-remote]
+                  [--no-remote] [--keep-streaming SECONDS]
        sill-linux --install-service [options above]   run in the background, from login on
        sill-linux --uninstall-service
        sill-linux --install-extension                 GNOME: list single windows in the app's bar
@@ -31,6 +31,8 @@ const USAGE: &str = "usage: sill-linux [--port N] [--name NAME] [--open | --plai
                     screen-cast API, which needs no dialog and streams single windows)
   --monitor C       with GNOME's API, the monitor to stream as the Desktop (a connector, e.g. DP-3)
   --no-clipboard    share nothing of the clipboard with devices (GNOME, with the extension: on)
+  --keep-streaming S  keep streaming S seconds after the last device leaves (default 60; 0: stop
+                    at once), so the app back from the background is on the same window again
   --forget-devices  remove every paired device, then exit
 
 By default the door speaks TLS and a device pairs once with a code this terminal shows (TXT p=1),
@@ -60,12 +62,13 @@ struct Args {
     service: Option<bool>,
     extension: bool,
     clipboard: bool,
+    keep_streaming: u64,
     /// The arguments to keep in the service's command line.
     pass: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, pass: Vec::new() };
+    let mut a = Args { port: 47460, name: hostname(), advertise: true, mode: Mode::Paired, forget: false, input: Some(CommandKey::Ctrl), show_cursor: false, keep_all_taps: false, choose_screen: false, notifications: true, portal: false, monitor: None, service: None, extension: false, clipboard: true, keep_streaming: 60, pass: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut taken = None;
@@ -96,6 +99,12 @@ fn parse_args() -> Result<Args, String> {
             "--monitor" => a.monitor = Some(value("--monitor")?),
             "--no-notifications" => a.notifications = false,
             "--no-clipboard" => a.clipboard = false,
+            "--keep-streaming" => {
+                a.keep_streaming = value("--keep-streaming")?.parse().map_err(|_| "--keep-streaming is a number of seconds")?;
+                if a.keep_streaming > 3600 {
+                    return Err("--keep-streaming is at most 3600 seconds".into());
+                }
+            }
             "--no-remote" => sill_linux::remote::set_enabled(false),
             "--install-service" => {
                 a.service = Some(true);
@@ -206,7 +215,8 @@ fn main() {
     };
 
     let (control_tx, control_rx) = mpsc::channel::<Control>();
-    let server = Server::new(args.name.clone(), control_tx, door.clone(), Some(state.join("settings.json")));
+    let server = Server::new(args.name.clone(), control_tx, door.clone(), Some(state.join("settings.json")))
+        .keep_streaming(std::time::Duration::from_secs(args.keep_streaming));
     let addr = match server.listen(SocketAddr::from((Ipv6Addr::UNSPECIFIED, args.port))) {
         Ok(a) => a,
         Err(e) => {

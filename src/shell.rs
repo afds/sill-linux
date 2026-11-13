@@ -267,8 +267,8 @@ impl Client {
     }
 
     /// Fires on every `ClipboardChanged`.
-    pub async fn clipboard_changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
-        Ok(self.proxy.receive_signal("ClipboardChanged").await?)
+    pub async fn clipboard_changes(&self) -> Result<Arrivals> {
+        self.arrivals("ClipboardChanged").await
     }
 
     /// The pointer's image: hotspot and size in logical pixels, and its PNG (Some(None): no image
@@ -285,8 +285,8 @@ impl Client {
     }
 
     /// Fires on every `CursorChanged`.
-    pub async fn cursor_changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
-        Ok(self.proxy.receive_signal("CursorChanged").await?)
+    pub async fn cursor_changes(&self) -> Result<Arrivals> {
+        self.arrivals("CursorChanged").await
     }
 
     pub async fn command(&self, method: &str, id: u64) -> bool {
@@ -304,12 +304,33 @@ impl Client {
     pub async fn close_pairing(&self) {
         let _ = self.proxy.call_method("ClosePairing", &()).await;
     }
-    pub async fn pairing_cancels(&self) -> Result<zbus::proxy::SignalStream<'static>> {
-        Ok(self.proxy.receive_signal("PairingCancelled").await?)
+    pub async fn pairing_cancels(&self) -> Result<Arrivals> {
+        self.arrivals("PairingCancelled").await
     }
 
     /// Fires on every `WindowsChanged` (coalesced by the extension to one per 250 ms).
-    pub async fn changes(&self) -> Result<zbus::proxy::SignalStream<'static>> {
-        Ok(self.proxy.receive_signal("WindowsChanged").await?)
+    pub async fn changes(&self) -> Result<Arrivals> {
+        self.arrivals("WindowsChanged").await
+    }
+
+    /// A signal read as it comes, by a task of its own, down to "it came since you last looked".
+    /// A zbus signal stream left unread for 64 signals stops the whole connection, the replies to
+    /// every call on it too: a watcher busy with a call while the signals came (a terminal's title
+    /// changing every second) waited for its reply for ever, and so did GNOME's screen cast.
+    async fn arrivals(&self, signal: &'static str) -> Result<Arrivals> {
+        use futures_util::StreamExt;
+        let mut stream = self.proxy.receive_signal(signal).await?;
+        let (tx, rx) = tokio::sync::watch::channel(());
+        tokio::spawn(async move {
+            while stream.next().await.is_some() {
+                if tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
     }
 }
+
+/// `changed().await` once a signal came since the last look; an error once it can come no more.
+pub type Arrivals = tokio::sync::watch::Receiver<()>;

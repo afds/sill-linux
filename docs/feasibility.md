@@ -851,3 +851,27 @@ The pin moved to Sill 0.6.2 (docs/upstream-0.6.2-plan.md, step 1):
 Checked with Sill's `sillclient.py` against a `--plain` door in a headless shell: the refusal and
 the next viewport taken; keyframes at 4.03 s and 6.37 s for requests at 4.0, 4.3 and 6.0 s. Not
 checked live: Aa's Off (the restore is the one a stop uses), key repeat from the app.
+
+## The host stopped answering (2026-11-13)
+
+After a while every pick got "no answer from the GNOME session" and the devices a black screen.
+The host's session-bus socket had 29 KB unread and growing, and dbus-daemon 184 KB more queued for
+it: zbus stops reading a connection once any of its signal streams holds 64 unread signals, and
+with it the replies to every call on it. The window watcher read `WindowsChanged` only between
+its passes, a terminal whose title changes every second sent one a second or more, and one pass
+waiting long enough on a call never got its reply. Every extension signal is now read by a task
+of its own down to "it came" (`shell::Arrivals`, a watch channel): beside a window retitled 20
+times a second for 30 s, with picks, the socket stayed empty. Which call first waited that long
+is not known.
+
+## Smaller things the same day
+
+- Aa grew a window past the space under the top bar (1070 points on a 1048-point work area), and
+  GNOME moved it to the next monitor, which has no top bar. The extension (version 7) keeps
+  `MoveResize` inside the work area of the window's monitor.
+- The host's start lagged the desktop for 6–7 s: `AppIcon` made a new `St.IconTheme` per icon,
+  30 ms each on the Shell's main thread. One theme, made again when the icon theme changes, does
+  169 icons in 0.9 s instead of 5.4 s; the host waits 20 ms between icons.
+- `--keep-streaming` (60 s): the app closes its connection in the background and, back on a
+  list that says nothing streams, starts the Desktop; the stream now outlives the last device
+  that long, so the app comes back to the window it showed. Sill for Mac stops at once.

@@ -3,7 +3,7 @@
 // org.sill_linux.Shell at /org/sill_linux/Shell. A thin layer: it reads GNOME's state and does
 // plain actions; sill-linux decides (GNOME on Wayland loads an extension's code once per login, so
 // a change here costs a log-out, while sill-linux restarts in a second).
-//   Version() -> u                this interface's version (6)
+//   Version() -> u                this interface's version (7)
 //   ListWindows() -> a(tsssiibb)  every window: Mutter's window id (what
 //                                 org.gnome.Mutter.ScreenCast RecordWindow takes), title, app name,
 //                                 app id (.desktop id, or WM class), frame width and height (logical
@@ -17,7 +17,8 @@
 //                                 all 0 for no such window
 //   FrameState(t id) -> (iiiibbb) the frame (x, y, w, h), maximized, full screen, and whether the
 //                                 window exists
-//   MoveResize(t id, i x, i y, i w, i h) -> b, SetMaximized(t id, b on) -> b
+//   MoveResize(t id, i x, i y, i w, i h) -> b   kept inside the work area of the window's monitor
+//   SetMaximized(t id, b on) -> b
 //   Thumbnail(t id, u maxSize) -> s   a PNG of the window's frame, at most maxSize on its longer
 //                                 side, in $XDG_RUNTIME_DIR/sill-linux/ (0700); "" when it has none
 //   MonitorThumbnail(s connector, u maxSize) -> s   a PNG of a whole monitor (its windows as
@@ -127,7 +128,7 @@ const XML = `
   </interface>
 </node>`;
 
-const VERSION = 6;
+const VERSION = 7;
 
 // Whether every surface of a window actor has a texture. Mutter 50's get_image crashes GNOME Shell
 // on a surface without one (a window still being made, or the single-pixel buffer a video player
@@ -194,6 +195,13 @@ class Service {
         const w = byId(id);
         if (!w || width < 1 || height < 1)
             return false;
+        // Inside its monitor's work area: one that does not fit there (taller than the space under
+        // the top bar, say) is moved by GNOME to a monitor where it does.
+        const a = w.get_work_area_for_monitor(w.get_monitor());
+        width = Math.min(width, a.width);
+        height = Math.min(height, a.height);
+        x = Math.max(a.x, Math.min(x, a.x + a.width - width));
+        y = Math.max(a.y, Math.min(y, a.y + a.height - height));
         w.move_resize_frame(false, x, y, width, height);
         return true;
     }
@@ -313,7 +321,10 @@ class Service {
             const icon = app?.get_app_info()?.get_icon();
             if (!icon)
                 return '';
-            const info = new St.IconTheme().lookup_by_gicon(icon, size, St.IconLookupFlags.FORCE_SIZE);
+            // One theme for every icon: a new St.IconTheme reads the themes again, 30 ms an icon on
+            // the Shell's main thread (seconds of lag at a host's start), 5 ms with this one.
+            this._iconTheme ??= new St.IconTheme();
+            const info = this._iconTheme.lookup_by_gicon(icon, size, St.IconLookupFlags.FORCE_SIZE);
             const file = info?.get_filename();
             if (!file)
                 return '';
@@ -613,6 +624,7 @@ class Service {
             this._watch(w);
         this._cursorTracker = global.backend.get_cursor_tracker();
         this._cursorSignal = this._cursorTracker.connect('cursor-changed', () => this._dbus?.emit_signal('CursorChanged', null));
+        this._iconThemeSignal = St.Settings.get().connect('notify::gtk-icon-theme', () => (this._iconTheme = null));
         const selection = global.display.get_selection();
         this._selection = selection;
         this._selectionSignal = selection.connect('owner-changed', (_s, type) => {
@@ -632,6 +644,10 @@ class Service {
         if (this._cursorSignal) {
             this._cursorTracker.disconnect(this._cursorSignal);
             this._cursorSignal = 0;
+        }
+        if (this._iconThemeSignal) {
+            St.Settings.get().disconnect(this._iconThemeSignal);
+            this._iconThemeSignal = 0;
         }
         if (this._selectionSignal) {
             this._selection.disconnect(this._selectionSignal);

@@ -202,6 +202,8 @@ struct State {
     icons: Vec<(String, Vec<u8>)>,
     /// The pointer's current image (kind 14's payload), for devices as they connect.
     cursor: Option<Vec<u8>>,
+    /// Counts the times the last device left: a wait to stop the stream ends only its own time.
+    left_at: u64,
     /// Who moves this machine's pointer (kind 26).
     pointer: crate::pointer::PointerControl,
     /// The last viewport any device sent (one stream: the last to report wins, as Sill for Mac).
@@ -221,6 +223,8 @@ pub struct Server {
     clipboard: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     /// Trackpad gestures are taken (GNOME, with the extension).
     gestures: Arc<std::sync::atomic::AtomicBool>,
+    /// How long the stream outlives the last device (`--keep-streaming`).
+    keep_streaming: Duration,
 }
 
 impl Server {
@@ -247,6 +251,7 @@ impl Server {
                 viewport: None,
                 pointer: Default::default(),
                 cursor: None,
+                left_at: 0,
             })),
             control,
             host_name: Arc::new(host_name),
@@ -255,7 +260,15 @@ impl Server {
             input: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             gestures: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keep_streaming: Duration::ZERO,
         }
+    }
+
+    /// The stream outlives the last device by this long: the app closes its connection when it
+    /// goes to the background, and back, it stays on what streams; on nothing it starts the Desktop.
+    pub fn keep_streaming(mut self, d: Duration) -> Server {
+        self.keep_streaming = d;
+        self
     }
 
     /// What the encoder should run at, from the settings and the connected devices.
@@ -1033,11 +1046,30 @@ impl Server {
         }
         println!("Client left: {} ({reason})", c.label);
         if st.clients.is_empty() && st.active != StreamSource::None {
-            st.active = StreamSource::None;
-            println!("Streaming: nothing (no devices)");
-            let _ = self.control.send(Control::Stop);
+            if self.keep_streaming.is_zero() {
+                Self::stop_unwatched(&mut st, &self.control);
+            } else {
+                st.left_at += 1;
+                let left_at = st.left_at;
+                println!("Streaming: kept for {} s for a device to come back.", self.keep_streaming.as_secs());
+                let (state, control, wait) = (self.state.clone(), self.control.clone(), self.keep_streaming);
+                thread::spawn(move || {
+                    thread::sleep(wait);
+                    let mut st = state.lock().unwrap();
+                    // A device came meanwhile (and maybe left again, with its own wait).
+                    if st.clients.is_empty() && st.left_at == left_at && st.active != StreamSource::None {
+                        Self::stop_unwatched(&mut st, &control);
+                    }
+                });
+            }
         }
         self.reapply(&st);
+    }
+
+    fn stop_unwatched(st: &mut State, control: &Sender<Control>) {
+        st.active = StreamSource::None;
+        println!("Streaming: nothing (no devices)");
+        let _ = control.send(Control::Stop);
     }
 
     /// The pairing door, when this host has one (TLS).
@@ -1325,6 +1357,36 @@ mod tests {
             }
         }
         assert!(got_stop);
+    }
+
+    #[test]
+    fn the_stream_waits_for_a_device_to_come_back() {
+        let (ctx, crx) = smpsc::channel();
+        let server = Server::new("test host".into(), ctx, Door::Plain, None).keep_streaming(Duration::from_millis(600));
+        let addr = server.listen(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut s = StdStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_until(&mut s, kind::WINDOW_LIST);
+        select_desktop(&mut s);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop));
+        let stops = |within: Duration| {
+            let end = Instant::now() + within;
+            std::iter::from_fn(|| crx.recv_timeout(end.saturating_duration_since(Instant::now())).ok()).any(|c| c == Control::Stop)
+        };
+
+        // Gone, and back within the wait: the list says the Desktop still streams, and nothing stops.
+        drop(s);
+        thread::sleep(Duration::from_millis(300));
+        let mut s = StdStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (_, p) = read_until(&mut s, kind::WINDOW_LIST);
+        assert_eq!(serde_json::from_slice::<WindowList>(&p).unwrap().active, StreamSource::Desktop);
+        assert!(!stops(Duration::from_millis(700)), "the first wait ended a stream a device came back to");
+
+        // Gone for good: it stops once the wait is over, not before.
+        drop(s);
+        assert!(!stops(Duration::from_millis(300)));
+        assert!(stops(Duration::from_secs(2)));
     }
 
     #[test]

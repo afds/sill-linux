@@ -119,8 +119,12 @@ notification, and in a terminal it is printed too (with a QR code if `qrencode` 
 sill-linux [--port N] [--name NAME] [--open | --plain] [--no-advertise] [--view-only]
            [--show-cursor] [--keep-all-taps] [--choose-screen] [--portal] [--monitor CONNECTOR]
            [--no-notifications] [--no-clipboard] [--no-remote] [--command-key ctrl|super]
-           [--forget-devices]
+           [--keep-streaming SECONDS] [--forget-devices]
 ```
+
+- `--keep-streaming 60` (the default): the stream goes on that long after the last device
+  leaves. The app closes its connection while it is in the background, and back within that time
+  it is on the same window again instead of the Desktop. `0` stops at once.
 
 - `--monitor DP-3` picks another monitor on GNOME (the primary by default).
 - `--portal` uses the desktop portal even on GNOME (the desktop only).
