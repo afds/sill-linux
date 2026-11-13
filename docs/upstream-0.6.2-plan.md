@@ -28,7 +28,7 @@ as it is.
    connections' limits, a removed device's input): read, fix what applies.
 5. The pin moves to `bf69067f` (SILL_REFERENCE.md).
 
-## Step 2: the Desktop's displays
+## Step 2: the Desktop's displays (done 2026-11-13)
 
 `desktopDisplays`, `desktopDisplay`, `desktopDisplayNames` in the window list and kind 47 (the
 Desktop button steps to the next display): the main monitor first, then left to right, wrapping.

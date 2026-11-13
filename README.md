@@ -31,7 +31,8 @@ The Sill app on an iPad, streaming from Ubuntu with GNOME.
     set to Off.
 - **More than one monitor:** each monitor but the main one is an entry with the windows, named after
   the monitor ("Dell 27″ (DP-2)", with a monitor icon and a thumbnail); a tap streams that monitor, and input goes there. Desktop is the
-  main monitor (`--monitor` picks another).
+  main monitor (`--monitor` picks another); with the app's 0.6.2, a tap on Desktop while it
+  streams steps to the next monitor (left to right, round to the main one).
 - **This machine's pointer** shown on the device while the local mouse moves it, in its current
   shape.
 - **Three-finger gestures** on the app's trackpad work as GNOME's own: swipe up for Activities and

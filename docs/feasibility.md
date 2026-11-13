@@ -878,3 +878,12 @@ is not known.
 - A password manager's copies go to the devices like any other since 2026-11-13, as Sill for
   Mac's do since 2026-10-29 (Noah: "I think its fine to copy password apps"); the markers above
   are no longer looked at.
+- The Desktop button steps through the monitors (Sill 0.6.2's kind 47, `desktopDisplays`,
+  `desktopDisplay`, `desktopDisplayNames`): the main monitor first, then left to right and top to
+  bottom, round again; a mirrored monitor is no stop of its own. A stop other than the main one
+  records that display, as a pick of its entry in the bar does; the pointer follows it. The stop
+  is kept while the stream runs and goes back to the main monitor when it stops, when the stop's
+  monitor goes, and when its recording fails. Checked with two virtual monitors in a headless
+  shell (a new screen cast per step, the list 1, 2, 1). Not done: Sill's 30 s grace for the
+  choice (the stream's own `--keep-streaming` covers a return) and moving the pointer to the new
+  monitor's centre.

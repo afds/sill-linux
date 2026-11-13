@@ -204,6 +204,10 @@ struct State {
     cursor: Option<Vec<u8>>,
     /// Counts the times the last device left: a wait to stop the stream ends only its own time.
     left_at: u64,
+    /// The Desktop's stops (kind 47): None the main monitor, else a display's id; with its name.
+    stops: Vec<(Option<u64>, String)>,
+    /// The stop the Desktop shows, or comes back to while a window streams.
+    stop: usize,
     /// Who moves this machine's pointer (kind 26).
     pointer: crate::pointer::PointerControl,
     /// The last viewport any device sent (one stream: the last to report wins, as Sill for Mac).
@@ -252,6 +256,8 @@ impl Server {
                 pointer: Default::default(),
                 cursor: None,
                 left_at: 0,
+                stops: Vec::new(),
+                stop: 0,
             })),
             control,
             host_name: Arc::new(host_name),
@@ -485,6 +491,9 @@ impl Server {
             gestures: self.gestures.load(Ordering::Relaxed).then_some(1),
             clipboard: self.clipboard.lock().unwrap().is_some().then_some(crate::clipboard::GENERATION),
             key_repeat: Some(1),
+            desktop_displays: (st.stops.len() >= 2).then_some(st.stops.len() as i64),
+            desktop_display: (st.stops.len() >= 2).then_some(st.stop as i64 + 1),
+            desktop_display_names: (st.stops.len() >= 2).then(|| st.stops.iter().map(|(_, n)| n.clone()).collect()),
         };
         protocol::message(kind::WINDOW_LIST, protocol::now(), false, &serde_json::to_vec(&list).unwrap())
     }
@@ -612,6 +621,7 @@ impl Server {
                         let _ = self.control.send(Control::Keyframe);
                     }
                 }
+                kind::NEXT_DISPLAY => self.next_display(id),
                 kind::WINDOW_COMMAND => self.window_command(id, &payload),
                 kind::LAUNCH_APP => self.launch(id, &payload),
                 kind::CLIPBOARD => self.clipboard_from(id, &payload),
@@ -727,7 +737,7 @@ impl Server {
             }
             StreamSource::Desktop => {
                 println!("Streaming: the Desktop");
-                Control::Start(Source::Desktop)
+                Self::desktop_start(&st)
             }
             StreamSource::Window(w) => {
                 let m = st.mutter_ids[&w];
@@ -862,9 +872,56 @@ impl Server {
 
     /// The capture side went back to the Desktop by itself (a window could not be streamed, or its
     /// stream ended): the devices are told.
+    /// What the Desktop records: the main monitor, or the stop a device stepped to (a display).
+    fn desktop_start(st: &State) -> Control {
+        match st.stops.get(st.stop) {
+            Some((Some(display), _)) => Control::Start(Source::Window(*display)),
+            _ => Control::Start(Source::Desktop),
+        }
+    }
+
+    /// The Desktop's stops: the main monitor first, then each other display (`mutter::desktop_stops`).
+    /// The stop shown is kept while it is still there; gone, the Desktop goes back to the main one.
+    pub fn set_desktop_stops(&self, stops: Vec<(Option<u64>, String)>) {
+        let mut st = self.state.lock().unwrap();
+        if st.stops == stops {
+            return;
+        }
+        let shown = st.stops.get(st.stop).map(|s| s.0);
+        let at = stops.iter().position(|s| Some(s.0) == shown);
+        st.stops = stops;
+        st.stop = at.unwrap_or(0);
+        if at.is_none() && shown.flatten().is_some() && st.active == StreamSource::Desktop {
+            println!("Desktop: its display went; back to the main one.");
+            let _ = self.control.send(Control::Start(Source::Desktop));
+        }
+        let list = self.window_list(&st);
+        for c in st.clients.values() {
+            let _ = c.tx.send(list.clone());
+        }
+    }
+
+    /// Kind 47, the Desktop button tapped while the Desktop streams: the next stop, wrapping round.
+    fn next_display(&self, id: u64) {
+        let mut st = self.state.lock().unwrap();
+        if st.active != StreamSource::Desktop || st.stops.len() < 2 {
+            return;
+        }
+        st.stop = (st.stop + 1) % st.stops.len();
+        println!("Desktop: {} ({} of {}), for client {id}.", st.stops[st.stop].1, st.stop + 1, st.stops.len());
+        let _ = self.control.send(Self::desktop_start(&st));
+        let list = self.window_list(&st);
+        for c in st.clients.values_mut() {
+            c.needs_keyframe = true;
+            let _ = c.tx.send(list.clone());
+        }
+    }
+
     pub fn showing_desktop(&self) {
         let mut st = self.state.lock().unwrap();
-        if st.active == StreamSource::Desktop || st.active == StreamSource::None {
+        // The capture fell back to the main monitor, a stop that did not stream included.
+        let stepped_back = std::mem::take(&mut st.stop) != 0;
+        if st.active == StreamSource::None || (st.active == StreamSource::Desktop && !stepped_back) {
             return;
         }
         st.active = StreamSource::Desktop;
@@ -1009,12 +1066,14 @@ impl Server {
         self.state.lock().unwrap().active != StreamSource::None
     }
 
-    /// The streamed window's Mutter id, if a window streams.
+    /// The streamed window's Mutter id, if a window streams, or the display's the Desktop shows on
+    /// a stop other than the main monitor.
     pub fn active_window(&self) -> Option<u64> {
         let st = self.state.lock().unwrap();
         match st.active {
             StreamSource::Window(w) => st.mutter_ids.get(&w).copied(),
-            _ => None,
+            StreamSource::Desktop => st.stops.get(st.stop).and_then(|s| s.0),
+            StreamSource::None => None,
         }
     }
 
@@ -1068,6 +1127,7 @@ impl Server {
 
     fn stop_unwatched(st: &mut State, control: &Sender<Control>) {
         st.active = StreamSource::None;
+        st.stop = 0; // a later session starts on the main monitor
         println!("Streaming: nothing (no devices)");
         let _ = control.send(Control::Stop);
     }
@@ -1387,6 +1447,33 @@ mod tests {
         drop(s);
         assert!(!stops(Duration::from_millis(300)));
         assert!(stops(Duration::from_secs(2)));
+    }
+
+    /// A display's id, as the capture side makes them (its top bit set).
+    const DISPLAY: u64 = 1 << 63 | 7;
+
+    #[test]
+    fn the_desktop_button_steps_through_the_monitors() {
+        let (server, crx, addr) = start();
+        server.set_desktop_stops(vec![(None, "Main".into()), (Some(DISPLAY), "LG".into())]);
+        let mut s = StdStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let list = |s: &mut StdStream| serde_json::from_slice::<WindowList>(&read_until(s, kind::WINDOW_LIST).1).unwrap();
+        let first = list(&mut s);
+        assert_eq!((first.desktop_displays, first.desktop_display), (Some(2), Some(1)));
+        assert_eq!(first.desktop_display_names.unwrap(), ["Main", "LG"]);
+        // A step while nothing streams does nothing.
+        s.write_all(&protocol::message(kind::NEXT_DISPLAY, 0.0, false, &[])).unwrap();
+        select_desktop(&mut s);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop));
+        assert_eq!(list(&mut s).desktop_display, Some(1));
+        s.write_all(&protocol::message(kind::NEXT_DISPLAY, 0.0, false, &[])).unwrap();
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Window(DISPLAY)));
+        let l = list(&mut s);
+        assert_eq!((l.active, l.desktop_display), (StreamSource::Desktop, Some(2)));
+        s.write_all(&protocol::message(kind::NEXT_DISPLAY, 0.0, false, &[])).unwrap();
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop), "round to the main one");
+        assert_eq!(list(&mut s).desktop_display, Some(1));
     }
 
     #[test]

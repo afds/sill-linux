@@ -103,6 +103,23 @@ pub async fn monitors(conn: &zbus::Connection) -> Result<Vec<Monitor>> {
     Ok(out)
 }
 
+/// The Desktop's stops, in the button's order (Sill's `DesktopDisplays.candidates`): left to
+/// right, then top to bottom, turned to start at `main`; mirrored monitors (one place) once.
+pub fn desktop_stops(monitors: &[Monitor], main: &str) -> Vec<Monitor> {
+    let mut stops: Vec<Monitor> = Vec::new();
+    for m in monitors {
+        if !stops.iter().any(|s| s.rect == m.rect) || m.connector == main {
+            stops.retain(|s| s.rect != m.rect);
+            stops.push(m.clone());
+        }
+    }
+    stops.sort_by_key(|m| (m.rect.0, m.rect.1, m.connector.clone()));
+    if let Some(i) = stops.iter().position(|m| m.connector == main) {
+        stops.rotate_left(i);
+    }
+    stops
+}
+
 /// Whether the screen is locked (GNOME Shell's `org.gnome.ScreenSaver`). GNOME blocks every screen
 /// cast and remote-desktop session while it is: running ones end, new ones are refused ("Session
 /// creation inhibited").
@@ -249,4 +266,25 @@ pub enum Source<'a> {
 /// For `bail!` users that want a plain error.
 pub fn unavailable() -> Result<()> {
     bail!("GNOME's screen-cast API (org.gnome.Mutter.ScreenCast) is not here")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_button_goes_left_to_right_from_the_main_monitor() {
+        let m = |c: &str, x, y| Monitor { connector: c.into(), name: c.into(), rect: (x, y, 1920, 1080) };
+        let names = |v: Vec<Monitor>| v.into_iter().map(|m| m.connector).collect::<Vec<_>>();
+        // Main in the middle: it, then the one on its right, then round to the leftmost.
+        let three = [m("DP-1", 1920, 0), m("HDMI-1", 0, 0), m("DP-2", 3840, 0)];
+        assert_eq!(names(desktop_stops(&three, "DP-1")), ["DP-1", "DP-2", "HDMI-1"]);
+        // A monitor mirroring the main one is no stop of its own.
+        let mirrored = [m("DP-3", 0, 0), m("HDMI-1", 0, 0), m("DP-1", 1920, 0)];
+        assert_eq!(names(desktop_stops(&mirrored, "HDMI-1")), ["HDMI-1", "DP-1"]);
+        // Stacked: top before bottom at the same x.
+        let stacked = [m("B", 0, 1080), m("A", 0, 0)];
+        assert_eq!(names(desktop_stops(&stacked, "B")), ["B", "A"]);
+        assert_eq!(names(desktop_stops(&[m("DP-3", 0, 0)], "DP-3")), ["DP-3"]);
+    }
 }

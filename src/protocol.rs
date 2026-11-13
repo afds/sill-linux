@@ -43,6 +43,7 @@ pub mod kind {
     pub const GESTURE: u8 = 28;
     pub const CLIPBOARD: u8 = 32;
     pub const KEYFRAME_REQUEST: u8 = 44;
+    pub const NEXT_DISPLAY: u8 = 47;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -224,6 +225,14 @@ pub struct WindowList {
     /// (GNOME's clients repeat a held key themselves).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_repeat: Option<i64>,
+    /// The Desktop's stops (this machine's monitors, the main one first), 2 or more; which one it
+    /// shows, from 1; each one's name. Left out with one: the device then sends no kind 47.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_displays: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_display: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_display_names: Option<Vec<String>>,
 }
 
 /// `Viewport` (kind 9).
@@ -353,6 +362,9 @@ mod tests {
             gestures: None,
             clipboard: None,
             key_repeat: None,
+            desktop_displays: None,
+            desktop_display: None,
+            desktop_display_names: None,
         };
         let v: serde_json::Value = serde_json::to_value(&l).unwrap();
         assert_eq!(v, serde_json::json!({"macName":"linux","windows":[],"active":{"desktop":{}},"launchID":"L","protocol":1}));

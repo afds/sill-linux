@@ -1423,9 +1423,12 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
                 }
         }
         // The monitors, looked at on every change and every 2 s (one could be plugged in).
-        let now_displays: Vec<(u64, crate::mutter::Monitor)> = crate::mutter::monitors(&conn)
-            .await
-            .unwrap_or_default()
+        let monitors = crate::mutter::monitors(&conn).await.unwrap_or_default();
+        let stops = crate::mutter::desktop_stops(&monitors, &desktop)
+            .into_iter()
+            .map(|m| ((m.connector != desktop).then(|| display_id(&m.connector)), m.name))
+            .collect();
+        let now_displays: Vec<(u64, crate::mutter::Monitor)> = monitors
             .into_iter()
             .filter(|m| m.connector != desktop)
             .map(|m| (display_id(&m.connector), m))
@@ -1438,6 +1441,8 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
             displays = now_displays;
             *DISPLAYS.lock().unwrap() = displays.clone();
         }
+        // After DISPLAYS: a step records a display by its id there.
+        server.set_desktop_stops(stops);
         // The server sends the list only when it changed.
         // The app shows a window's app name and icon, not its title: each display is an app of
         // its own, named after the monitor.
