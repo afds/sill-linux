@@ -194,6 +194,8 @@ struct Client {
     /// epoch it was last sent.
     audio: bool,
     audio_epoch: Option<u16>,
+    /// Told sharing ended here (`sharing_ended`): nothing it sends until it goes starts it again.
+    told_ended: bool,
 }
 
 struct State {
@@ -570,6 +572,7 @@ impl Server {
                     gesture_arrivals: Vec::new(),
                     audio: false,
                     audio_epoch: None,
+                    told_ended: false,
                 },
             );
             if st.active != StreamSource::None {
@@ -619,6 +622,9 @@ impl Server {
                 Ok(m) => m,
                 Err(e) => break if e.kind() == std::io::ErrorKind::InvalidData { "message too large" } else { "closed" },
             };
+            if self.state.lock().unwrap().clients.get(&id).is_some_and(|c| c.told_ended) {
+                continue;
+            }
             match h.kind {
                 // The app's ping carries 8 or 16 bytes; at most 32 pongs wait for a device that stops reading.
                 kind::PING if payload.len() <= 64 && pongs_queued.load(Ordering::SeqCst) < 32 => {
@@ -1279,7 +1285,8 @@ impl Server {
         let ids: Vec<u64> = {
             let mut st = self.state.lock().unwrap();
             st.active = StreamSource::None;
-            for c in st.clients.values() {
+            for c in st.clients.values_mut() {
+                c.told_ended = true;
                 let _ = c.tx.send(msg.clone());
             }
             st.clients.keys().copied().collect()
@@ -1578,6 +1585,25 @@ mod tests {
         let (_, p) = read_message(&mut b);
         assert_eq!(serde_json::from_slice::<WindowList>(&p).unwrap().active, StreamSource::Desktop);
         assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Keyframe);
+    }
+
+    #[test]
+    fn a_device_told_sharing_ended_starts_nothing() {
+        let (server, crx, addr) = start();
+        let mut a = StdStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_message(&mut a);
+        select_desktop(&mut a);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop));
+        server.sharing_ended(Ended::Stopped);
+        // Seen 2026-11-15: the app picked the Desktop again in the 2 s before it was let go.
+        select_desktop(&mut a);
+        assert!(crx.recv_timeout(Duration::from_millis(500)).is_err(), "GNOME's stop is kept");
+        let mut b = StdStream::connect(addr).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_message(&mut b);
+        select_desktop(&mut b);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Desktop), "a new connection starts it");
     }
 
     #[test]
