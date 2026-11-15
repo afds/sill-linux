@@ -133,7 +133,7 @@ pub fn run(server: &Server, control: Receiver<Control>, input: Option<CommandKey
             }
             Outcome::NoDmaBuf(why) if source == Source::Desktop => bail!(why),
             Outcome::NoDmaBuf(why) | Outcome::SourceEnded(why) => {
-                println!("The window's stream ended ({why}); back to the Desktop.");
+                println!("The stream ended ({why}); back to the Desktop.");
                 server.showing_desktop();
                 Source::Desktop
             }
@@ -194,7 +194,7 @@ enum Outcome {
     Ended,
     /// A device picked another source.
     Switch(Source),
-    /// A window's stream ended (the window closed).
+    /// A stream ended: a window closed, or a monitor went (the Desktop's too, GNOME's API only).
     SourceEnded(String),
     /// The pipeline failed before its first frame (with DMA-BUF: try shared memory).
     NoDmaBuf(String),
@@ -548,7 +548,8 @@ fn run_pipeline(
             break Ok(Outcome::Idle);
         }
         if let Some(why) = failure {
-            if source != Source::Desktop {
+            // A window closed, or a monitor went (the Desktop's too): GNOME's API records anew.
+            if source != Source::Desktop || (recorder.is_some() && encoded_total.load(Ordering::Relaxed) > 0) {
                 break Ok(Outcome::SourceEnded(why));
             }
             if encoded_total.load(Ordering::Relaxed) == 0 {
@@ -857,8 +858,7 @@ async fn mutter_session(server: Server, input: Option<CommandKey>) -> Result<(Po
     if named != Some(1) {
         println!("Windows: another sill-linux has {HOST_NAME}; the GNOME Shell extension answers only that one.");
     }
-    let wanted = MONITOR.lock().unwrap().clone();
-    let connector = crate::mutter::monitor_connector(&conn, wanted.as_deref()).await?;
+    let connector = desktop_connector(&conn).await?;
     // No session yet: one opens when a device picks a source (a session made now would show GNOME's
     // sharing indicator, and fails while the screen is locked). The monitor's place and size come
     // from the display configuration.
@@ -933,6 +933,15 @@ const DISPLAY_ID: u64 = 1 << 63;
 
 /// The monitors offered as windows, with their ids.
 static DISPLAYS: std::sync::Mutex<Vec<(u64, crate::mutter::Monitor)>> = std::sync::Mutex::new(Vec::new());
+/// Where the Desktop's monitor sits now (x, y, width, height), as `watch_windows` last looked.
+static DESKTOP_RECT: std::sync::Mutex<Option<(i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+/// The Desktop's monitor now: `--monitor`'s, else the main one. Monitors come and go (one turned
+/// off, unplugged, made the main one) while this host runs, so this is asked each time.
+async fn desktop_connector(conn: &ashpd::zbus::Connection) -> Result<String> {
+    let wanted = MONITOR.lock().unwrap().clone();
+    crate::mutter::monitor_connector(conn, wanted.as_deref()).await
+}
 
 fn display_id(connector: &str) -> u64 {
     // FNV-1a: the same id for the same connector across restarts.
@@ -1161,7 +1170,10 @@ async fn recorder(conn: ashpd::zbus::Connection, connector: String, shown: Shown
                     let session = crate::mutter::Session::new(conn.clone()).await?;
                     let stream = match (source, &monitor) {
                         (_, Some(m)) => session.record(crate::mutter::Source::Monitor(&m.connector), cursor).await,
-                        (Source::Desktop, None) => session.record(crate::mutter::Source::Monitor(&connector), cursor).await,
+                        (Source::Desktop, None) => {
+                            let main = desktop_connector(&conn).await.unwrap_or_else(|_| connector.clone());
+                            session.record(crate::mutter::Source::Monitor(&main), cursor).await
+                        }
                         (Source::Window(id), None) => session.record(crate::mutter::Source::Window(id), cursor).await,
                     };
                     match stream {
@@ -1375,7 +1387,7 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
         let rect = match (monitor, window) {
             (Some(m), _) => Some((m.rect.0 as f64, m.rect.1 as f64, m.rect.2 as f64, m.rect.3 as f64)),
             (None, Some(_)) => frame,
-            (None, None) => desktop,
+            (None, None) => DESKTOP_RECT.lock().unwrap().map(|r| (r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64)).or(desktop),
         };
         moving = server.pointer_sample(p, rect);
     }
@@ -1386,7 +1398,7 @@ async fn watch_pointer(server: Server, shell: crate::shell::Client, desktop: Opt
 /// every 6 s, and all again when a device joins.
 /// Monitors other than the Desktop's are listed too (`DISPLAY_ID`), first, with thumbnails of the
 /// whole monitor when the extension takes them (`monitor_thumbs`, version 4).
-async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd::zbus::Connection, desktop: String, monitor_thumbs: bool) {
+async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd::zbus::Connection, mut desktop: String, monitor_thumbs: bool) {
     const BOX: u32 = 208;
     let mut changes = match shell.changes().await {
         Ok(c) => Some(c),
@@ -1443,6 +1455,12 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
         }
         // The monitors, looked at on every change and every 2 s (one could be plugged in).
         let monitors = crate::mutter::monitors(&conn).await.unwrap_or_default();
+        if let Ok(main) = desktop_connector(&conn).await
+            && main != desktop {
+                println!("Displays: the Desktop is {main} now (was {desktop}).");
+                desktop = main;
+            }
+        *DESKTOP_RECT.lock().unwrap() = monitors.iter().find(|m| m.connector == desktop).map(|m| m.rect);
         let stops = crate::mutter::desktop_stops(&monitors, &desktop)
             .into_iter()
             .map(|m| ((m.connector != desktop).then(|| display_id(&m.connector)), m.name))
