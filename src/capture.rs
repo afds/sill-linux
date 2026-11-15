@@ -1460,26 +1460,30 @@ async fn watch_windows(server: Server, shell: crate::shell::Client, conn: ashpd:
                 println!("Displays: the Desktop is {main} now (was {desktop}).");
                 desktop = main;
             }
-        *DESKTOP_RECT.lock().unwrap() = monitors.iter().find(|m| m.connector == desktop).map(|m| m.rect);
-        let stops = crate::mutter::desktop_stops(&monitors, &desktop)
-            .into_iter()
-            .map(|m| ((m.connector != desktop).then(|| display_id(&m.connector)), m.name))
-            .collect();
-        let now_displays: Vec<(u64, crate::mutter::Monitor)> = monitors
-            .into_iter()
-            .filter(|m| m.connector != desktop)
-            .map(|m| (display_id(&m.connector), m))
-            .collect();
-        if now_displays != displays {
-            for (_, m) in now_displays.iter().filter(|d| !displays.contains(d)) {
-                println!("Displays: {} ({}, {}×{}) is offered with the windows.", m.name, m.connector, m.rect.2, m.rect.3);
-                server.add_icon(&display_app(m), crate::icon::display_icon());
+        // The layout and the main monitor are two looks, a moment apart: while a monitor comes or
+        // goes they can disagree (the main one not in the layout yet), then this round waits.
+        if monitors.iter().any(|m| m.connector == desktop) {
+            *DESKTOP_RECT.lock().unwrap() = monitors.iter().find(|m| m.connector == desktop).map(|m| m.rect);
+            let stops = crate::mutter::desktop_stops(&monitors, &desktop)
+                .into_iter()
+                .map(|m| ((m.connector != desktop).then(|| display_id(&m.connector)), m.name))
+                .collect();
+            let now_displays: Vec<(u64, crate::mutter::Monitor)> = monitors
+                .into_iter()
+                .filter(|m| m.connector != desktop)
+                .map(|m| (display_id(&m.connector), m))
+                .collect();
+            if now_displays != displays {
+                for (_, m) in now_displays.iter().filter(|d| !displays.contains(d)) {
+                    println!("Displays: {} ({}, {}×{}) is offered with the windows.", m.name, m.connector, m.rect.2, m.rect.3);
+                    server.add_icon(&display_app(m), crate::icon::display_icon());
+                }
+                displays = now_displays;
+                *DISPLAYS.lock().unwrap() = displays.clone();
             }
-            displays = now_displays;
-            *DISPLAYS.lock().unwrap() = displays.clone();
+            // After DISPLAYS: a step records a display by its id there.
+            server.set_desktop_stops(stops);
         }
-        // After DISPLAYS: a step records a display by its id there.
-        server.set_desktop_stops(stops);
         // The server sends the list only when it changed.
         // The app shows a window's app name and icon, not its title: each display is an app of
         // its own, named after the monitor.
