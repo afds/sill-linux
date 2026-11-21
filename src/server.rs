@@ -1200,6 +1200,11 @@ impl Server {
             if self.keep_streaming.is_zero() {
                 Self::stop_unwatched(&mut st, &self.control);
             } else {
+                // A window Aa sized goes back now, not when the wait ends: a device that comes back
+                // sends its viewport on connecting, and the window is sized again.
+                if matches!(st.active, StreamSource::Window(_)) {
+                    let _ = self.control.send(Control::Unfit);
+                }
                 st.left_at += 1;
                 let left_at = st.left_at;
                 println!("Streaming: kept for {} s for a device to come back.", self.keep_streaming.as_secs());
@@ -1543,6 +1548,25 @@ mod tests {
         drop(s);
         assert!(!stops(Duration::from_millis(300)));
         assert!(stops(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_window_goes_back_as_the_last_device_leaves() {
+        let (ctx, crx) = smpsc::channel();
+        let server = Server::new("test host".into(), ctx, Door::Plain, None).keep_streaming(Duration::from_secs(60));
+        {
+            let mut st = server.state.lock().unwrap();
+            st.wire_ids.insert(77, 1);
+            st.mutter_ids.insert(1, 77);
+        }
+        let addr = server.listen(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut s = StdStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_until(&mut s, kind::WINDOW_LIST);
+        s.write_all(&protocol::message(kind::SELECT_SOURCE, 0.0, false, br#"{"window":{"_0":1}}"#)).unwrap();
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Start(Source::Window(77)));
+        drop(s);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(2)).unwrap(), Control::Unfit, "not after the 60 s wait");
     }
 
     /// A display's id, as the capture side makes them (its top bit set).
