@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "sill-linux"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "ashpd",
